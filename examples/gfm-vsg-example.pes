@@ -26,7 +26,6 @@ units:
         type: voltage
         v_pu: 1.0
     pwm:
-      update_period: 5e-05
       f_sw: 20000.0
       modulation_limit: 0.95
       carrier_phase: 0.0
@@ -36,11 +35,11 @@ units:
         power:
           type: power
           period: 5.0e-05
-          bw_hz: 0.0
+          filter: {enable: 0}
         sync:
           type: vsg
           period: 5.0e-05
-          h_s: 2.0
+          h: 2.0
           d_p_pu: 20.0
           k_q_pu: 0.05
           t_q: 0.02
@@ -55,8 +54,7 @@ units:
     delay:
       steps: 1
     protection:
-      i_alarm_pu: 1.5
-      hold_s: 0.02
+      overcurrent: {enable: 1, limit_pu: 1.5}
     events:
       startup:
         start: 0.2
@@ -71,12 +69,11 @@ simulation:
     type: fixed
     method: rk4
     dt: 1.25e-05
-  log:
-    plant_period: 0.0005
+  initial:
+    t: 0.0           # default: capacitors at 1 pu, every other state 0
+  output:
+    period: 0.0005
     control_every: 10
-  stop_on_trip: true
-initial:
-  t: 0.0           # default: capacitors at 1 pu, every other state 0
-output:
-  states: true
-  signals: false
+    states: 1
+    signals: 0
+  stop_on_trip: 1

@@ -54,7 +54,7 @@ class Unit:
             i_dc=lambda: self.dclink.inp.i_dc)
         T_s = cfg.pwm.update_period  # PWM publication interval
         self.adc = ADC(self.ports, T_s, int(cfg.control.samples_per_update),
-                       meas.window_s if meas.window_s is not None else T_s, channels)
+                       meas.window if meas.window is not None else T_s, channels)
 
         # ------------------------------------------------------------ control
         self.ctrl = ctrl if ctrl is not None else make_controller(cfg, sc)

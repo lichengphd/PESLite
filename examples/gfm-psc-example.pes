@@ -1,6 +1,6 @@
 meta:
-  custom:                 # free-form user metadata; ignored by the core package
-    psc_lag_tau_s: 0.02
+  title: PSC grid-forming converter
+  description: Power-synchronisation control with active damping.
 base:
   s_base: 2000000.0
   v_ll_rms: 690.0
@@ -29,11 +29,9 @@ units:
         type: voltage
         v_pu: 1.0
     measurement:              # ADC
-      average: instantaneous  # instantaneous | window (mean over (t_k - window_s, t_k])
-      window_s: 50.0e-6       # averaging window, used when average = window
+      average: instantaneous  # instantaneous | window (mean over (t_k - window, t_k])
       # u_dc: instantaneous   # same choice for the dc voltage
     pwm:
-      update_period: 5e-05
       f_sw: 20000.0
       modulation_limit: 0.95
       carrier_phase: 0.0
@@ -43,7 +41,7 @@ units:
         power:
           type: power
           period: 5.0e-05
-          bw_hz: 0.0
+          filter: {enable: 0}
         sync:
           type: psc
           period: 5.0e-05
@@ -66,8 +64,7 @@ units:
     delay:
       steps: 1
     protection:
-      i_alarm_pu: 1.5
-      hold_s: 0.02
+      overcurrent: {enable: 1, limit_pu: 1.5}
     events:
       startup:
         start: 0.2
@@ -82,12 +79,11 @@ simulation:
     type: fixed
     method: rk4
     dt: 1.25e-05
-  log:
-    plant_period: 0.0005
+  initial:
+    t: 0.0           # default: capacitors at 1 pu, every other state 0
+  output:
+    period: 0.0005
     control_every: 10
-  stop_on_trip: true
-initial:
-  t: 0.0           # default: capacitors at 1 pu, every other state 0
-output:
-  states: true
-  signals: false
+    states: 1
+    signals: 0
+  stop_on_trip: 1

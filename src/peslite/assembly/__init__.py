@@ -5,10 +5,10 @@ the files); ``validate``: the checks across its sections; ``events``: the time f
 events; ``unit``: a converter unit; ``system``: the network with its units, as one model.
 """
 
-from .params import BaseValues, ConfigError, Params, dump, from_dict, load, read_initial, to_dict
+from .params import BaseValues, ConfigError, Params, dump, dumps, from_dict, load, read_initial, to_dict
 from .events import SourceScenario, UnitScenario
 from .unit import Unit
 from .system import System
 
-__all__ = ["Params", "BaseValues", "ConfigError", "load", "dump", "from_dict", "to_dict", "read_initial",
+__all__ = ["Params", "BaseValues", "ConfigError", "load", "dump", "dumps", "from_dict", "to_dict", "read_initial",
            "SourceScenario", "UnitScenario", "Unit", "System"]

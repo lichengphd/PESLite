@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import warnings
+from dataclasses import fields, is_dataclass
 
 from typing import TYPE_CHECKING
 
@@ -34,6 +35,20 @@ def _misaligned(name: str, r: float, where: str, both_ways: bool = False) -> Non
     warnings.warn(f"{where}: {name} = {r:.6g} is not a whole number"
                   f"{' in either direction' if both_ways else ''}, so the two grids do not line "
                   f"up; the periods are used as configured", stacklevel=3)
+
+
+def _switched(section, where: str) -> None:
+    """Validate a section controlled by an ``enable`` switch."""
+    if not section.enable:
+        return
+    for f in fields(section):
+        value = getattr(section, f.name)
+        if f.name == "enable" or not f.init:
+            continue
+        if value is None:
+            raise ConfigError(f"{where}.{f.name}: required when enable is 1")
+        if not math.isfinite(value) or value <= 0:
+            raise ConfigError(f"{where}.{f.name} must be finite and positive, got {value}")
 
 
 def _dclink(cfg, where):
@@ -89,6 +104,8 @@ def _control(c, dclink, where: str) -> None:
         for key, value in vars(cfg).items():
             if isinstance(value, (int, float)) and not math.isfinite(value):
                 raise ConfigError(f"{where}.loops.{name}.{key} must be finite")
+            if is_dataclass(value) and hasattr(value, "enable"):
+                _switched(value, f"{where}.loops.{name}.{key}")
         if cfg.type == "matching" and dclink.capacitor is None:
             raise ConfigError(f"{where}: matching control needs dclink.capacitor")
         if cfg.type == "matching" and cfg.k_theta_pu is None and c.references.vdc_ref_pu <= 0:
@@ -109,17 +126,20 @@ def _sampling(c, m, T_pwm: float, where: str) -> None:
     sampling_period = c.sampling_period if c.sampling_period is not None else T_pwm
     _misaligned("pwm.update_period / control.sampling_period", T_pwm / sampling_period,
                 f"{where}.control.sampling_period")
-    if m.window_s is not None and m.window_s <= 0.0:
-        raise ConfigError(f"{where}.measurement.window_s must be > 0, got {m.window_s}")
+    if m.window is not None and m.window <= 0.0:
+        raise ConfigError(f"{where}.measurement.window must be > 0, got {m.window}")
     if m.average == "window" or m.u_dc == "window":
-        window = m.window_s if m.window_s is not None else T_pwm
+        window = m.window if m.window is not None else T_pwm
         if window > T_pwm * (1.0 + 1e-9):
             raise ConfigError(
-                f"{where}.measurement.window_s = {window} is longer than the PWM update period {T_pwm}")
+                f"{where}.measurement.window = {window} is longer than the PWM update period {T_pwm}")
         if sampling_period < T_pwm * (1.0 - 1e-9):
             raise ConfigError(
                 f"{where}: measurement.average = 'window' cannot be combined with a sampling period "
                 f"shorter than the PWM update period")
+    elif m.window is not None:
+        warnings.warn(f"{where}.measurement.window has no effect: no quantity is window-averaged",
+                      stacklevel=4)
 
 
 def _unit(u, base, where: str) -> None:
@@ -134,6 +154,14 @@ def _unit(u, base, where: str) -> None:
     _sampling(u.control, u.measurement, u.pwm.effective_update_period, where)
     if u.delay.steps < 0:
         raise ConfigError(f"{where}.delay.steps must be >= 0")
+    protection = u.protection
+    for name in ("overcurrent", "undervoltage", "overvoltage", "frequency", "dc_voltage", "rocof"):
+        _switched(getattr(protection, name), f"{where}.protection.{name}")
+    if not math.isfinite(protection.hold) or protection.hold < 0:
+        raise ConfigError(f"{where}.protection.hold must be finite and >= 0, got {protection.hold}")
+    if not math.isfinite(protection.rocof.window) or protection.rocof.window <= 0:
+        raise ConfigError(f"{where}.protection.rocof.window must be finite and positive, "
+                          f"got {protection.rocof.window}")
 
 
 def _network(p: Params) -> None:
@@ -199,24 +227,24 @@ def _solver(s, bridge: str) -> None:
 
 def _initial(p: Params) -> None:
     """Check the start/end times and the shape of initial state values."""
-    t0 = p.initial.t
+    t0 = p.simulation.initial.t
     if t0 < 0.0:
-        raise ConfigError("initial.t must be >= 0")
+        raise ConfigError("simulation.initial.t must be >= 0")
     for name, u in p.units.items():  # t0 must be on every unit's PWM update grid
         T = u.pwm.effective_update_period
         if abs(round(t0 / T) * T - t0) > 1e-9 * max(1.0, t0):
-            raise ConfigError(f"initial.t = {t0} is not on the PWM update grid of {name!r} (a multiple of "
+            raise ConfigError(f"simulation.initial.t = {t0} is not on the PWM update grid of {name!r} (a multiple of "
                               f"units.{name}.pwm.update_period = {T})")
     if p.simulation.t_end <= t0:
-        raise ConfigError(f"simulation.t_end = {p.simulation.t_end} must be after initial.t = {t0}")
-    for key, value in p.initial.states.items():
+        raise ConfigError(f"simulation.t_end = {p.simulation.t_end} must be after simulation.initial.t = {t0}")
+    for key, value in p.simulation.initial.states.items():
         if isinstance(value, str):
             continue  # a keyword, resolved when the plant is built
         elif isinstance(value, (list, tuple)):
             if len(value) != 2 or not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in value):
-                raise ConfigError(f"initial.states.{key}: expected [re, im], got {value!r}")
+                raise ConfigError(f"simulation.initial.states.{key}: expected [re, im], got {value!r}")
         elif not isinstance(value, (int, float)):
-            raise ConfigError(f"initial.states.{key}: expected a number, [re, im], a flag or a keyword, "
+            raise ConfigError(f"simulation.initial.states.{key}: expected a number, [re, im], a flag or a keyword, "
                               f"got {value!r}")
 
 

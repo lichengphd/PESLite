@@ -45,7 +45,6 @@ units:
         type: voltage
         v_pu: 1.0
     pwm:
-      update_period: 5e-05
       f_sw: 20000.0
       modulation_limit: 0.95
       carrier_phase: 0.0
@@ -55,7 +54,7 @@ units:
         power:
           type: power
           period: 5.0e-05
-          bw_hz: 0.0
+          filter: {enable: 0}
         sync:
           type: psc
           period: 5.0e-05
@@ -78,8 +77,7 @@ units:
     delay:
       steps: 1
     protection:
-      i_alarm_pu: 1.5
-      hold_s: 0.02
+      overcurrent: {enable: 1, limit_pu: 1.5}
     events:
       startup:
         start: 0.05
@@ -103,7 +101,6 @@ units:
         i_pu: 0.9
         k_pu: 0.0
     pwm:
-      update_period: 0.0001
       f_sw: 10000.0
       modulation_limit: 0.95
       carrier_phase: 0.0
@@ -118,7 +115,7 @@ units:
         cc:
           type: dq_current_pi
           period: 0.0001
-          bw_hz: 200.0
+          bandwidth: 200.0
           antiwindup: conditional
         dvc:
           type: dc_voltage_pi
@@ -127,18 +124,16 @@ units:
           kp_pu: 0.8
           ki_pu: 90.0
           id0_export_pu: 0.9
-          bidirectional: false
+          bidirectional: 0
     delay:
       steps: 0
     protection:
-      i_alarm_pu: 1.15
-      vac_uv_pu: 0.5
-      vac_ov_pu: 1.2
-      freq_band_hz: -1.0
-      vdc_band_pu: -1.0
-      hold_s: 0.02
-      rocof_alarm_hz_s: 1.0
-      rocof_window_s: 0.1
+      overcurrent: {enable: 1, limit_pu: 1.15}
+      undervoltage: {enable: 1, limit_pu: 0.5}
+      overvoltage: {enable: 1, limit_pu: 1.2}
+      frequency: {enable: 0}
+      dc_voltage: {enable: 0}
+      rocof: {enable: 1, limit: 1.0, window: 0.1}
     events:
       startup:
         start: 0.05
@@ -153,15 +148,14 @@ simulation:
     dt: 1.25e-05
     rtol: 1.0e-06
     atol: 1.0e-09
-  log:
-    plant_period: 0.0005
+  initial:
+    t: 0.0           # default: capacitors at 1 pu, every other state 0
+  output:
+    period: 0.0005
     control_every: 10
-  stop_on_trip: false
+    states: 1
+    signals: 0
+    energy: 0
+  stop_on_trip: 0
   progress_every: 0.0
   energy_check: warn
-initial:
-  t: 0.0           # default: capacitors at 1 pu, every other state 0
-output:
-  states: true
-  signals: false
-  energy: false

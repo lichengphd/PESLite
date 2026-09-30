@@ -4,6 +4,7 @@ import yaml
 
 import peslite
 from conftest import EXAMPLES, ROOT
+from peslite.solver import simulation
 from peslite.solver.simulation import _config_path
 
 EXPECTED = {
@@ -48,3 +49,19 @@ def test_issue_two_does_not_change_the_release_version():
 def test_wheel_data_comes_from_the_root_examples_directory():
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert '"share/peslite/examples" = ["examples/*.pes"]' in pyproject
+
+
+def test_installed_package_finds_examples_in_its_data_directory(tmp_path, monkeypatch):
+    installed = tmp_path / "installed"
+    examples = installed / "share" / "peslite" / "examples"
+    examples.mkdir(parents=True)
+
+    class Distribution:
+        @staticmethod
+        def locate_file(_entry):
+            return installed
+
+    fake_module = tmp_path / "package" / "peslite" / "solver" / "simulation.py"
+    monkeypatch.setattr(simulation, "__file__", str(fake_module))
+    monkeypatch.setattr(simulation, "distribution", lambda _name: Distribution())
+    assert simulation._example_configs_dir() == examples

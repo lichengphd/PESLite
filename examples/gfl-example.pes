@@ -45,12 +45,11 @@ units:                     # converters; one entry per converter
         # voltage source: v_pu (emf, default 1), r_pu (series R, default 0)
 
     measurement:           # ADC
-      average: instantaneous # instantaneous | window (mean over (t_k - window_s, t_k])
-      # window_s: 50.0e-6  # averaging window; default: the PWM update period
+      average: instantaneous # instantaneous | window (mean over (t_k - window, t_k])
+      # window: 50.0e-6    # averaging window; default: the PWM update period
       # u_dc: instantaneous  # same choice for the dc voltage
 
     pwm:
-      update_period: 5e-05 # s
       f_sw: 20000.0        # Hz
       modulation_limit: 0.95
       # method: spwm       # spwm | svpwm
@@ -69,7 +68,7 @@ units:                     # converters; one entry per converter
         cc:
           type: dq_current_pi
           period: 5.0e-05
-          bw_hz: 200.0
+          bandwidth: 200.0
           antiwindup: conditional  # conditional | backcalc | none
         dvc:
           type: dc_voltage_pi
@@ -78,19 +77,18 @@ units:                     # converters; one entry per converter
           kp_pu: 0.8
           ki_pu: 90.0
           id0_export_pu: 0.9
-          bidirectional: false
+          bidirectional: 0
       # sampling_period: 2.5e-5  # ADC oversampling (default: the PWM update period)
     delay:
       steps: 0             # computation delay in PWM updates
     protection:            # trips only this converter
-      i_alarm_pu: 1.15     # instantaneous phase-current trip
-      vac_uv_pu: 0.50
-      vac_ov_pu: 1.20
-      freq_band_hz: -1.0   # < 0: disabled
-      vdc_band_pu: -1.0    # < 0: disabled
-      hold_s: 0.02
-      rocof_alarm_hz_s: 1.0  # alarm only
-      rocof_window_s: 0.1
+      overcurrent: {enable: 1, limit_pu: 1.15}
+      undervoltage: {enable: 1, limit_pu: 0.50}
+      overvoltage: {enable: 1, limit_pu: 1.20}
+      frequency: {enable: 0}
+      dc_voltage: {enable: 0}
+      hold: 0.02
+      rocof: {enable: 1, limit: 1.0, window: 0.1}
 
     events:
       startup: {start: 0.2, duration: 1.0}
@@ -109,20 +107,17 @@ simulation:
     # subsystems: {vsc.dclink: 10, pcc: 0.1}  # own step relative to dt: 10 = once per 10 steps, 0.1 = 10 per step
     # sweeps: 2
     # linearisations: 3
-  log:
-    plant_period: 0.5e-3   # s
+  initial:                 # default: capacitors at 1 pu, every other state 0
+    t: 0.0
+    states:                # names as in states.csv (see --list-states)
+      plant.pcc.u_C: source  # 'source': the emf driving that bus at t
+      plant.vsc.u_dc: rated  # 'rated': the unit's rated dc voltage
+  output:
+    period: 0.5e-3         # s
     control_every: 10      # keep every 10th controller sample
-  stop_on_trip: true
+    states: 1              # states.csv
+    signals: 0             # plant.csv + control.<unit>.csv
+    energy: 0              # energy.csv
+  stop_on_trip: 1
   progress_every: 0.0
   energy_check: warn       # warn | strict | off
-
-initial:                   # default: capacitors at 1 pu, every other state 0
-  t: 0.0
-  states:                  # names as in states.csv (see --list-states)
-    plant.pcc.u_C: source  # 'source': the emf driving that bus at t
-    plant.vsc.u_dc: rated  # 'rated': the unit's rated dc voltage
-
-output:
-  states: true             # states.csv
-  signals: false           # plant.csv + control.<unit>.csv
-  energy: false            # energy.csv

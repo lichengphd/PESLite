@@ -14,6 +14,7 @@ import csv
 import dataclasses
 import json
 import math
+import sysconfig
 import time
 import warnings
 from dataclasses import dataclass, field
@@ -23,7 +24,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional
 
 import numpy as np
 
-from ..assembly.params import Params, dump, load
+from ..assembly.params import Params, dump, dumps, load
 from ..assembly.system import System
 from ..assembly.unit import Unit
 from ..components.pwm import Delay, Modulator
@@ -140,19 +141,20 @@ class SimulationResult:
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
         written = []
-        if self.params.output.states:
+        output = self.params.simulation.output
+        if output.states:
             self.states_to_csv(out / "states.csv")
             written.append(out / "states.csv")
-        if self.params.output.signals:
+        if output.signals:
             self.to_csv(out / "plant.csv")
             written += [out / "plant.csv"] + self.control_to_csv(out / "control.csv")
-        if self.params.output.energy and self.energy:
+        if output.energy and self.energy:
             self.energy_to_csv(out / "energy.csv")
             written.append(out / "energy.csv")
         summary = {**(info or {}), "wall_time_s": self.wall_time, "n_rhs": self.n_rhs, **self.summary}
         (out / "summary.json").write_text(json.dumps(summary, indent=2, default=float), encoding="utf-8")
-        dump(self.params, out / "params.yaml")
-        written += [out / "summary.json", out / "params.yaml"]
+        dump(self.params, out / "simulation.pes")
+        written += [out / "summary.json", out / "simulation.pes"]
         return written
 
 def _write(path: str | Path, cols: dict) -> None:
@@ -427,7 +429,7 @@ class Simulation:
         self._start_duty()  # so that the duty ratios and delay pipelines have their states
         parts = self._parts()
         try:
-            values = resolve(gather(parts), expand_aliases(self.p.initial.states, aliases), presets)
+            values = resolve(gather(parts), expand_aliases(self.p.simulation.initial.states, aliases), presets)
         except (KeyError, ValueError) as exc:
             msg = exc.args[0] if exc.args else str(exc)
             if aliases:
@@ -462,16 +464,17 @@ class Simulation:
         p, system = self.p, self.system
         mdl, solver = system.model, self.solver
         t_end = p.simulation.t_end if t_end is None else t_end
-        log_period = p.simulation.log.plant_period
-        control_every = max(1, p.simulation.log.control_every)
+        output = p.simulation.output
+        log_period = output.period
+        control_every = max(1, output.control_every)
         stop_on_trip = p.simulation.stop_on_trip
         progress_every = p.simulation.progress_every
-        rec = Recorder(keep_states=p.output.states)
+        rec = Recorder(keep_states=output.states)
         wall0 = time.time()
 
         units = list(system.units.values())
         periods = [u.pwm.period for u in units]
-        t_start = min(round(p.initial.t / T) * T for T in periods)
+        t_start = min(round(p.simulation.initial.t / T) * T for T in periods)
         if t_end <= t_start + _EPS:
             raise ValueError(f"t_end = {t_end} must be after the start time {t_start}")
         # the run ends at the earliest period boundary at or after t_end
@@ -734,10 +737,10 @@ class SystemLoop:
         self._p = dataclasses.replace(
             p,
             simulation=dataclasses.replace(sp, energy_check="off", stop_on_trip=False, progress_every=0.0,
-                                           log=dataclasses.replace(sp.log, plant_period=self.period or 1.0),
+                                           output=dataclasses.replace(sp.output, period=self.period or 1.0,
+                                                                      states=True, energy=False, signals=False),
                                            solver=dataclasses.replace(sp.solver, subsystems={},
-                                                                      linearisations=0)),
-            output=dataclasses.replace(p.output, states=True, energy=False, signals=False))
+                                                                      linearisations=0)))
 
     # ------------------------------------------------------------ coordinates
     def coordinates(self, names: list[str]) -> list[tuple[str, list[str], float]]:
@@ -811,9 +814,11 @@ class SystemLoop:
         view: optional ``(plant state label, offset, channel)``; the offset is seen by the
         integration (``"b"``) or by the end-of-period sample (``"c"``).
         """
+        initial = dataclasses.replace(
+            self._p.simulation.initial, t=t,
+            states={k: v for k, v in row.items() if not k.startswith("solver.")})
         p = dataclasses.replace(self._p, simulation=dataclasses.replace(
-            self._p.simulation, t_end=t + self.period), initial=dataclasses.replace(
-            self._p.initial, t=t, states={k: v for k, v in row.items() if not k.startswith("solver.")}))
+            self._p.simulation, t_end=t + self.period, initial=initial))
         sim = self._cls(p, parts=self._factories)
         model = sim.system.model
         if view is not None:
@@ -845,12 +850,13 @@ def _example_configs_dir() -> Path:
         dist = distribution("peslite")
     except PackageNotFoundError:
         return source
-    for entry in dist.files or ():
-        parts = entry.parts
-        if len(parts) >= 3 and tuple(parts[-3:-1]) == ("peslite", "examples"):
-            candidate = Path(dist.locate_file(entry)).resolve().parent
-            if candidate.is_dir():
-                return candidate
+    # data-files live below the installation prefix, outside the import package.  A ``--target``
+    # installation puts them below the metadata root; a normal environment uses sysconfig's data root.
+    roots = (Path(dist.locate_file("")).resolve(), Path(sysconfig.get_path("data")).resolve())
+    for root in roots:
+        candidate = root / "share" / "peslite" / "examples"
+        if candidate.is_dir():
+            return candidate
     return source
 
 
@@ -901,10 +907,7 @@ def parse_override(text: str):
 
 
 def main(argv=None) -> int:
-    """Run a converter configuration and save its states, summary and configured signals.
-
-    With no config argument, run the first bundled YAML/JSON example (sorted by filename).
-    """
+    """Run a simulation file and save its states, summary and configured signals."""
     ap = argparse.ArgumentParser(description=main.__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("config", nargs="?", help="configuration name or path; default: first bundled example by filename")
     ap.add_argument("--set", action="append", default=[], type=parse_override, metavar="PATH=VALUE",
@@ -920,6 +923,8 @@ def main(argv=None) -> int:
                     help="print the state names generated for this configuration and exit")
     ap.add_argument("--ph-report", action="store_true",
                     help="print the port-Hamiltonian structure report of the system (always built) and exit")
+    ap.add_argument("--resolved", action="store_true",
+                    help="print the complete resolved simulation file and exit")
     args = ap.parse_args(argv)
 
     try:
@@ -932,6 +937,9 @@ def main(argv=None) -> int:
         overrides["simulation.progress_every"] = args.progress
     p = load(config, initial=args.initial,
                     initial_time=args.initial_time, **overrides)
+    if args.resolved:
+        print(dumps(p), end="")
+        return 0
     sim = Simulation(p)
     if args.list_states:
         print("\n".join(sim.state_names()))
@@ -943,7 +951,8 @@ def main(argv=None) -> int:
                       for n, u in p.units.items())
     print(f"peslite: {config}  units={units}  bridge={p.simulation.bridge}  "
           f"solver={p.simulation.solver.type}/{p.simulation.solver.method}  "
-          f"t = {p.initial.t} .. {p.simulation.t_end} s  ({len(p.initial.states)} initial values given)")
+          f"t = {p.simulation.initial.t} .. {p.simulation.t_end} s  "
+          f"({len(p.simulation.initial.states)} initial values given)")
     if sim.ph_report is not None:
         print(f"structure: {sim.ph_report.verdict} (state coverage {sim.ph_report.coverage:.0%}"
               f"{'; ' + '; '.join(sim.energy_problems) if sim.energy_problems else ''})")

@@ -56,6 +56,7 @@ peslite gfl-example --initial output/a/states.csv --out output/b
 # inspect a configuration
 peslite gfl-example --list-states     # state names (the states.csv columns)
 peslite gfl-example --ph-report       # port-Hamiltonian structure of the circuit
+peslite gfl-example --resolved        # complete resolved simulation file
 peslite --help
 ```
 
@@ -72,7 +73,7 @@ r.plant["vsc.i_c"]                 # plant signals (complex space vectors)
 r.control["vsc.id_pu"]             # controller log of unit "vsc"
 r.final_states()                   # last row, usable as an initial state
 r.summary                          # trips, alarms, peaks
-r.save("output/run")               # states.csv, summary.json, params.yaml
+r.save("output/run")               # states.csv, summary.json, simulation.pes
 ```
 
 ## Example configurations
@@ -96,23 +97,23 @@ r.save("output/run")               # states.csv, summary.json, params.yaml
 | `simulation.solver.type` / `.method` | `fixed`: `euler` \| `heun` \| `rk4`; `adaptive`: `RK45` \| `DOP853` \| `Radau` \| `BDF` \| `LSODA` \| `DP45` |
 | `simulation.solver.dt` | maximum fixed step, s |
 | `simulation.solver.subsystems` | own steps per subsystem, e.g. `{vsc.dclink: 10, pcc: 0.1}` |
-| `simulation.log.plant_period` | snapshot interval, s |
+| `simulation.output.period` | snapshot interval, s |
 | `simulation.energy_check` | `warn` \| `strict` \| `off` |
 | `units.<u>.control.type` | `gfl` \| `gfm` \| `custom` |
 | `units.<u>.control.loops.<loop>.period` | loop period, s |
-| `units.<u>.measurement.average` | `instantaneous` \| `window` (with `window_s`) |
+| `units.<u>.measurement.average` | `instantaneous` \| `window` (with `window`) |
 | `units.<u>.pwm.method` / `.sync` | `spwm` \| `svpwm`; `asynchronous` \| `synchronous` |
 | `units.<u>.delay.steps` | computation delay in PWM updates |
-| `output.states` / `.signals` / `.energy` | which files are written |
+| `simulation.output.states` / `.signals` / `.energy` | which files are written |
 
 ## Output
 
 | File | Content |
 |---|---|
 | `states.csv` | every state at each snapshot; any row can start a new run |
-| `plant.csv`, `control.<unit>.csv` | plant signals and controller logs (`output.signals: true`) |
-| `energy.csv` | stored energy and power balance (`output.energy: true`) |
-| `summary.json`, `params.yaml` | run summary and the full parameter set |
+| `plant.csv`, `control.<unit>.csv` | plant signals and controller logs (`simulation.output.signals: 1`) |
+| `energy.csv` | stored energy and power balance (`simulation.output.energy: 1`) |
+| `summary.json`, `simulation.pes` | run summary and the complete resolved simulation file |
 
 ## Custom parts
 

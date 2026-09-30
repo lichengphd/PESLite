@@ -28,12 +28,14 @@ from ..solver.model import ConfigError
 from .validate import validate
 
 __all__ = [
-    "ConfigError", "load", "dump", "read_tree", "read_initial", "from_dict", "to_dict", "BaseValues", "DCBase",
+    "ConfigError", "load", "dump", "dumps", "read_tree", "read_initial", "from_dict", "to_dict",
+    "BaseValues", "DCBase",
     "BusParams", "BranchParams", "SourceParams", "SourceEventParams",
     "ACFilterParams", "DCLinkParams", "DCCapacitorParams", "DCSourceParams", "PWMParams", "MeasurementParams",
-    "ReferenceParams", "ControlParams", "DelayParams", "ProtectionParams",
+    "ReferenceParams", "ControlParams", "DelayParams", "OvercurrentParams", "VoltageLimitParams",
+    "FrequencyLimitParams", "DCVoltageLimitParams", "RocofParams", "ProtectionParams",
     "StartupParams", "SetpointStepParams", "PLLGainStepParams", "UnitEventParams", "UnitParams",
-    "SolverParams", "LogParams", "SimulationParams", "InitialParams", "OutputParams", "Params",
+    "SolverParams", "SimulationParams", "InitialParams", "OutputParams", "MetaParams", "Params",
 ]
 
 
@@ -320,11 +322,11 @@ class MeasurementParams:
     """ADC measurement settings.
 
     ``average`` (AC) and ``u_dc`` (DC): ``"instantaneous"`` or ``"window"`` (mean over
-    ``window_s``, s, at most the PWM update period).
+    ``window``, s, at most the PWM update period).
     """
 
     average: str = "instantaneous"
-    window_s: Optional[float] = None  # s; default: the PWM update period
+    window: Optional[float] = None  # s; default: the PWM update period
     u_dc: str = "instantaneous"
 
     _choices = {"average": ("instantaneous", "window"), "u_dc": ("instantaneous", "window")}
@@ -374,20 +376,53 @@ class DelayParams:
 
 
 @dataclass(frozen=True)
+class OvercurrentParams:
+    enable: bool = False
+    limit_pu: Optional[float] = None
+
+    _quantities = {"limit_pu": "current"}
+
+
+@dataclass(frozen=True)
+class VoltageLimitParams:
+    enable: bool = False
+    limit_pu: Optional[float] = None
+
+    _quantities = {"limit_pu": "voltage"}
+
+
+@dataclass(frozen=True)
+class FrequencyLimitParams:
+    enable: bool = False
+    limit: Optional[float] = None  # Hz
+
+
+@dataclass(frozen=True)
+class DCVoltageLimitParams:
+    enable: bool = False
+    limit_pu: Optional[float] = None
+
+    _quantities = {"limit_pu": "dc_voltage"}
+
+
+@dataclass(frozen=True)
+class RocofParams:
+    enable: bool = False
+    limit: Optional[float] = None  # Hz/s
+    window: float = 0.1  # s
+
+
+@dataclass(frozen=True)
 class ProtectionParams:
-    """Trip and alarm thresholds; ``<= 0`` disables a criterion; times in s."""
+    """Trip criteria and the ROCOF alarm, each switched by ``enable`` (1/0)."""
 
-    i_alarm_pu: float = -1.0  # instantaneous phase current, trips immediately
-    vac_uv_pu: float = -1.0
-    vac_ov_pu: float = -1.0
-    freq_band_hz: float = -1.0
-    vdc_band_pu: float = -1.0
-    hold_s: float = 0.02
-    rocof_alarm_hz_s: float = -1.0  # alarm only
-    rocof_window_s: float = 0.1
-
-    _quantities = {"i_alarm_pu": "current", "vac_uv_pu": "voltage",
-                   "vac_ov_pu": "voltage", "vdc_band_pu": "dc_voltage"}
+    overcurrent: OvercurrentParams = field(default_factory=OvercurrentParams)
+    undervoltage: VoltageLimitParams = field(default_factory=VoltageLimitParams)
+    overvoltage: VoltageLimitParams = field(default_factory=VoltageLimitParams)
+    frequency: FrequencyLimitParams = field(default_factory=FrequencyLimitParams)
+    dc_voltage: DCVoltageLimitParams = field(default_factory=DCVoltageLimitParams)
+    rocof: RocofParams = field(default_factory=RocofParams)
+    hold: float = 0.02  # s
 
 
 @dataclass(frozen=True)
@@ -444,6 +479,7 @@ class UnitParams:
     protection: ProtectionParams = field(default_factory=ProtectionParams)
     events: UnitEventParams = field(default_factory=UnitEventParams)
     base: BaseValues = field(init=False, default=None)  # set by resolved()
+    derived_defaults: frozenset = field(init=False, default=frozenset(), compare=False)
 
     @staticmethod
     def _bases(data: dict, base: BaseValues, where: str) -> tuple[BaseValues, dict[str, float]]:
@@ -461,11 +497,16 @@ class UnitParams:
         return base, base.parameter_scales(vdc_ref)
 
     def resolved(self, system_base: BaseValues) -> UnitParams:
-        """Return a copy with ``base``, timing defaults and ``omega`` filled in (after validation)."""
-        pwm = replace(self.pwm, update_period=self.pwm.effective_update_period)
+        """Return a copy with its base and dependent defaults resolved."""
+        derived = set()
+        pwm = self.pwm
+        if pwm.update_period is None:
+            pwm = replace(pwm, update_period=pwm.switching_period)
+            derived.add("pwm.update_period")
         references = self.control.references
         if references.omega is None:
             references = replace(references, omega=system_base.w0)
+            derived.add("control.references.omega")
         control = replace(self.control, references=references)
         sampling_period = control.sampling_period if control.sampling_period is not None else pwm.update_period
         object.__setattr__(control, "samples_per_update",
@@ -474,6 +515,7 @@ class UnitParams:
         base = system_base if self.s_base is None else BaseValues(
             self.s_base, system_base.v_ll_rms, system_base.f0)
         object.__setattr__(unit, "base", base)
+        object.__setattr__(unit, "derived_defaults", frozenset(derived))
         return unit
 
     @property
@@ -507,25 +549,6 @@ class SolverParams:
 
 
 @dataclass(frozen=True)
-class LogParams:
-    plant_period: float = 5e-4  # plant snapshot period, s
-    control_every: int = 1  # keep every n-th controller sample
-
-
-@dataclass(frozen=True)
-class SimulationParams:
-    t_end: float
-    bridge: str = "switching"  # "switching" | "averaged" | "step_averaged"
-    solver: SolverParams = field(default_factory=SolverParams)
-    log: LogParams = field(default_factory=LogParams)
-    stop_on_trip: bool = True
-    progress_every: float = 0.0  # s of simulated time between progress lines; 0: silent
-    energy_check: str = "warn"  # "warn" | "strict" | "off": verify the energy declarations before the run
-
-    _choices = {"bridge": ("switching", "averaged", "step_averaged"), "energy_check": ("warn", "strict", "off")}
-
-
-@dataclass(frozen=True)
 class InitialParams:
     """Start time ``t`` (s) and overrides of initial state values.
 
@@ -540,11 +563,40 @@ class InitialParams:
 
 @dataclass(frozen=True)
 class OutputParams:
-    """Files written by ``SimulationResult.save``."""
+    """What a run records and the files written by ``SimulationResult.save``."""
 
+    period: float = 5e-4  # plant snapshot interval, s
+    control_every: int = 1  # keep every n-th controller sample
     states: bool = True  # states.csv
     signals: bool = False  # plant.csv and control.csv
     energy: bool = False  # energy.csv
+
+
+@dataclass(frozen=True)
+class SimulationParams:
+    """How the model is simulated: time span, bridge model, solver, initial state and output."""
+
+    t_end: float
+    bridge: str = "switching"  # "switching" | "averaged" | "step_averaged"
+    solver: SolverParams = field(default_factory=SolverParams)
+    initial: InitialParams = field(default_factory=InitialParams)
+    output: OutputParams = field(default_factory=OutputParams)
+    stop_on_trip: bool = True
+    progress_every: float = 0.0  # s of simulated time between progress lines; 0: silent
+    energy_check: str = "warn"  # "warn" | "strict" | "off": verify the energy declarations before the run
+
+    _choices = {"bridge": ("switching", "averaged", "step_averaged"), "energy_check": ("warn", "strict", "off")}
+
+
+@dataclass(frozen=True)
+class MetaParams:
+    """Optional human-readable notes which do not affect the simulation."""
+
+    title: Optional[str] = None
+    description: Optional[str] = None
+
+    _text = ("title", "description")
+    _unknown_hint = "meta holds only a title and a description"
 
 
 @dataclass(frozen=True)
@@ -561,9 +613,7 @@ class Params:
     simulation: SimulationParams
     sources: dict[str, SourceParams] = field(default_factory=dict)
     branches: dict[str, BranchParams] = field(default_factory=dict)
-    initial: InitialParams = field(default_factory=InitialParams)
-    output: OutputParams = field(default_factory=OutputParams)
-    meta: dict = field(default_factory=dict)
+    meta: MetaParams = field(default_factory=MetaParams)
 
     def unit(self, name: Optional[str] = None) -> UnitParams:
         """Return the unit ``name``, or the only unit if ``name`` is None."""
@@ -593,7 +643,7 @@ class Params:
         """Return a copy with dotted paths replaced, e.g. ``replace(**{"units.vsc.control.loops.pll.kp_pu": 20})``."""
         d = to_dict(self)
         assigned = set()
-        free = ("initial.states.", "simulation.solver.subsystems.")  # keys that contain dots themselves
+        free = ("simulation.initial.states.", "simulation.solver.subsystems.")  # dotted keys themselves
         for path, value in path_values.items():
             head = next((h for h in free if path.startswith(h)), None)
             if head is not None:  # remainder is one key
@@ -629,12 +679,24 @@ def from_dict(data: dict) -> Params:
     return replace(p, units={name: unit.resolved(p.base) for name, unit in p.units.items()})
 
 
-def to_dict(p: Any) -> dict:
-    """Convert a dataclass tree to mappings, omitting non-init (derived) fields."""
+def to_dict(p: Any, derived: bool = False) -> dict:
+    """Convert a dataclass tree to mappings, omitting non-init fields.
+
+    Values filled from other parameters are written as ``None`` unless ``derived`` is true,
+    so rebuilding the mapping derives them from any replacements again.
+    """
     if is_dataclass(p) and not isinstance(p, type):
-        return {f.name: to_dict(getattr(p, f.name)) for f in fields(p) if f.init}
+        d = {f.name: to_dict(getattr(p, f.name), derived) for f in fields(p) if f.init}
+        if not derived:
+            for path in getattr(p, "derived_defaults", ()):
+                *head, last = path.split(".")
+                node = d
+                for key in head:
+                    node = node[key]
+                node[last] = None
+        return d
     if isinstance(p, dict):
-        return {k: to_dict(v) for k, v in p.items()}
+        return {k: to_dict(v, derived) for k, v in p.items()}
     return p
 
 
@@ -651,7 +713,7 @@ def _numeric_string(value: Any) -> Any:
 def _flatten_states(states: Any, prefix: str = "") -> dict:
     """Flatten nested state mappings to dotted keys; lists are kept as values."""
     if not isinstance(states, dict):
-        raise ConfigError(f"initial.states{'.' + prefix if prefix else ''}: expected a mapping")
+        raise ConfigError(f"simulation.initial.states{'.' + prefix if prefix else ''}: expected a mapping")
     out: dict = {}
     for key, value in states.items():
         name = f"{prefix}.{key}" if prefix else str(key)
@@ -667,11 +729,11 @@ def _normalize(data: dict) -> dict:
     data = deepcopy(data)
     if not isinstance(data, dict):
         return data  # type error reported by the construction
-    init = data.get("initial")
+    simulation = data.get("simulation")
+    init = simulation.get("initial") if isinstance(simulation, dict) else None
     if isinstance(init, dict) and init.get("states") is not None:
         init["states"] = {key: _numeric_string(value)
                           for key, value in _flatten_states(init["states"]).items()}
-    simulation = data.get("simulation")
     solver = simulation.get("solver") if isinstance(simulation, dict) else None
     subsystems = solver.get("subsystems") if isinstance(solver, dict) else None
     if isinstance(subsystems, dict):
@@ -742,7 +804,9 @@ def _build(cls, data: Any, path: str, base: Any, scales: Optional[dict]):
     known = {f.name for f in fields(cls) if f.init}
     unknown = set(data) - known
     if unknown:
-        raise ConfigError(f"{path}: unknown key(s) {sorted(unknown)}; known: {sorted(known)}")
+        hint = getattr(cls, "_unknown_hint", "")
+        raise ConfigError(f"{path}: unknown key(s) {sorted(unknown)}; known: {sorted(known)}"
+                          + (f". {hint}" if hint else ""))
     kwargs = {}
     for f in fields(cls):
         if not f.init:
@@ -779,8 +843,10 @@ def _build(cls, data: Any, path: str, base: Any, scales: Optional[dict]):
                 elif isinstance(value, (int, float)) and value in (0, 1):
                     kwargs[f.name] = bool(value)
                 else:
-                    raise ConfigError(f"{key}: expected a boolean, got {value!r}")
+                    raise ConfigError(f"{key}: expected 1 (on) or 0 (off), got {value!r}")
             elif inner is str:
+                if f.name in getattr(cls, "_text", ()) and not isinstance(value, str):
+                    raise ConfigError(f"{key}: expected text, got {value!r}")
                 kwargs[f.name] = str(value)
             elif inner is dict:
                 kwargs[f.name] = dict(value)
@@ -817,7 +883,7 @@ def load(path: str | Path, initial: str | Path | None = None,
     if initial is not None:
         init = read_initial(initial, initial_time)
         merged = to_dict(p)
-        merged["initial"] = init
+        merged["simulation"]["initial"] = init
         if merged["simulation"]["t_end"] <= init.get("t", 0.0):
             # keep the configured duration after the new start time
             merged["simulation"]["t_end"] = init.get("t", 0.0) + p.simulation.t_end
@@ -844,7 +910,8 @@ def read_initial(path: str | Path, t: Optional[float] = None) -> dict:
     """Read an ``initial`` mapping (``t``, ``states``) from YAML/JSON or a states CSV.
 
     CSV: last row, or the row at ``t`` (s); empty/NaN cells are omitted.
-    YAML/JSON: the mapping itself or an ``initial`` block; ``t`` overrides its time.
+    YAML/JSON: a simulation file's ``simulation.initial`` block or the mapping itself;
+    ``t`` overrides its time.
     """
     path = Path(path)
     if path.suffix.lower() == ".csv":
@@ -870,10 +937,12 @@ def read_initial(path: str | Path, t: Optional[float] = None) -> dict:
                 states[name] = value
         return {"t": float(row[0]), "states": states}
     data = _read(path)
-    if isinstance(data, dict) and "initial" in data:
-        data = data["initial"]
+    if isinstance(data, dict) and isinstance(data.get("simulation"), dict):
+        if "initial" not in data["simulation"]:
+            raise ConfigError(f"{path}: a simulation file without a simulation.initial section")
+        data = data["simulation"]["initial"]
     if not isinstance(data, dict):
-        raise ConfigError(f"{path}: expected an 'initial' mapping")
+        raise ConfigError(f"{path}: expected an initial mapping (t, states)")
     if t is not None:
         data = {**data, "t": t}
     return data
@@ -887,13 +956,49 @@ def read_tree(path: str | Path) -> dict:
     return data
 
 
-def dump(p: Any, path: str | Path) -> None:
-    """Write ``p`` as a configuration file (YAML if PyYAML is installed, else JSON)."""
-    path = Path(path)
-    d = to_dict(p)
+_FILE_ORDER = ("base", "buses", "branches", "sources", "units", "simulation", "meta")
+
+
+def _written_out(p: Params) -> dict:
+    """Return ``p`` in file order, including defaults derived from other values."""
+    d = to_dict(p, derived=True)
+    for name, u in p.units.items():
+        unit = d["units"][name]
+        if unit["s_base"] is None:
+            unit["s_base"] = u.base.s_base
+        if unit["control"]["sampling_period"] is None:
+            unit["control"]["sampling_period"] = u.pwm.update_period
+        measurement = unit["measurement"]
+        if measurement["window"] is None and "window" in (measurement["average"], measurement["u_dc"]):
+            measurement["window"] = u.pwm.update_period
+    return _switches({key: d[key] for key in _FILE_ORDER})
+
+
+def _switches(value: Any) -> Any:
+    """Write switches as 1 or 0, including switches nested in mappings and lists."""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, dict):
+        return {key: _switches(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_switches(item) for item in value]
+    return value
+
+
+def dumps(p: Params) -> str:
+    """Return a complete resolved simulation file as YAML (or JSON without PyYAML)."""
+    d = _written_out(p)
     try:
         import yaml  # type: ignore
-
-        path.write_text(yaml.safe_dump(d, sort_keys=False), encoding="utf-8")
     except ImportError:  # pragma: no cover
-        path.write_text(json.dumps(d, indent=2), encoding="utf-8")
+        return json.dumps(d, indent=2) + "\n"
+    from .. import __version__
+    header = (f"# PESLite {__version__} simulation file with every value written out (plant values in SI).\n"
+              f"# null: not used, or derived when the case is built (for example loop gains from bandwidth).\n"
+              f"# Run it with: peslite <this file>\n")
+    return header + yaml.safe_dump(d, sort_keys=False)
+
+
+def dump(p: Params, path: str | Path) -> None:
+    """Write a complete resolved simulation file (see :func:`dumps`)."""
+    Path(path).write_text(dumps(p), encoding="utf-8")

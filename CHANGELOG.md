@@ -77,3 +77,18 @@
 - The results of a simulation file are unchanged: bit for bit on the bundled files and on the
   other settings (bridge models, averaging windows, oversampling, delays, synchronous PWM,
   multirate splits, adaptive solvers, trips, restarts).
+
+### Simulation file parameters (#2)
+
+- `initial` and `output` are inside `simulation`; the former `simulation.log` fields are now
+  `simulation.output.period` and `simulation.output.control_every`.
+- Parameter names follow the SI/pu convention (no suffix for SI and `_pu` for per unit).
+  `measurement.window_s`, current-loop `bw_hz`, VSG `h_s` and dVOC `kappa_rad` are now
+  `window`, `bandwidth`, `h` and `kappa`.
+- Protection criteria, the power measurement filter and the virtual-admittance current limit use
+  nested `enable` switches. Switches are accepted and written as 1 (on) or 0 (off).
+- Defaults derived from the system base, PWM frequency or nominal frequency continue to follow
+  those values through `--set` and `Params.replace`; explicitly supplied values remain fixed.
+- `meta` contains optional text-only `title` and `description` fields.
+- `peslite.dumps` returns and `peslite.dump` writes a complete resolved simulation file.
+  Run results contain this file as `simulation.pes`, and `peslite FILE --resolved` prints it.
