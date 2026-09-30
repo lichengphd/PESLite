@@ -13,7 +13,7 @@ from peslite.control import LOOP_TYPES, Loop, Measurement, SyncLaw, register_loo
 from peslite.solver.model import ConfigError
 
 CONTROL = Path(peslite.control.__file__).parent
-QUIET = {"simulation.progress_every": 0.0, "simulation.solver.linearisations": 0}
+QUIET = {"simulation.progress.enable": 0, "simulation.solver.linearisations": 0}
 FAST = {"events.connect_vsc.t": 0.0, "events.connect_vsc.ramp": 0.01}
 
 

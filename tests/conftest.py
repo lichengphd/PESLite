@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import peslite  # noqa: E402
 
-QUIET = {"simulation.solver.linearisations": 0, "simulation.progress_every": 0.0}
+QUIET = {"simulation.solver.linearisations": 0, "simulation.progress.enable": 0}
 
 CASE = {
     "base": {"s_base": 2.0e6, "v_ll_rms": 690.0, "f0": 50.0},

@@ -49,7 +49,7 @@ def _switched(section, where: str) -> None:
             continue
         if value is None:
             raise ConfigError(f"{where}.{f.name}: required when enable is 1")
-        if not math.isfinite(value) or value <= 0:
+        if isinstance(value, (int, float)) and (not math.isfinite(value) or value <= 0):
             raise ConfigError(f"{where}.{f.name} must be finite and positive, got {value}")
 
 
@@ -292,6 +292,14 @@ def _initial(p: Params) -> None:
                               f"got {value!r}")
 
 
+def _progress(progress) -> None:
+    """Check progress settings; watched names are resolved at the first progress line."""
+    _switched(progress, "simulation.progress")
+    watch = progress.watch
+    if not isinstance(watch, list) or not all(isinstance(name, str) and name for name in watch):
+        raise ConfigError(f"simulation.progress.watch: expected a list of quantity names, got {watch!r}")
+
+
 def validate(p: Params) -> Params:
     """Check a :class:`Params` tree and return it unchanged; raise ConfigError if invalid."""
     _network(p)
@@ -305,5 +313,6 @@ def validate(p: Params) -> Params:
                               f"asynchronous carrier")
     _solver(p.simulation.solver, time_step)
     _events(p)
+    _progress(p.simulation.progress)
     _initial(p)
     return p

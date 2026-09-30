@@ -38,7 +38,8 @@ __all__ = [
     "ReferenceParams", "ControlParams", "DelayParams", "OvercurrentParams", "VoltageLimitParams",
     "FrequencyLimitParams", "DCVoltageLimitParams", "RocofParams", "ProtectionParams",
     "AveragingParams", "UnitParams", "RUNTIME", "Change", "runtime_changeable", "set_changes",
-    "SolverParams", "SimulationParams", "InitialParams", "OutputParams", "MetaParams", "Params",
+    "SolverParams", "SimulationParams", "InitialParams", "OutputParams", "ProgressParams",
+    "MetaParams", "Params",
 ]
 
 
@@ -541,6 +542,20 @@ class OutputParams:
 
 
 @dataclass(frozen=True)
+class ProgressParams:
+    """Progress lines, controlled by ``enable``.
+
+    ``period`` is simulated seconds between lines. ``watch`` names state-table or plant-table
+    quantities to append to each line; a complex state may be named without ``.re``/``.im`` to
+    report its magnitude.
+    """
+
+    enable: bool = False
+    period: Optional[float] = None
+    watch: list = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class SimulationParams:
     """How the model is simulated: time span, solver, initial state and output."""
 
@@ -549,7 +564,7 @@ class SimulationParams:
     initial: InitialParams = field(default_factory=InitialParams)
     output: OutputParams = field(default_factory=OutputParams)
     stop_on_trip: bool = True
-    progress_every: float = 0.0  # s of simulated time between progress lines; 0: silent
+    progress: ProgressParams = field(default_factory=ProgressParams)
     energy_check: str = "warn"  # "warn" | "strict" | "off": verify the energy declarations before the run
 
     _choices = {"energy_check": ("warn", "strict", "off")}

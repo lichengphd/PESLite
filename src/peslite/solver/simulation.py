@@ -435,6 +435,27 @@ class Simulation:
             unit.pwm.d = np.array(unit.ctrl.initial_duty(), dtype=float)
             unit.pwm.delay.reset(unit.pwm.d)
 
+    def watch_values(self, t: float,
+                     ctrl_logs: Mapping[str, Mapping[str, float]]) -> dict[str, float]:
+        """Return values addressable by ``simulation.progress.watch`` at time ``t``.
+
+        Names include state-table columns, plant-table columns, state aliases, and complex states
+        without their ``.re``/``.im`` suffix, in which case the magnitude is returned.
+        """
+        system = self.system
+        plant = {key: np.asarray([value]) for key, value in system.signals(t).items()}
+        plant.update({f"ctrl.{unit}.{key}": np.asarray([value])
+                      for unit, log in ctrl_logs.items() for key, value in log.items()})
+        row = SimulationResult(params=self.p, t=np.asarray([t]), plant=plant, control={}).columns()
+        values = {key: float(value[0]) for key, value in row.items() if key != "t"}
+        state = gather(self._parts())
+        for alias, name in getattr(system, "state_aliases", {}).items():
+            if f"plant.{name}" in state:
+                state[f"plant.{alias}"] = state[f"plant.{name}"]
+        values.update({key: abs(value) for key, value in state.items() if isinstance(value, complex)})
+        values.update(flatten(state))
+        return values
+
     def state_names(self) -> list[str]:
         """Return the state-table column names after ``t``, i.e. the valid ``initial.states`` keys."""
         if self.result is None:
@@ -511,7 +532,9 @@ class Simulation:
         log_period = output.period
         control_every = max(1, output.control_every)
         stop_on_trip = p.simulation.stop_on_trip
-        progress_every = p.simulation.progress_every
+        progress = p.simulation.progress
+        progress_every = progress.period if progress.enable else 0.0
+        watch = list(progress.watch) if progress.enable else []
         rec = Recorder(keep_states=output.states)
         wall0 = time.time()
 
@@ -565,6 +588,16 @@ class Simulation:
                         worst["balance"] = max(worst["balance"], rep.max_residual / scale)
             except (OverflowError, FloatingPointError):
                 pass  # diverged state: not recorded
+
+        def watched(t_now: float) -> str:
+            """Format the quantities appended to a progress line."""
+            mdl.sync(t_now, y)
+            values = self.watch_values(t_now, rec.last_ctrl_log)
+            unknown = [name for name in watch if name not in values]
+            if unknown:
+                raise ConfigError(f"simulation.progress.watch: unknown name(s) {unknown}; "
+                                  f"known: {sorted(values)}")
+            return "".join(f"   {name} = {values[name]:.6g}" for name in watch)
 
         @np.errstate(over="raise")  # overflow counts as divergence
         def integrate(t_a: float, t_b: float, y: np.ndarray, event: bool) -> np.ndarray:
@@ -713,7 +746,9 @@ class Simulation:
             if t_stop >= t_final - _EPS:
                 break
             if t_local >= next_report:
-                print(f"  t = {t_local:8.4f} s   wall {time.time() - wall0:8.1f} s", flush=True)
+                suffix = watched(t_local) if watch else ""
+                print(f"  t = {t_local:8.4f} s   wall {time.time() - wall0:8.1f} s{suffix}",
+                      flush=True)
                 next_report += progress_every
 
         if not stopped:
@@ -805,7 +840,9 @@ class SystemLoop:
         sp = p.simulation
         self._p = dataclasses.replace(
             p,
-            simulation=dataclasses.replace(sp, energy_check="off", stop_on_trip=False, progress_every=0.0,
+            simulation=dataclasses.replace(
+                sp, energy_check="off", stop_on_trip=False,
+                progress=dataclasses.replace(sp.progress, enable=False),
                                            output=dataclasses.replace(sp.output, period=self.period or 1.0,
                                                                       states=True, energy=False, signals=False),
                                            solver=dataclasses.replace(sp.solver, subsystems={},
@@ -993,7 +1030,10 @@ def main(argv=None) -> int:
                     help="output directory (default: output/<file name>, or "
                          "output/<file name>-averaging when --averaging changes a unit)")
     ap.add_argument("--progress", type=float, default=None, metavar="SECONDS",
-                    help="print a progress line every SECONDS of simulated time (overrides the config)")
+                    help="print a progress line every SECONDS of simulated time")
+    ap.add_argument("--watch", action="append", default=None, metavar="NAME",
+                    help="append a state or plant/control value to each progress line; repeatable, "
+                         "or use NAME,NAME")
     ap.add_argument("--list-states", action="store_true",
                     help="print the state names generated for this configuration and exit")
     ap.add_argument("--ph-report", action="store_true",
@@ -1009,12 +1049,18 @@ def main(argv=None) -> int:
 
     overrides = dict(args.set)
     if args.progress is not None:
-        overrides["simulation.progress_every"] = args.progress
+        overrides["simulation.progress.enable"] = 1
+        overrides["simulation.progress.period"] = args.progress
+    if args.watch is not None:
+        overrides["simulation.progress.watch"] = [name for value in args.watch
+                                                   for name in value.split(",") if name]
     p = load(config, initial=args.initial,
                     initial_time=args.initial_time, **overrides)
     averaged = args.averaging and any(not unit.averaging.enable for unit in p.units.values())
     if args.averaging:
         p = p.replace(**{f"units.{name}.averaging.enable": 1 for name in p.units})
+    if args.watch and not p.simulation.progress.enable:
+        ap.error("--watch prints on the progress lines: add --progress SECONDS")
     if args.resolved:
         print(dumps(p), end="")
         return 0
