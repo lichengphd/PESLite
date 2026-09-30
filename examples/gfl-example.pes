@@ -1,0 +1,165 @@
+# Grid-following converter on a Thevenin grid: an annotated simulation file.
+# A simulation file is YAML (named .pes): the model (base, buses, branches, sources, units, elements),
+# what happens during the run (events), how it is simulated (simulation), then notes (meta). A key that
+# is left out takes its default; the commented keys show every option. `peslite gfl-example --resolved` prints
+# this file with every value written out. A name without a suffix is in SI units, a `_pu` name in pu:
+# network quantities on the system base, converter quantities on the unit's own base; a quantity can
+# also be given in SI by dropping `_pu` (e.g. `l_f: 1.5e-4` in H). A switch is 1 (on) or 0 (off).
+
+base:                      # system base
+  s_base: 2.0e6            # VA
+  v_ll_rms: 690.0          # V
+  f0: 50.0                 # Hz
+
+buses:                     # ac nodes; every bus needs a shunt capacitor
+  pcc:
+    c_pu: 0.02             # shunt capacitor, pu susceptance at f0
+    r_d_pu: 0.5            # damping resistor in series with it
+
+# branches:                # series R-L lines between buses
+#   line1: {from_bus: pcc, to_bus: bus2, x_pu: 0.05, r_pu: 0.005}  # connect/disconnect events switch it
+
+sources:                   # emf behind an impedance, attached to a bus
+  grid:
+    bus: pcc
+    x_pu: 0.4
+    r_pu: 0.04
+    # v_pu: 1.0            # emf magnitude (default 1)
+    # f: 50.0              # frequency, Hz (default: base.f0)
+    # angle: 0.0           # offset of the emf angle, rad
+
+units:                     # converters, one entry each
+  vsc:
+    bus: pcc               # terminal bus, fed through the filter branch
+    # s_base: 2.0e6        # the converter's rating (default: the system base)
+
+    ac_filter:             # bridge --[R, L]-- bus
+      l_f_pu: 0.2
+      r_f_pu: 0.01
+
+    dclink:
+      vdc_ref: 1500.0      # V: the dc voltage base and the capacitor's initial voltage
+      capacitor:           # omit for a voltage-source dc side
+        c_pu: 35.0
+        r_esr_pu: 0.001
+      source:
+        type: current      # current | voltage | none
+        i_pu: 0.9          # into the link, ramped up after connecting (the connect event's ramp)
+        # k_pu: 0.2        # current-source droop: k_pu * (1 - u_C_pu)
+        # voltage source: v_pu (emf, default 1), r_pu (series R)
+
+    # measurement:         # the ADC, sampled at every PWM update
+    #   average: instantaneous  # ac voltage and current: instantaneous | window (mean over (t_k - window, t_k])
+    #   u_dc: instantaneous     # the same choice for the dc voltage
+    #   window: 50.0e-6    # averaging window, s (default: the PWM update period)
+
+    pwm:
+      f_sw: 20000.0        # carrier frequency, Hz
+      modulation_limit: 0.95
+      # update_period: 50.0e-6  # ADC sample, control law and new duty ratios (default: one carrier period)
+      # method: spwm       # spwm | svpwm
+      # sync: asynchronous # asynchronous | synchronous (carrier locked to the controller angle)
+      # carrier_phase: 0.0 # carrier position at t = 0, in periods
+
+    control:
+      type: gfl            # default wiring: gfl | gfm | custom (explicit connections and outputs)
+      loops:               # each loop runs every `period` (s) on its own clock
+        pll:
+          type: srf_pll
+          period: 50.0e-6
+          kp_pu: 20.0
+          ki_pu: 1200.0
+          # normalisation: rated  # rated | amplitude
+        cc:
+          type: dq_current_pi
+          period: 50.0e-6
+          bandwidth: 200.0 # Hz; gains from the bandwidth unless kp_pu, ki_pu are given
+          # decoupling: 1
+          # feedforward: 1
+          # antiwindup: conditional  # conditional | backcalc | none
+        dvc:
+          type: dc_voltage_pi
+          period: 50.0e-6
+          kp_pu: 0.8
+          ki_pu: 90.0
+          limit_pu: 1.15
+          id0_export_pu: 0.9 # feed-forward, raised with the start-up
+          # bidirectional: 0
+          # antiwindup: none # none | conditional
+      # connections: {cc.id_ref: dvc.id_ref}   # input port -> output port, over the default wiring
+      # outputs: {u_dq: cc.u_dq, theta: pll.theta, omega: pll.omega}
+      # references:        # constant inputs, pu on this unit's base
+      #   id_ref_pu: 0.0
+      #   iq_ref_pu: 0.0
+      #   p_ref_pu: 0.0
+      #   q_ref_pu: 0.0
+      #   v_ref_pu: 1.0
+      #   vdc_ref_pu: 1.0
+      #   theta: 0.0       # rad
+      #   omega: 314.159   # rad/s (default: 2 pi f0)
+      #   zero_v_pu: 0.0
+      # sampling_period: 25.0e-6  # ADC oversampling (default: the PWM update period)
+      # A custom loop type, registered with peslite.register_loop_type, is written here
+      # like the built-in ones and its parameters are checked the same way.
+
+    # delay:
+    #   steps: 0           # delay of the duty ratios, in PWM updates
+
+    protection:            # trips only this converter; each criterion is switched by enable (1/0)
+      overcurrent: {enable: 1, limit_pu: 1.15}   # instantaneous phase current: trips at once
+      undervoltage: {enable: 1, limit_pu: 0.50}  # ac voltage magnitude, held for hold
+      overvoltage: {enable: 1, limit_pu: 1.20}
+      # frequency: {enable: 0, limit: 0.5}       # frequency deviation, Hz, held for hold
+      # dc_voltage: {enable: 0, limit_pu: 0.1}   # dc-voltage error, held for hold
+      rocof: {enable: 1, limit: 1.0}              # Hz/s over window (default 0.1 s); alarm only
+      # hold: 0.02         # s
+
+# elements:                # other circuit elements: the built-in load, or types registered with
+#   load1: {type: load, bus: pcc, r_pu: 2.0, x_pu: 1.0}  # peslite.register_element_type
+#                          # load: series R-L from the bus to ground; a small impedance is a fault
+
+events:                    # what happens during the run, by name; written only when it happens
+  connect_vsc: {type: connect, target: vsc, t: 0.2, ramp: 1.0}
+  #                        # target: a unit, source, branch or element, by name; one whose first
+  #                        # connect/disconnect event is connect starts disconnected. ramp (s): after
+  #                        # connecting, a converter ramps up its dc source and power setpoints and arms
+  #                        # its protection at the end; other targets have nothing to ramp
+  # trip_line: {type: disconnect, target: line1, t: 3.0}
+  # load_on: {type: connect, target: load1, t: 1.0}                # load1 starts disconnected
+  # p_step: {type: set, t: 2.0, set: {units.vsc.control.references.p_ref_pu: 0.8}}
+  #                        # set: new values from t on, paths as for --set: references, loop parameters
+  #                        # (not type, period), protection, dc source; a source's v, f, angle, l, r;
+  #                        # l, r of lines and elements; c, r_d of buses
+  # weak_grid: {type: set, t: 4.0, set: {sources.grid.x_pu: 0.6, sources.grid.f: 49.8}}
+  # A custom event type, registered with peslite.register_event_type, is written here too.
+
+simulation:                # how the model is simulated
+  t_end: 3.0
+  # bridge: switching      # switching | averaged | step_averaged
+  solver:
+    dt: 12.5e-6            # fixed: maximum step
+    # type: fixed          # fixed | adaptive
+    # method: rk4          # fixed: euler | heun | rk4; adaptive: RK45 | DOP853 | Radau | BDF | LSODA | DP45
+    # rtol: 1.0e-6         # adaptive tolerances
+    # atol: 1.0e-9
+    # max_step: .inf       # adaptive: largest step, s
+    # warm_start: 1        # adaptive: reuse the last step size
+    # subsystems: {vsc.dclink: 10, pcc: 0.1}  # own step relative to dt: 10 = once per 10 steps, 0.1 = 10 per step
+    # sweeps: 2            # coupling sweeps for subsystems on their own step
+    # linearisations: 3    # points of the split error bound (0: none)
+  # initial:               # default: buses at their source's emf, dc capacitors at vdc_ref, the rest at zero
+  #   t: 0.0
+  #   states: {plant.vsc.u_dc: 1450.0}  # names as in states.csv (--list-states); keywords: source, rated
+  output:
+    control_every: 10      # keep every 10th controller sample
+    # period: 0.5e-3       # snapshot interval, s
+    # states: 1            # states.csv
+    # signals: 0           # plant.csv and control.<unit>.csv
+    # energy: 0            # energy.csv
+  # stop_on_trip: 1
+  # progress_every: 0.0    # s of simulated time between progress lines (0: none)
+  # energy_check: warn     # warn | strict | off
+
+# meta:                    # notes only, text; they do not change the simulation
+#   title: Grid-following converter
+#   description: A PLL-synchronised current-controlled converter on a Thevenin grid.

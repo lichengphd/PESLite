@@ -113,10 +113,15 @@ class ControlGraph:
     ``.u_dc``) or the references (``references.<name>``); ``connections`` and ``outputs`` are the
     default wiring, which ``cfg.control.connections`` and ``.outputs`` override. Loops run in signal
     order; a loop without a period runs whenever the loops before it do.
+
+    Retuned parameters are queued by :meth:`schedule` and take effect at the next update. Changed
+    loops are rebuilt from their new parameters and continue from their named states.
     """
 
     def __init__(self, cfg, scenario, connections, outputs):
-        self.cfg = cfg
+        self.cfg, self.scenario = cfg, scenario
+        self._pending: list[Any] = []
+        self.on_retune = None
         self.connections = {**connections, **cfg.control.connections}
         self.outputs = {**outputs, **cfg.control.outputs}
         self.nodes = {}
@@ -174,7 +179,13 @@ class ControlGraph:
                 pending.pop(name)
             for deps in pending.values():
                 deps.difference_update(ready)
-        # resolved input sources per loop
+        self._rewire()
+        self._all_clocked = all(T is not None for T in self.periods.values())
+        self._clocked = tuple((n, T) for n, T in self.periods.items() if T)
+        self._retime()
+
+    def _rewire(self):
+        """Resolve loop inputs and graph outputs against the current references."""
         self._constants = {f"references.{k}": complex(v) if k == "zero_v_pu" else v
                            for k, v in self.references.items()}
         self._wiring = {}
@@ -187,9 +198,41 @@ class ControlGraph:
             self._port_source[name] = {w[0]: w[1:] for w in wiring}
         self._latching = frozenset(n for n, node in self.nodes.items() if node.delayed)
         self._output_source = {port: self._resolve(source) for port, source in self.outputs.items()}
-        self._all_clocked = all(T is not None for T in self.periods.values())
-        self._clocked = tuple((n, T) for n, T in self.periods.items() if T)  # the loops with a clock
-        self._retime()
+
+    def schedule(self, cfg):
+        """Queue unit parameters to take effect at the next control update."""
+        self._pending.append(cfg)
+
+    def _apply_pending(self):
+        """Apply queued references and rebuild loops whose parameters changed."""
+        while self._pending:
+            cfg = self._pending.pop(0)
+            control = cfg.control
+            if control.references != self.cfg.control.references:
+                self.references = {f.name: getattr(control.references, f.name)
+                                   for f in fields(control.references)}
+                self._rewire()
+            changed = [name for name, params in control.loops.items()
+                       if params != self.cfg.control.loops[name]]
+            self.cfg = cfg
+            for name in changed:
+                self._retune(name)
+
+    def _retune(self, name):
+        """Rebuild one loop and continue from the old instance's state."""
+        old = self.nodes[name]
+        params = self.cfg.control.loops[name]
+        fresh = LOOP_TYPES[params.type](params, self.cfg, self.scenario)
+        try:
+            fresh.set_state(old.get_state())
+        except (KeyError, ValueError) as exc:
+            raise ConfigError(
+                f"control.loops.{name}: with the parameters of a set event it has other "
+                f"states than before ({exc}), so it cannot continue from them") from None
+        fresh.retuned(old)
+        self.nodes[name] = fresh
+        if self.on_retune is not None:
+            self.on_retune(name)
 
     def _resolve(self, source):
         if source in _MEASUREMENTS:
@@ -261,6 +304,8 @@ class ControlGraph:
 
         ``finalize(t, meas, updated)`` runs after them, before the delayed inputs are latched.
         """
+        if self._pending:
+            self._apply_pending()
         self.updated = updated = set()
         periods, ticks = self.periods, self.ticks
         due = {n for n, T in self._clocked if ticks[n] * T <= t + 1e-10}
@@ -371,8 +416,9 @@ def default_wiring(cfg, family):
         "admittance": {"v_ref": f"{sync}.v_ref", "frame": frame, "omega": omega, "v": "measurement.u_g"},
         "damping": {"i": "measurement.i_c", "frame": frame},
     }
-    wires = {f"{name}.{port}": source
-             for name, role in roles.items() for port, source in ports_of.get(role, {}).items()}
+    wires = {f"{name}.{port}": source for name, role in roles.items()
+             for port, source in ports_of.get(role, {}).items()
+             if port in LOOP_TYPES[loops[name].type].inputs}
     terminal = vi if family == "gfm" and vi else cc
     return wires, {"u_dq": f"{terminal}.u_dq", "theta": theta, "omega": omega}
 
@@ -383,9 +429,10 @@ class UniteType:
     """Configurable controller of one unit: its loop network, protection and output stage.
 
     ``cfg``: the unit's parameters; ``cfg.control.type``: ``"gfl"``, ``"gfm"`` or ``"custom"`` (no
-    default wiring). ``scenario``: the unit's prescribed time functions (start-up ramp, setpoint and
-    gain steps). ``pwm_method``, ``limiter``: see :class:`~peslite.control.modulation.OutputStage`.
-    ``update()`` advances the due loops; ``__call__`` is the PWM publication.
+    default wiring). ``scenario``: the unit's connection state and ramp over time.
+    ``pwm_method``, ``limiter``: see :class:`~peslite.control.modulation.OutputStage`.
+    ``update()`` advances the due loops; ``__call__`` is the PWM publication. Integrating loops
+    freeze while the unit is disconnected or tripped.
     """
 
     def __init__(self, cfg, scenario, pwm_method=None, *, limiter=CONFIGURED):
@@ -397,8 +444,7 @@ class UniteType:
         self.T_s = cfg.pwm.update_period
         self.v_base, self.i_base, self.w0 = cfg.base.v_phase_peak, cfg.base.i_phase_peak, cfg.base.w0
         self.v_dc_base = cfg.dc_base.v
-        self.vdc_ref_pu = cfg.control.references.vdc_ref_pu
-        self.protection = Protection(cfg.protection, self.T_s, scenario.arm_time)
+        self.protection = Protection(cfg.protection, self.T_s, scenario.armed)
         self.stage = OutputStage(cfg, complex(cfg.base.v_phase_peak), pwm_method=pwm_method, limiter=limiter)
         self.theta, self.omega = self.initial_sync()
         self.u_cmd = 1.0 + 0j
@@ -407,20 +453,38 @@ class UniteType:
         self.last_log = {}
         # the loops the controller itself reads, by role
         role = {name: node.role for name, node in graph.nodes.items()}
-        first = lambda r: next((n for n, x in role.items() if x == r), None)  # noqa: E731
-        self._freezable = tuple(n for n in graph.nodes.values() if hasattr(n, "frozen"))
+        def first(r, port=None):
+            return next((name for name, value in role.items()
+                         if value == r and (port is None or port in graph.nodes[name].inputs)), None)
+
         self._terminal = graph.outputs["u_dq"].partition(".")[0]
         self._terminal_key = f"{self._terminal}.u_dq"
-        self._terminal_node = graph.nodes.get(self._terminal)
         self._terminal_in_graph = self._terminal in graph.nodes
-        self._terminal_is_cc = self._terminal_node is not None and role[self._terminal] == "current"
+        self._terminal_is_cc = self._terminal_in_graph and role[self._terminal] == "current"
+        self._find_nodes()
+        graph.on_retune = self._find_nodes
         self._frame_key = f"{graph.outputs['theta'].partition('.')[0]}.frame"
-        self._cc, self._dc, self._sync = first("current"), first("dc_voltage"), first("sync")
+        self._dc, self._sync = first("dc_voltage"), first("sync")
+        self._frame_cc, self._log_cc = first("current", "frame"), first("current", "id_ref")
         self._is_gfl = cfg.control.type == "gfl"
         self._p_key, self._q_key, self._v_ref_key = f"{first('power')}.p", f"{first('power')}.q", f"{self._sync}.v_ref"
 
+    def _find_nodes(self, name=None):
+        """Refresh loop-instance references after a loop is rebuilt."""
+        self._freezable = tuple(node for node in self.graph.nodes.values()
+                               if hasattr(node, "frozen"))
+        self._terminal_node = self.graph.nodes.get(self._terminal)
+
     def describe(self):
         return self.graph.describe()
+
+    def retune(self, cfg, paths, t):
+        """Queue new control parameters and apply new protection settings."""
+        if any(path.startswith("control.") for path in paths):
+            self.graph.schedule(cfg)
+        if any(path.startswith("protection.") for path in paths):
+            self.protection.retune(cfg.protection)
+        self.p = cfg
 
     @property
     def next_event(self):
@@ -475,11 +539,14 @@ class UniteType:
         """Run the loops due at ``t`` between publications, on the SI sample ``meas``."""
         return self._update_pu(t, self._pu(meas))
 
+    def _in_service(self, t):
+        return not self.tripped and self.scenario.connected(t)
+
     def _update_pu(self, t, control_meas):
         self.stage.new_instant()
-        tripped = self.tripped
+        idle = not self._in_service(t)
         for node in self._freezable:
-            node.frozen = tripped
+            node.frozen = idle
         return self.graph.update(t, control_meas, finalize=self._accept_command)
 
     def _accept_command(self, t, meas, updated):
@@ -502,33 +569,32 @@ class UniteType:
         control_meas = self._pu(meas)
         self._update_pu(t, control_meas)
         frame = self.graph.values.get(self._frame_key, self.theta)
-        if self._cc is not None:
-            frame = self.graph.input(self._cc, "frame", control_meas)
+        if self._frame_cc is not None:
+            frame = self.graph.input(self._frame_cc, "frame", control_meas)
         rot = cmath.exp(-1j * frame)
         self.v_dq, self.i_dq = control_meas.u_g * rot, control_meas.i_c * rot
-        freq_dev_hz = (self.omega - self.w0) / (2 * math.pi)
-        prot = self.protection
+        freq_dev = (self.omega - self.w0) / (2 * math.pi)
+        refs, prot = self.graph.references, self.protection
         prot.check_current(t, peak_abs(control_meas.i_abc))
-        prot.check_sampled(t, abs(self.v_dq), freq_dev_hz, control_meas.u_dc - self.vdc_ref_pu)
+        prot.check_sampled(t, abs(self.v_dq), freq_dev,
+                           control_meas.u_dc - refs["vdc_ref_pu"])
         tripped = prot.tripped
         duty = self.stage.modulate(t, 0j if tripped else self.u_cmd, self.command_theta, control_meas.u_dc)
         log = {"id_pu": self.i_dq.real, "iq_pu": self.i_dq.imag,
                "vd_pu": self.v_dq.real, "vq_pu": self.v_dq.imag,
                "vac_pu": abs(self.v_dq), "vdc_pu": control_meas.u_dc,
-               "m_max": peak_abs(self.stage.m_abc), "in_service": 0.0 if tripped else 1.0,
+               "m_max": peak_abs(self.stage.m_abc), "in_service": 1.0 if self._in_service(t) else 0.0,
                **self._raw_log(meas, frame)}
         angle_rel = (self.theta - self.w0 * t + math.pi) % (2 * math.pi) - math.pi
         if self._is_gfl:
-            id_ref = self.graph.input(self._cc, "id_ref", control_meas) if self._cc else 0.0
-            log.update(idref_pu=id_ref, pll_freq_dev_hz=freq_dev_hz, pll_angle_rel=angle_rel)
+            id_ref = self.graph.input(self._log_cc, "id_ref", control_meas) if self._log_cc else 0.0
+            log.update(id_ref_pu=id_ref, freq_dev=freq_dev, angle_rel=angle_rel)
         else:
             values = self.graph.values
-            refs = self.graph.references
             pr, qr, vr = self.scenario.setpoints(t, refs["p_ref_pu"], refs["q_ref_pu"], refs["v_ref_pu"])
             log.update(p_pu=values.get(self._p_key, 0.0), q_pu=values.get(self._q_key, 0.0),
-                       p_ref_pu=pr, v_mag_pu=abs(self.v_dq),
-                       v_ref_pu=values.get(self._v_ref_key, 1.0),
-                       freq_dev_hz=freq_dev_hz, angle_rel=angle_rel)
+                       p_ref_pu=pr, v_ref_pu=values.get(self._v_ref_key, 1.0),
+                       freq_dev=freq_dev, angle_rel=angle_rel)
         self.last_log = log
         return ControlOutput(duty, tripped, log, theta=self.theta, omega=self.omega)
 
@@ -555,22 +621,27 @@ class UniteType:
         self.theta, self.omega = self.initial_sync()
 
     def summary(self):
+        """Return this unit's summary; values for events which did not occur are ``None``."""
         st, trip, stage = self.protection.stats, self.protection.trip, self.stage
         summary = {
-            "tripped": float(trip is not None),
-            "trip_time_s": trip.t if trip else -1.0,
-            "trip_cause": trip.cause if trip else "none",
+            "tripped": int(trip is not None),
+            "trip_time": trip.t if trip and math.isfinite(trip.t) else None,
+            "trip_cause": trip.cause if trip else None,
             "max_current_pu": st.max_current_pu,
             "modulation_saturation_fraction": stage.n_saturated / max(1, stage.n_updates),
-            "modulation_saturation_first_t_s": stage.first_saturation_t,
-            "rocof_max_hz_s": st.rocof_max_hz_s,
+            "modulation_saturation_first_t": stage.first_saturation_t,
+            "rocof_max": st.rocof_max,
             "vac_min_pu": st.vac_min_pu,
             "vac_max_pu": st.vac_max_pu,
-            "alarms": "|".join(st.alarms) if st.alarms else "none",
+            **{f"{criterion}_first_t": getattr(st, f"{criterion}_first_t")
+               for criterion in ("overcurrent", "undervoltage", "overvoltage", "frequency",
+                                 "dc_voltage", "rocof")},
+            "alarms": list(st.alarms),
         }
         if self._dc is not None:
             dc = self.graph.nodes[self._dc]
-            summary["idref_limit_fraction"] = dc.n_clamped / max(1, dc.n_updates)
+            summary["id_ref_limit_fraction"] = dc.n_clamped / max(1, dc.n_updates)
+            summary["id_ref_limit_first_t"] = dc.first_clamp_t
         if self._sync is not None:
             summary["law"] = self.p.control.loops[self._sync].type
         return summary

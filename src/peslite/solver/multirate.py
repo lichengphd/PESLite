@@ -149,6 +149,7 @@ class MultirateSolver:
         self._anchor: Optional[NDArray[np.float64]] = None  # outer states at the last window close
         self._slope: Optional[NDArray[np.float64]] = None
         self._t_anchor = 0.0
+        self._window_end = math.nan  # the close of the open window, also after one closed early
         self._rate_sampled_at = math.nan  # the anchor time whose live outer rates were sampled
         self._acc: dict[tuple[int, str], Any] = {}
         self._acc_energy: dict[int, float] = {}  # storage state index -> int scale * e_seen * f dt over the window
@@ -210,6 +211,8 @@ class MultirateSolver:
         y = np.array(y0, dtype=float)
         if self._anchor is None or (self._last_returned is not None
                                     and not np.array_equal(y0[self._mask_outer], self._last_returned[self._mask_outer])):
+            if self._anchor is None or not self._window_end > t0 + _EPS:
+                self._window_end = t0 + self.window
             self._anchor = y0[self._mask_outer].copy()
             self._slope = np.zeros_like(self._anchor)
             self._t_anchor = t0
@@ -221,15 +224,41 @@ class MultirateSolver:
         t = t0
         while t < t1 - _EPS:
             self._sample_outer_rate(t, y)
-            t_close = self._t_anchor + self.window
+            t_close = self._window_end
             t_stop = min(t1, t_close)
             y = self._advance(t, t_stop, y)
             t = t_stop
             if t >= t_close - _EPS:
-                self._close_window(y)
+                self._close_window(y, None if t_close == self._t_anchor + self.window else t_close)
+                self._window_end = self._t_anchor + self.window
                 y[self._mask_outer] = self._anchor
         self._last_returned = y.copy()
         return SolverStep(t1, y, self.n_rhs)
+
+    def settle(self, t: float, y: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Finish deferred work at ``t`` before the model changes there.
+
+        A shortened window uses its actual duration. The next window still
+        closes on the original grid, and the prediction based on the old model
+        is discarded even when ``t`` already lies on that grid.
+        """
+        if self.outer is None or self._anchor is None:
+            return y
+        y = np.array(y, dtype=float)
+        if t > self._t_anchor + _EPS:
+            self._close_window(y, t)
+            y[self._mask_outer] = self._anchor
+        self._slope = np.zeros_like(self._anchor)
+        self._rate_sampled_at = math.nan
+        self._last_returned = y.copy()
+        return y
+
+    def parameters_changed(self) -> None:
+        """Refresh storage declarations after a ``set`` event changed parameters."""
+        self._storage_of = {
+            self.model.state_slice(sub, st.state).start: (sub, st)
+            for sub in self.model.subsystems for st in getattr(sub, "storage", ())
+        }
 
     def _sample_outer_rate(self, t: float, y: NDArray[np.float64]) -> None:
         """Evaluate the windowed group's rates once per window to update the rate peaks."""
@@ -273,7 +302,7 @@ class MultirateSolver:
     def interface(self) -> dict[str, float]:
         """Coupling indicators of the run, relative to rated effort where given, else to the state's peak.
 
-        Keys: ``max_rel_error``, ``excursion_rel_max``, ``energy_residual_J``, ``energy_window_rel_max``,
+        Keys: ``max_rel_error``, ``excursion_rel_max``, ``energy_residual`` (J), ``energy_window_rel_max``,
         ``windows``, ``steps``; with ratings ``max_error_rated`` and ``excursion_rated``; with a split
         ``kappa`` (hold bound) and ``within_bound`` (1.0 if no hold exceeded its bound).
         """
@@ -293,7 +322,7 @@ class MultirateSolver:
                 exc_rated = max(exc_rated, float(self._exc_abs.get(idx, 0.0) / ref[sl.start]))
         out = {"max_rel_error": float(np.max(rel)) if rel.size else 0.0,
                "excursion_rel_max": exc_rel,
-               "energy_residual_J": self._energy_residual, "energy_window_rel_max": win_rel,
+               "energy_residual": self._energy_residual, "energy_window_rel_max": win_rel,
                "windows": self._windows, "steps": self._steps}
         if self.ratings:
             out["max_error_rated"] = err_rated  # worst held-effort error / rated effort
@@ -302,7 +331,7 @@ class MultirateSolver:
             # hold bound relative to the reference
             bound_rel = (self._bound_abs / ref)[seen]
             out["kappa"] = float(np.max(bound_rel)) if bound_rel.size else 0.0
-            out["within_bound"] = float(self.bound_violations == 0)
+            out["within_bound"] = int(self.bound_violations == 0)
         return out
 
     @property
@@ -333,12 +362,12 @@ class MultirateSolver:
             return {}
         labels = [lab for lab, m in zip(self.model.state_labels(), self._mask_outer) if m]
         if self._anchor is None:
-            s: dict[str, Any] = {"t_anchor": math.nan}
+            s: dict[str, Any] = {"t_anchor": math.nan, "window_end": math.nan}
             for lab in labels:
                 s[f"anchor.{lab}"] = math.nan
                 s[f"slope.{lab}"] = math.nan
             return s
-        s = {"t_anchor": self._t_anchor}
+        s = {"t_anchor": self._t_anchor, "window_end": self._window_end}
         for lab, a, sl in zip(labels, self._anchor, self._slope):
             s[f"anchor.{lab}"] = float(a)
             s[f"slope.{lab}"] = float(sl)
@@ -348,7 +377,8 @@ class MultirateSolver:
         if self.outer is None:
             return
         labels = [lab for lab, m in zip(self.model.state_labels(), self._mask_outer) if m]
-        names = ("t_anchor",) + tuple(f"anchor.{lab}" for lab in labels) + tuple(f"slope.{lab}" for lab in labels)
+        names = (("t_anchor", "window_end") + tuple(f"anchor.{lab}" for lab in labels)
+                 + tuple(f"slope.{lab}" for lab in labels))
         unknown = set(values) - set(names)
         if unknown:
             raise KeyError(f"MultirateSolver has no state(s) {sorted(unknown)}")
@@ -366,6 +396,8 @@ class MultirateSolver:
             self._anchor = self._slope = None
             return
         self._t_anchor, self._anchor, self._slope = float(t_anchor), anchor, slope
+        end = float(values.get("window_end", math.nan))
+        self._window_end = end if end > t_anchor else t_anchor + self.window
         self._acc, self._acc_energy, self._acc_flow, self._excursion, self._flow_track = {}, {}, {}, {}, {}
         self._last_returned = None  # a loaded anchor is trusted on the next call
 
@@ -539,15 +571,22 @@ class MultirateSolver:
         return traj[i] + frac * (traj[i + 1] - traj[i])
 
     # -------------------------------------------------------------- windows
-    def _close_window(self, y: NDArray[np.float64]) -> None:
-        """Advance the outer group over the window on its averaged inputs; re-anchor."""
+    def _close_window(self, y: NDArray[np.float64], t_end: Optional[float] = None) -> None:
+        """Advance the outer group over its averaged inputs and re-anchor.
+
+        ``t_end`` ends a window shortened by :meth:`settle`.
+        """
         assert self.outer is not None and self._anchor is not None and self._outer_solver is not None
-        t0, t1 = self._t_anchor, self._t_anchor + self.window
+        if t_end is None:
+            duration, t_end = self.window, self._t_anchor + self.window
+        else:
+            duration = t_end - self._t_anchor
+        t0, t1 = self._t_anchor, t_end
         self.model.set_states(y)
         for _kind, (dst_inp, dst_name, _s, _n, _f) in self.outer.inputs:  # inputs frozen at their averages
             key = (id(dst_inp), dst_name)
             if key in self._acc:
-                setattr(dst_inp, dst_name, self._acc[key] / self.window)
+                setattr(dst_inp, dst_name, self._acc[key] / duration)
         y_start = np.array(y, dtype=float)
         y_start[self._mask_outer] = self._anchor
 
@@ -566,7 +605,7 @@ class MultirateSolver:
         full_pred[self._mask_outer] = predicted
         full_new = np.array(y, dtype=float)
         full_new[self._mask_outer] = new
-        self._note_error(self._mask_outer, y_start, full_pred, full_new, self.window, t1, window=True)
+        self._note_error(self._mask_outer, y_start, full_pred, full_new, duration, t1, window=True)
         residual = 0.0
         for idx, (sub, st) in self._storage_of.items():
             if not self._mask_outer[idx]:
@@ -594,7 +633,7 @@ class MultirateSolver:
             if self._mask_outer[idx]:
                 track = self._flow_track.get(idx, [])
                 total = track[-1][1] if track else 0.0
-                stray = max((abs(f - (tau / self.window) * total) for tau, f in track), default=0.0) / st.value
+                stray = max((abs(f - (tau / duration) * total) for tau, f in track), default=0.0) / st.value
                 sl = self.model.state_slice(sub, st.state)
                 for j in range(sl.start, sl.stop):
                     ripple[outer_index[j]] = stray
@@ -603,7 +642,7 @@ class MultirateSolver:
         self._acc_flow = {}
         self._excursion = {}
         self._flow_track = {}
-        self._slope = (new - self._anchor) / self.window
+        self._slope = (new - self._anchor) / duration
         self._anchor = new.copy()
         self._t_anchor = t1
         self._acc = {}

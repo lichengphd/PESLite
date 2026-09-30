@@ -1,4 +1,4 @@
-"""The package has four code parts; the root examples directory contains YAML only."""
+"""The package has four code parts; the root examples directory contains YAML-format .pes files."""
 
 import ast
 from pathlib import Path
@@ -39,12 +39,10 @@ def test_the_package_has_four_code_parts():
     assert entries == {"__init__.py", *PARTS}
 
 
-def test_the_root_examples_directory_contains_only_yaml():
+def test_the_root_examples_directory_contains_only_pes_files():
     examples = ROOT / "examples"
     assert examples.is_dir()
-    assert {path.suffix.lower() for path in examples.iterdir()} == {".yaml"}
-    assert all(path.suffix.lower() in {".yaml", ".yml", ".json"}
-               for path in examples.iterdir())
+    assert {path.suffix for path in examples.iterdir()} == {".pes"}
 
 
 def test_each_part_imports_only_the_parts_below_it():

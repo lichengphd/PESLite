@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, ClassVar, Optional
 
+from ..control.blocks import smoothstep
 from ..solver.energy import PowerPort, StoragePort
 from ..solver.model import Bag, Empty, OutputStage
 
@@ -97,16 +98,29 @@ class DCCapacitor:
         return self.R_esr * i ** 2
 
 
+def _zero(t: float) -> float:
+    return 0.0
+
+
 class DCCurrentSource:
     """Supply current ``ramp(t) i_nom + k_dc (u_ref - u_C)`` (A); may be negative.
 
-    ``k_dc`` in A/V, ``u_ref`` in V; ``ramp`` is a function of time, ``None`` for 1.
+    ``k_dc`` is in A/V and ``u_ref`` in V. :meth:`connect` controls its nominal-current ramp.
     """
 
-    def __init__(self, i_nom: float, k_dc: float = 0.0, u_ref: float = 0.0,
-                 ramp: Optional[Callable[[float], float]] = None) -> None:
+    def __init__(self, i_nom: float, k_dc: float = 0.0, u_ref: float = 0.0) -> None:
         self.i_nom, self.k_dc, self.u_ref = float(i_nom), float(k_dc), float(u_ref)
-        self.ramp = ramp
+        self.ramp: Optional[Callable[[float], float]] = None
+
+    def connect(self, on: bool, t: float, ramp: float = 0.0) -> None:
+        """Connect at ``t``, optionally with a smooth ramp, or disconnect the nominal current."""
+        if not on:
+            self.ramp = _zero
+        elif ramp <= 0.0:
+            self.ramp = None
+        else:
+            end = t + ramp
+            self.ramp = lambda at: 1.0 if at >= end else smoothstep((at - t) / ramp)
 
     def __call__(self, t: float, u_C: float) -> float:
         i = self.i_nom if self.ramp is None else self.ramp(t) * self.i_nom
@@ -163,6 +177,19 @@ class DCLink:
         """Disconnect the source from the capacitor; a link without capacitor is unchanged."""
         self.tripped = True
 
+    def connect(self, on: bool, t: float, ramp: float = 0.0) -> None:
+        """Connect or disconnect the unit's source; current sources honor the connection ramp."""
+        if isinstance(self.source, DCCurrentSource):
+            self.source.connect(on, t, ramp)
+
+    def retune_source(self, i: float, k: float, v: float, r: float) -> None:
+        """Apply new settings to the existing DC source without replacing its state."""
+        source = self.source
+        if isinstance(source, DCCurrentSource):
+            source.i_nom, source.k_dc = float(i), float(k)
+        elif isinstance(source, DCVoltageSource):
+            source.u_dc, source.R = float(v), float(r)
+
     def set_outputs(self, t: float) -> None:
         cap, source, i_dc = self.capacitor, self.source, self.inp.i_dc
         if cap is None:
@@ -200,14 +227,14 @@ class DCLink:
         return self.out.u_dc * self.out.i_src
 
 
-def make_dclink(cfg: Any, ramp: Optional[Callable[[float], float]] = None) -> DCLink:
+def make_dclink(cfg: Any) -> DCLink:
     """Build a :class:`DCLink` from SI parameters; source type ``"current"``, ``"voltage"`` or ``"none"``."""
     capacitor = None
     if cfg.capacitor is not None:
         capacitor = DCCapacitor(cfg.vdc_ref, cfg.capacitor.c, cfg.capacitor.r_esr)
     p = cfg.source
     if p.type == "current":
-        source = DCCurrentSource(p.i, p.k, cfg.vdc_ref, ramp)
+        source = DCCurrentSource(p.i, p.k, cfg.vdc_ref)
     elif p.type == "voltage":
         source = DCVoltageSource(p.v, p.r)
     elif p.type == "none":

@@ -192,7 +192,7 @@ def _convert(where: str, target: Any, value: Any, presets: Any, name: str = "") 
 
 
 def resolve(template: Mapping[str, Any], given: Mapping[str, Any],
-            presets: Any = None, where: str = "initial.states") -> dict[str, Any]:
+            presets: Any = None, where: str = "simulation.initial.states") -> dict[str, Any]:
     """Convert the entries of ``given`` to the types of the matching ``template`` entries.
 
     ``template``: state name -> current value. ``given``: state names or ``x.re``/``x.im`` parts;
@@ -221,12 +221,17 @@ def resolve(template: Mapping[str, Any], given: Mapping[str, Any],
     return out
 
 
-def assign(obj: Any, values: Mapping[str, Any], names: tuple[str, ...]) -> None:
-    """Set attributes of ``obj`` from ``values``; keys must be in ``names``."""
+def assign(obj: Any, values: Mapping[str, Any], names: tuple[str, ...] | Mapping[str, str]) -> None:
+    """Set attributes from named states.
+
+    ``names`` is either a tuple whose state and attribute names agree, or a
+    mapping from public state names to internal attribute names.
+    """
+    attrs = names if isinstance(names, Mapping) else {name: name for name in names}
     for key, value in values.items():
-        if key not in names:
-            raise KeyError(f"{type(obj).__name__} has no state {key!r} (states: {', '.join(names)})")
-        setattr(obj, key, value)
+        if key not in attrs:
+            raise KeyError(f"{type(obj).__name__} has no state {key!r} (states: {', '.join(attrs)})")
+        setattr(obj, attrs[key], value)
 
 
 # ------------------------------------------------------------------ the model

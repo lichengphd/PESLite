@@ -10,14 +10,15 @@ from __future__ import annotations
 
 import cmath
 import math
-from dataclasses import dataclass, is_dataclass
+from dataclasses import dataclass, field, is_dataclass
 from typing import Any, ClassVar, Mapping, Optional
 
 from ..solver.model import ConfigError, assign, gather, scatter
 from .blocks import HighPass1, LowPass1, clamp
 
 __all__ = ["SignalType", "V_AB", "I_AB", "V_DQ", "VOLTAGE", "DC_VOLTAGE", "CURRENT", "ANGLE", "FREQUENCY",
-           "POWER_PU", "ROLES", "Loop", "LOOP_TYPES", "register_loop_type",
+           "POWER_PU", "ROLES", "Loop", "LOOP_TYPES", "register_loop_type", "PowerFilterParams",
+           "CurrentLimitParams",
            "SRFPLL", "CurrentLoop", "DCVoltageLoop", "PowerLoop", "SyncLaw", "PSC", "Droop", "VSG", "DVOC",
            "Matching", "VirtualImpedance", "VirtualAdmittance", "ActiveDamping", "UnitDelay"]
 
@@ -58,9 +59,10 @@ class Loop:
     :data:`ROLES`, or ``None``: wired only by ``control.connections``). With ``outputs_from_state``
     its held outputs are set from its states (``initial_outputs()``) when states are loaded.
     It provides ``initial_outputs()`` and ``update(t, inputs) -> outputs``; its named states are the
-    attributes in ``state_names`` unless it overrides ``get_state`` / ``set_state``.
+    attributes in ``state_names`` unless it overrides ``get_state`` / ``set_state``. A loop rebuilt
+    after retuning continues from those states and from attributes listed in ``carried``.
     ``cfg``: the loop's parameters; ``unit``: the unit's parameters; ``scenario``: the unit's
-    prescribed time functions (start-up ramp, setpoint and gain steps).
+    connection state and ramp over time.
     """
 
     type: ClassVar[str]
@@ -70,7 +72,8 @@ class Loop:
     delayed: ClassVar[frozenset[str]] = frozenset()
     role: ClassVar[Optional[str]] = None
     outputs_from_state: ClassVar[bool] = False  # held outputs = initial_outputs() after loading states
-    state_names: tuple[str, ...] = ()
+    state_names: tuple[str, ...] | Mapping[str, str] = ()
+    carried: ClassVar[tuple[str, ...]] = ()
 
     def __init__(self, cfg: Any, unit: Any, scenario: Any) -> None:
         self.cfg, self.unit, self.scenario = cfg, unit, scenario
@@ -82,10 +85,17 @@ class Loop:
         raise NotImplementedError
 
     def get_state(self) -> dict[str, Any]:
-        return {name: getattr(self, name) for name in self.state_names}
+        names = self.state_names
+        attrs = names if isinstance(names, Mapping) else {name: name for name in names}
+        return {name: getattr(self, attr) for name, attr in attrs.items()}
 
     def set_state(self, values: Mapping[str, Any]) -> None:
         assign(self, values, self.state_names)
+
+    def retuned(self, old: "Loop") -> None:
+        """Take non-state runtime attributes from the loop instance being replaced."""
+        for name in self.carried:
+            setattr(self, name, getattr(old, name))
 
 
 LOOP_TYPES: dict[str, type] = {}
@@ -114,6 +124,24 @@ def register_loop_type(cls: type) -> type:
 def _into(frame: float):
     """The rotation from alpha-beta into the dq frame of angle ``frame`` (rad)."""
     return cmath.exp(-1j * frame)
+
+
+@dataclass(frozen=True)
+class PowerFilterParams:
+    """Optional first-order low-pass filter on measured active and reactive power."""
+
+    enable: bool = False
+    bandwidth: Optional[float] = None  # Hz
+
+
+@dataclass(frozen=True)
+class CurrentLimitParams:
+    """Optional current-reference magnitude limit."""
+
+    enable: bool = False
+    limit_pu: Optional[float] = None
+
+    _quantities = {"limit_pu": "current"}
 
 
 # ------------------------------------------------------------------ grid following
@@ -149,16 +177,14 @@ class SRFPLL(Loop):
         self.kp, self.ki, self.w0, self.T = cfg.kp_pu, cfg.ki_pu, unit.base.w0, cfg.period
         self.theta, self.omega, self.integral = 0.0, self.w0, 0.0
         self.u_g = 1.0 if cfg.normalisation == "amplitude" else None
-        self.state_names = ("theta", "integral") if self.u_g is None else ("theta", "integral", "u_g")
+        self.state_names = {"theta": "theta", "integral_pu": "integral",
+                            **({} if self.u_g is None else {"u_g_pu": "u_g"})}
 
     def initial_outputs(self):
         return {"theta": self.theta, "frame": self.theta, "omega": self.omega}
 
     def update(self, t, inputs):
         frame = self.theta
-        kp = self.scenario.pll_kp(t)
-        if kp is not None:
-            self.kp = kp
         v = inputs["v"] * _into(frame)
         u_g = self.u_g
         if u_g is None:                                    # rated
@@ -177,14 +203,14 @@ class SRFPLL(Loop):
 class CurrentLoop(Loop):
     """dq PI current loop: ``u = u_ff + (r_pu + j*omega/w0*x_pu)*i + kp*e + ki*integral`` (+ ``extra``).
 
-    Gains default from the bandwidth ``bw_hz`` (Hz) and the unit's filter. Anti-windup: the
+    Gains default from ``bandwidth`` (Hz) and the unit's filter. Anti-windup: the
     firmware uses ``rollback`` (conditional) or ``backcalculate`` when the modulation saturates.
     Named state: ``integral_pu`` (complex dq, pu*s).
     """
 
     @dataclass(frozen=True, kw_only=True)
     class Params:
-        bw_hz: float
+        bandwidth: float  # Hz
         kp_pu: Optional[float] = None  # pu voltage / pu current
         ki_pu: Optional[float] = None  # pu voltage / (pu current * s)
         decoupling: bool = True
@@ -201,18 +227,20 @@ class CurrentLoop(Loop):
     inputs = {"id_ref": CURRENT, "iq_ref": CURRENT, "v": V_AB, "i": I_AB, "frame": ANGLE, "omega": FREQUENCY,
               "extra": V_DQ}
     outputs = {"u_dq": V_DQ, "extra": V_DQ}
+    carried = ("frozen",)
 
     def __init__(self, cfg, unit, scenario):
         super().__init__(cfg, unit, scenario)
         x = unit.ac_filter.l_f * unit.base.w0 / unit.base.z_base
         r = unit.ac_filter.r_f / unit.base.z_base
-        self.kp = cfg.kp_pu if cfg.kp_pu is not None else x / unit.base.w0 * 2 * math.pi * cfg.bw_hz
-        self.ki = cfg.ki_pu if cfg.ki_pu is not None else r * 2 * math.pi * cfg.bw_hz
+        self.kp = cfg.kp_pu if cfg.kp_pu is not None else x / unit.base.w0 * 2 * math.pi * cfg.bandwidth
+        self.ki = cfg.ki_pu if cfg.ki_pu is not None else r * 2 * math.pi * cfg.bandwidth
         self.x_pu, self.r_pu, self.w0, self.T = x, r, unit.base.w0, cfg.period
         self.decoupling, self.feedforward, self.antiwindup = cfg.decoupling, cfg.feedforward, cfg.antiwindup
         self.integral = self._prev_integral = 0j
         self._last: tuple[complex, complex, complex, float] | None = None
         self.extra = 0j
+        self.frozen = False
 
     def initial_outputs(self):
         return {"u_dq": 0j, "extra": 0j}
@@ -221,9 +249,12 @@ class CurrentLoop(Loop):
         rot = _into(inputs["frame"])
         self.extra = inputs["extra"]
         i, u_ff, omega = inputs["i"] * rot, inputs["v"] * rot, inputs["omega"]
-        e = complex(inputs["id_ref"], inputs["iq_ref"]) - i
         self._prev_integral = self.integral
-        self.integral = self.integral + self.T * e
+        if self.frozen:
+            e = 0j
+        else:
+            e = complex(inputs["id_ref"], inputs["iq_ref"]) - i
+            self.integral = self.integral + self.T * e
         self._last = (e, i, u_ff, omega)
         return {"u_dq": self.command(e, i, u_ff, omega) + self.extra, "extra": self.extra}
 
@@ -262,7 +293,7 @@ class DCVoltageLoop(Loop):
     """PI dc-voltage loop returning ``id_ref = ff + kp*e + ki*int(e)`` clamped to ``[floor, limit]``.
 
     ``e = u_dc - vdc_ref`` in dc pu; ``id_ref`` in ac current pu (positive = export); the
-    feed-forward ``id0_export_pu`` follows the start-up ramp. ``frozen`` (set while tripped) zeroes
+    feed-forward ``id0_export_pu`` follows the connection ramp. ``frozen`` (set while tripped) zeroes
     the output and holds the integrator. Named states: ``integral`` (pu*s) and, with conditional
     anti-windup, ``clamped``.
     """
@@ -286,6 +317,7 @@ class DCVoltageLoop(Loop):
     role = "dc_voltage"
     inputs = {"u_dc": DC_VOLTAGE, "vdc_ref": DC_VOLTAGE}
     outputs = {"id_ref": CURRENT}
+    carried = ("frozen", "n_updates", "n_clamped", "n_reverse", "first_clamp_t")
 
     def __init__(self, cfg, unit, scenario):
         super().__init__(cfg, unit, scenario)
@@ -297,15 +329,16 @@ class DCVoltageLoop(Loop):
         self.clamped = self.frozen = False
         self.n_updates = self.n_clamped = 0
         self.n_reverse = 0  # updates asking for reverse (import) current
-        self.first_clamp_t = -1.0
-        self.state_names = ("integral", "clamped") if cfg.antiwindup == "conditional" else ("integral",)
+        self.first_clamp_t: float | None = None
+        self.state_names = {"integral_pu": "integral",
+                            **({"clamped": "clamped"} if cfg.antiwindup == "conditional" else {})}
 
     def initial_outputs(self):
         return {"id_ref": 0.0}
 
     def update(self, t, inputs):
         self.n_updates += 1
-        ff = self.scenario.startup(t) * self.cfg.id0_export_pu
+        ff = self.scenario.ramp_value(t) * self.cfg.id0_export_pu
         self.error = inputs["u_dc"] - inputs["vdc_ref"]
         if self.frozen:
             self.raw = 0.0
@@ -317,7 +350,7 @@ class DCVoltageLoop(Loop):
         self.clamped = id_ref != self.raw
         if self.clamped:
             self.n_clamped += 1
-            if self.first_clamp_t < 0.0:
+            if self.first_clamp_t is None:
                 self.first_clamp_t = t
         if self.raw < 0.0:
             self.n_reverse += 1
@@ -328,7 +361,7 @@ class DCVoltageLoop(Loop):
 
 @register_loop_type
 class PowerLoop(Loop):
-    """Power feedback ``p + j q = v conj(i)``, low-pass filtered at ``bw_hz`` (Hz; ``<= 0``: unfiltered).
+    """Power feedback ``p + j q = v conj(i)``, optionally low-pass filtered.
 
     Named states: filtered ``p`` and ``q`` (pu).
     """
@@ -336,7 +369,7 @@ class PowerLoop(Loop):
     @dataclass(frozen=True, kw_only=True)
     class Params:
         period: float
-        bw_hz: float = 0.0
+        filter: PowerFilterParams = field(default_factory=PowerFilterParams)
         type: str = "power"
 
     type = "power"
@@ -346,8 +379,9 @@ class PowerLoop(Loop):
 
     def __init__(self, cfg, unit, scenario):
         super().__init__(cfg, unit, scenario)
-        self.lpf_p = LowPass1(cfg.bw_hz, cfg.period, 0.0, init_on_first=False)
-        self.lpf_q = LowPass1(cfg.bw_hz, cfg.period, 0.0, init_on_first=False)
+        bandwidth = cfg.filter.bandwidth if cfg.filter.enable else 0.0
+        self.lpf_p = LowPass1(bandwidth, cfg.period, 0.0, init_on_first=False)
+        self.lpf_q = LowPass1(bandwidth, cfg.period, 0.0, init_on_first=False)
 
     def initial_outputs(self):
         return {"p": 0.0, "q": 0.0}
@@ -357,10 +391,10 @@ class PowerLoop(Loop):
         return {"p": self.lpf_p.update(s.real), "q": self.lpf_q.update(s.imag)}
 
     def get_state(self):
-        return gather({"p": self.lpf_p, "q": self.lpf_q})
+        return gather({"p_pu": self.lpf_p, "q_pu": self.lpf_q})
 
     def set_state(self, values):
-        scatter({"p": self.lpf_p, "q": self.lpf_q}, values)
+        scatter({"p_pu": self.lpf_p, "q_pu": self.lpf_q}, values)
 
 
 class SyncLaw(Loop):
@@ -370,7 +404,7 @@ class SyncLaw(Loop):
     A law implements ``step(T, p, q, v_mag, v_dc, p_ref, q_ref, v_ref, i_dq)``, which advances
     ``theta``, ``omega`` and ``v_mag`` by one period ``T``; its inputs are in pu (the voltage
     magnitude on the ac base, ``v_dc`` on the dc base) and ``i_dq`` is the current in the law's frame.
-    The power setpoint follows the start-up ramp and the setpoints their steps.
+    The active-power setpoint follows the connection ramp.
     """
 
     role = "sync"
@@ -420,7 +454,7 @@ class PSC(SyncLaw):
         _quantities = {"k_p_pu": "1/power"}
 
     type = "psc"
-    state_names = ("theta", "v_int")
+    state_names = {"theta": "theta", "v_int_pu": "v_int"}
 
     def __init__(self, cfg, unit, scenario):
         super().__init__(cfg, unit, scenario)
@@ -469,7 +503,7 @@ class VSG(SyncLaw):
 
     @dataclass(frozen=True, kw_only=True)
     class Params:
-        h_s: float  # inertia constant, s
+        h: float  # inertia constant, s
         d_p_pu: float  # damping, pu power per pu speed deviation
         k_q_pu: float  # Q-V droop, pu/pu
         t_q: float = 0.0  # voltage-magnitude lag time constant, s (0: none)
@@ -482,12 +516,13 @@ class VSG(SyncLaw):
 
     def __init__(self, cfg, unit, scenario):
         super().__init__(cfg, unit, scenario)
-        self.h_s, self.d_p, self.k_q, self.t_q = cfg.h_s, cfg.d_p_pu, cfg.k_q_pu, cfg.t_q
+        self.h, self.d_p, self.k_q, self.t_q = cfg.h, cfg.d_p_pu, cfg.k_q_pu, cfg.t_q
         self.dw_pu = 0.0
-        self.state_names = ("theta", "dw_pu", "v_mag") if self.t_q > 0.0 else ("theta", "dw_pu")
+        self.state_names = {"theta": "theta", "dw_pu": "dw_pu",
+                            **({"v_mag_pu": "v_mag"} if self.t_q > 0.0 else {})}
 
     def step(self, T, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
-        self.dw_pu += T / (2.0 * self.h_s) * (p_ref_pu - p_pu - self.d_p * self.dw_pu)
+        self.dw_pu += T / (2.0 * self.h) * (p_ref_pu - p_pu - self.d_p * self.dw_pu)
         self.omega = self.w0 * (1.0 + self.dw_pu)
         self.theta += T * self.omega
         v_cmd = v_ref_pu + self.k_q * (q_ref_pu - q_pu)
@@ -509,19 +544,19 @@ class DVOC(SyncLaw):
     class Params:
         eta_pu: float  # rad/s
         alpha_pu: float  # magnitude regulation gain
-        kappa_rad: float  # rotation of the current error, rad
+        kappa: float  # rotation of the current error, rad
         period: float
         type: str = "dvoc"
 
         _quantities = {"eta_pu": "resistance", "alpha_pu": "1/resistance"}
 
     type = "dvoc"
-    state_names = ("theta", "v_mag")
+    state_names = {"theta": "theta", "v_mag_pu": "v_mag"}
 
     def __init__(self, cfg, unit, scenario):
         super().__init__(cfg, unit, scenario)
         self.eta, self.alpha = cfg.eta_pu, cfg.alpha_pu
-        self.rot = cmath.exp(1j * cfg.kappa_rad)
+        self.rot = cmath.exp(1j * cfg.kappa)
 
     def step(self, T, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
         V = self.v_mag
@@ -600,18 +635,18 @@ class VirtualImpedance(Loop):
 
 @register_loop_type
 class VirtualAdmittance(Loop):
-    """Current reference from ``x_pu/w0 di/dt = v_ref - v - (r_pu + j omega/w0 x_pu) i``, limited to
-    ``|i| <= current_limit_pu`` (``<= 0``: no limit). Named state: ``i_ref_pu`` (dq, pu)."""
+    """Current reference from ``x_pu/w0 di/dt = v_ref - v - (r_pu + j omega/w0 x_pu) i``,
+    optionally magnitude-limited. Named state: ``i_ref_pu`` (dq, pu)."""
 
     @dataclass(frozen=True, kw_only=True)
     class Params:
         period: float
         x_v_pu: float
         r_v_pu: float = 0.0
-        current_limit_pu: float = 0.0
+        current_limit: CurrentLimitParams = field(default_factory=CurrentLimitParams)
         type: str = "virtual_admittance"
 
-        _quantities = {"r_v_pu": "resistance", "x_v_pu": "resistance", "current_limit_pu": "current"}
+        _quantities = {"r_v_pu": "resistance", "x_v_pu": "resistance"}
 
         def __post_init__(self) -> None:
             if not self.x_v_pu > 0.0:
@@ -625,7 +660,7 @@ class VirtualAdmittance(Loop):
     def __init__(self, cfg, unit, scenario):
         super().__init__(cfg, unit, scenario)
         self.r_pu, self.x_pu, self.w0, self.T = cfg.r_v_pu, cfg.x_v_pu, unit.base.w0, cfg.period
-        self.i_limit = cfg.current_limit_pu if cfg.current_limit_pu > 0 else math.inf
+        self.i_limit = cfg.current_limit.limit_pu if cfg.current_limit.enable else math.inf
         self.i_ref = 0j
 
     def initial_outputs(self):

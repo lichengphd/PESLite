@@ -1,0 +1,35 @@
+# Grid-forming converter: virtual synchronous generator (VSG) with a virtual impedance.
+base: {s_base: 2.0e6, v_ll_rms: 690.0, f0: 50.0}
+buses:
+  pcc: {c_pu: 0.02, r_d_pu: 0.5}
+sources:
+  grid:
+    bus: pcc
+    x_pu: 0.4
+    r_pu: 0.04
+units:
+  vsc:
+    bus: pcc
+    ac_filter: {l_f_pu: 0.2, r_f_pu: 0.01}
+    dclink:
+      vdc_ref: 1500.0
+      source: {type: voltage}
+    pwm: {f_sw: 20000.0, modulation_limit: 0.95}
+    control:
+      type: gfm
+      loops:
+        power: {type: power, period: 5.0e-5}
+        sync: {type: vsg, period: 5.0e-5, h: 2.0, d_p_pu: 20.0, k_q_pu: 0.05, t_q: 0.02}
+        impedance: {type: virtual_impedance, x_v_pu: 0.1}
+      references: {p_ref_pu: 0.5}
+    delay: {steps: 1}
+    protection: {overcurrent: {enable: 1, limit_pu: 1.5}}
+events:
+  connect_vsc: {type: connect, target: vsc, t: 0.2, ramp: 1.0}
+  p_step: {type: set, t: 2.0, set: {units.vsc.control.references.p_ref_pu: 0.8}}
+  grid_f: {type: set, t: 4.0, set: {sources.grid.f: 49.8}}
+simulation:
+  t_end: 6.0
+  bridge: averaged
+  solver: {dt: 12.5e-6}
+  output: {control_every: 10}

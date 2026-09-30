@@ -1,17 +1,17 @@
-"""The system: named buses, R-L branches, sources and converter units wired into one model.
+"""The system: named buses, branches, sources, units and circuit elements wired into one model.
 
-Element names are the namespaces of their subsystems and states.
+It also exposes the component operations used by simulation-file events.
 """
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Mapping, Optional
 
-from ..components.network import RCNode, RLBranch, ThreePhaseSource
-from ..solver.model import Model
-from ..solver.model import gather
-from .events import SourceScenario
-from .params import Params
+from ..components.network import ELEMENT_TYPES, RCNode, RLBranch, ThreePhaseSource
+from ..solver.energy import spec_of
+from ..solver.model import ConfigError, Model, gather
+from .events import SWITCHING, SourceScenario
+from .params import Change, Params
 from .unit import Unit
 
 __all__ = ["System"]
@@ -20,13 +20,23 @@ __all__ = ["System"]
 class _Source:
     """Voltage source (emf) behind a series R-L branch."""
 
-    def __init__(self, name: str, cfg, base, bus) -> None:
+    def __init__(self, name: str, cfg, base, bus, steps, t0: float) -> None:
         self.name, self.cfg, self.bus = name, cfg, bus
-        self.scenario = sc = SourceScenario(cfg)
-        self.emf = ThreePhaseSource(base.w0, cfg.v,
-                                    phi=sc.angle if sc.has_angle else None,
-                                    magnitude=sc.magnitude if sc.has_voltage_step else None)
+        self.scenario = SourceScenario(cfg, base.f0, steps)
+        self.emf = ThreePhaseSource(base.w0, *self.scenario.law(t0))
         self.branch = RLBranch(cfg.l, cfg.r)
+
+    def retune(self, cfg, paths: list[str], t: float) -> None:
+        """Apply changed source impedance, magnitude, frequency or angle at ``t``."""
+        self.cfg = cfg
+        if "l" in paths or "r" in paths:
+            self.branch.retune(cfg.l, cfg.r)
+        if "v" in paths or "f" in paths or "angle" in paths:
+            voltage, phase = self.scenario.law(t)
+            if "v" in paths:
+                self.emf.e_peak = voltage
+            if "f" in paths or "angle" in paths:
+                self.emf.phi = phase
 
     def subsystems(self) -> dict[str, Any]:
         return {f"{self.name}.emf": self.emf, f"{self.name}.branch": self.branch}
@@ -49,17 +59,13 @@ class _Source:
 
 
 class System:
-    """Buses, branches, sources and units wired into one :class:`~peslite.solver.model.Model`."""
+    """Buses, branches, sources, units and elements wired into one model."""
 
-    def __init__(self, p: Params, parts: Optional[Mapping[str, Any]] = None,
-                 elements: Sequence[Any] = ()) -> None:
-        """Build the elements described by ``p`` plus any extra ``elements``.
+    def __init__(self, p: Params, parts: Optional[Mapping[str, Any]] = None) -> None:
+        """Build the system described by ``p``, including registered ``elements`` entries.
 
         parts: replacement units or unit parts keyed ``"<unit>"``, ``"<unit>.ctrl"``, ``"<unit>.modulator"``,
         ``"<unit>.delay"``.
-        elements: callables ``(buses, params) -> element``; an element provides ``subsystems()``,
-        ``connections()``, ``bus_name``, ``injection`` (signed current into the bus, or ``None``)
-        and optionally ``signals()``.
         """
         self.p = p
         parts = dict(parts or {})
@@ -70,7 +76,10 @@ class System:
                       for name, cfg in p.buses.items()}
         self.branches = {name: RLBranch(cfg.l, cfg.r)
                          for name, cfg in p.branches.items()}
-        self.sources = {name: _Source(name, cfg, base, self.buses[cfg.bus])
+        self.sources = {name: _Source(name, cfg, base, self.buses[cfg.bus], [
+                            (change.t, change.params.sources[name]) for change in p.changes
+                            if set(change.touches(f"sources.{name}.")) & {"v", "f", "angle"}],
+                            p.simulation.initial.t)
                         for name, cfg in p.sources.items()}
         self.units: dict[str, Unit] = {}
         for name, cfg in p.units.items():
@@ -84,12 +93,13 @@ class System:
         subsystems.update(self.branches)
         connections: dict = {}
         into: dict[str, list] = {name: [] for name in self.buses}
-        self.elements = [make(self.buses, p) for make in elements]
-        for element in (*self.sources.values(), *self.units.values(), *self.elements):
+        self.named_elements = {name: ELEMENT_TYPES[cfg.type](name, cfg, self.buses, p)
+                               for name, cfg in p.elements.items()}
+        for element in (*self.sources.values(), *self.units.values(), *self.named_elements.values()):
             subsystems.update(element.subsystems())
             connections.update(element.connections())
-        # bus injections: units, sources, extra elements, then branches
-        for element in (*self.units.values(), *self.sources.values(), *self.elements):
+        # bus injections: units, sources, registered elements, then branches
+        for element in (*self.units.values(), *self.sources.values(), *self.named_elements.values()):
             if element.injection is not None:
                 into[element.bus_name].append(element.injection)
         for name, cfg in p.branches.items():
@@ -161,11 +171,78 @@ class System:
 
         return preset
 
+    # ---------------------------------------------------------------- events
+    def switch(self, name: str, on: bool, t: float, ramp: float = 0.0) -> None:
+        """Connect or disconnect a named unit, source, branch or registered element."""
+        if name in self.units:
+            self.units[name].connect(on, t, ramp)
+            return
+        if name in self.sources:
+            breakers = [self.sources[name].branch]
+        elif name in self.branches:
+            breakers = [self.branches[name]]
+        elif name in self.named_elements:
+            element = self.named_elements[name]
+            if hasattr(element, "connect"):
+                element.connect(on, t, ramp)
+                return
+            breakers = element.breakers
+        else:
+            raise ValueError(f"cannot switch {name!r}")
+        for breaker in breakers:
+            (breaker.close_breaker if on else breaker.open_breaker)()
+
+    def apply(self, change: Change) -> None:
+        """Apply the checked parameter state after one ``set`` event to affected components."""
+        p, done = change.params, set()
+        for path in change.paths:
+            section, name, _rest = path.split(".", 2)
+            if (section, name) in done:
+                continue
+            done.add((section, name))
+            if section == "buses":
+                self.buses[name].retune(p.buses[name].c, p.buses[name].r_d)
+            elif section == "branches":
+                self.branches[name].retune(p.branches[name].l, p.branches[name].r)
+            elif section == "sources":
+                self.sources[name].retune(
+                    p.sources[name], change.touches(f"sources.{name}."), change.t)
+            elif section == "units":
+                self.units[name].retune(
+                    p.units[name], change.touches(f"units.{name}."), change.t)
+            elif section == "elements":
+                self.named_elements[name].retune(p.elements[name])
+        model = self.model
+        model.energy_specs = {name: spec_of(subsystem)
+                              for name, subsystem in zip(model.names, model.subsystems)}
+
+    def check_events(self, p: Params) -> None:
+        """Check that custom elements and replacement controllers support their requested events."""
+        for event in p.events.values():
+            if event.type in SWITCHING and event.target in self.named_elements:
+                element = self.named_elements[event.target]
+                if not (hasattr(element, "breakers") or hasattr(element, "connect")):
+                    raise ConfigError(
+                        f"elements.{event.target}: its type has no breakers and no connect(), so "
+                        "connect and disconnect events cannot switch it")
+        for change in p.changes:
+            for path in change.paths:
+                section, name, rest = path.split(".", 2)
+                if section == "elements" and not hasattr(self.named_elements[name], "retune"):
+                    raise ConfigError(
+                        f"events.{change.event}: elements.{name} has no retune(parameters), so a "
+                        "set event cannot change it")
+                if (section == "units" and not rest.startswith("dclink.")
+                        and not hasattr(self.units[name].ctrl, "retune")):
+                    raise ConfigError(
+                        f"events.{change.event}: the controller of unit {name!r} has no "
+                        f"retune(cfg, paths, t), so a set event cannot change {path}")
+
     # ---------------------------------------------------------------- the run
     def signals(self, t: float) -> dict[str, float | complex]:
         """Return the plant signals (SI) for the recorder; outputs must be synced to ``t``."""
         out: dict[str, float | complex] = {}
-        for element in (*self.sources.values(), *self.units.values(), *self.elements):
+        for element in (*self.sources.values(), *self.units.values(), *self.named_elements.values()):
             out.update(element.signals() if hasattr(element, "signals") else {})
         for name, branch in self.branches.items():
             out[f"{name}.i"] = branch.out.i

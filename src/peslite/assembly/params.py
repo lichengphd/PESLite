@@ -1,11 +1,11 @@
-"""The parameters of a simulation file: their classes, the pu bases, and their construction from a mapping.
+"""Simulation-file parameters, pu bases, typed construction and runtime ``set`` changes.
 
 Electrical inputs without suffix are SI values; ``_pu`` names are per unit. Plant quantities are
 stored in SI, controller quantities in pu. A field listed in a class's ``_quantities`` may be given
 in SI or pu. :func:`from_dict` builds the checked :class:`Params` from a mapping in one pass: it
 converts each section's inputs on the bases in force there (the system base, or a unit's own), checks
-fields, types and choices, and builds the loops with the parameters of their registered types (a
-loop type declares its own, :class:`peslite.control.loops.Loop`); :func:`to_dict` converts back.
+fields, types and choices, and builds registered loop, element and event parameter types;
+:func:`to_dict` converts back.
 
 pu bases, AC: Vb = sqrt(2/3)*v_ll_rms (phase peak), Ib = S/(1.5*Vb), Zb = Vb/Ib, w0 = 2*pi*f0;
 DC: Vdc = vdc_ref, Idc = S/Vdc, Zdc = Vdc**2/S. L base = Z/w0, C base = 1/(w0*Z).
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import csv
 import dataclasses
+import functools
 import json
 import math
 from collections.abc import Mapping as _Mapping
@@ -23,17 +24,21 @@ from dataclasses import dataclass, field, fields, is_dataclass, replace
 from pathlib import Path
 from typing import Any, Optional, Union, get_args, get_origin, get_type_hints
 
+from ..components.network import ELEMENT_TYPES, element_buses
 from ..control.loops import LOOP_TYPES
 from ..solver.model import ConfigError
+from .events import EVENT_TYPES, NAMED, events_for
 from .validate import validate
 
 __all__ = [
-    "ConfigError", "load", "dump", "read_tree", "read_initial", "from_dict", "to_dict", "BaseValues", "DCBase",
-    "BusParams", "BranchParams", "SourceParams", "SourceEventParams",
+    "ConfigError", "load", "dump", "dumps", "read_tree", "read_initial", "from_dict", "to_dict",
+    "BaseValues", "DCBase",
+    "BusParams", "BranchParams", "SourceParams",
     "ACFilterParams", "DCLinkParams", "DCCapacitorParams", "DCSourceParams", "PWMParams", "MeasurementParams",
-    "ReferenceParams", "ControlParams", "DelayParams", "ProtectionParams",
-    "StartupParams", "SetpointStepParams", "PLLGainStepParams", "UnitEventParams", "UnitParams",
-    "SolverParams", "LogParams", "SimulationParams", "InitialParams", "OutputParams", "Params",
+    "ReferenceParams", "ControlParams", "DelayParams", "OvercurrentParams", "VoltageLimitParams",
+    "FrequencyLimitParams", "DCVoltageLimitParams", "RocofParams", "ProtectionParams",
+    "UnitParams", "RUNTIME", "Change", "runtime_changeable", "set_changes",
+    "SolverParams", "SimulationParams", "InitialParams", "OutputParams", "MetaParams", "Params",
 ]
 
 
@@ -186,15 +191,13 @@ class BusParams:
 class BranchParams:
     """Series R-L branch between two buses; current positive from ``from_bus`` to ``to_bus``.
 
-    ``l`` in H, ``r`` in ohm; pu inputs use the system base. ``breaker``: protection may open it.
+    ``l`` in H, ``r`` in ohm; pu inputs use the system base. Connect/disconnect events switch it.
     """
 
     from_bus: str
     to_bus: str
     l: float
     r: float = 0.0
-    breaker: bool = False
-
     _quantities = {"l": "inductance", "r": "resistance"}
     _input_aliases = {"x_pu": "l_pu"}
 
@@ -203,34 +206,20 @@ class BranchParams:
 class SourceParams:
     """Three-phase emf behind a series R-L impedance, connected to ``bus``.
 
-    ``l`` in H, ``r`` in ohm, ``v`` in phase-peak V (default 1 pu); pu inputs use the system base.
+    ``l`` in H, ``r`` in ohm, ``v`` in phase-peak V (default 1 pu), ``f`` in Hz (default
+    ``base.f0``), and ``angle`` in rad; pu inputs use the system base.
     """
 
     bus: str
     l: float
     r: float = 0.0
     v: float = 0.0  # emf magnitude, phase-peak V
-    events: "SourceEventParams" = field(default_factory=lambda: SourceEventParams())
+    f: Optional[float] = None
+    angle: float = 0.0
 
     _quantities = {"l": "inductance", "r": "resistance", "v": "voltage"}
     _input_aliases = {"x_pu": "l_pu"}
     _defaults_pu = {"v": 1.0}
-
-
-@dataclass(frozen=True)
-class SourceEventParams:
-    """Events applied to one source; times in s, ``t < 0`` disables a step."""
-
-    freq_step_t: float = -1.0
-    freq_step_hz: float = 0.0
-    phase_jump_t: float = -1.0
-    phase_jump_rad: float = 0.0
-    voltage_step_t: float = -1.0
-    voltage_step: float = 0.0  # phase-peak emf magnitude after the step, V
-
-    _quantities = {"voltage_step": "voltage"}
-    _defaults_pu = {"voltage_step": 1.0}
-
 
 # ------------------------------------------------------------------ a converter unit
 
@@ -320,11 +309,11 @@ class MeasurementParams:
     """ADC measurement settings.
 
     ``average`` (AC) and ``u_dc`` (DC): ``"instantaneous"`` or ``"window"`` (mean over
-    ``window_s``, s, at most the PWM update period).
+    ``window``, s, at most the PWM update period).
     """
 
     average: str = "instantaneous"
-    window_s: Optional[float] = None  # s; default: the PWM update period
+    window: Optional[float] = None  # s; default: the PWM update period
     u_dc: str = "instantaneous"
 
     _choices = {"average": ("instantaneous", "window"), "u_dc": ("instantaneous", "window")}
@@ -374,60 +363,58 @@ class DelayParams:
 
 
 @dataclass(frozen=True)
+class OvercurrentParams:
+    enable: bool = False
+    limit_pu: Optional[float] = None
+
+    _quantities = {"limit_pu": "current"}
+
+
+@dataclass(frozen=True)
+class VoltageLimitParams:
+    enable: bool = False
+    limit_pu: Optional[float] = None
+
+    _quantities = {"limit_pu": "voltage"}
+
+
+@dataclass(frozen=True)
+class FrequencyLimitParams:
+    enable: bool = False
+    limit: Optional[float] = None  # Hz
+
+
+@dataclass(frozen=True)
+class DCVoltageLimitParams:
+    enable: bool = False
+    limit_pu: Optional[float] = None
+
+    _quantities = {"limit_pu": "dc_voltage"}
+
+
+@dataclass(frozen=True)
+class RocofParams:
+    enable: bool = False
+    limit: Optional[float] = None  # Hz/s
+    window: float = 0.1  # s
+
+
+@dataclass(frozen=True)
 class ProtectionParams:
-    """Trip and alarm thresholds; ``<= 0`` disables a criterion; times in s."""
+    """Trip criteria and the ROCOF alarm, each switched by ``enable`` (1/0)."""
 
-    i_alarm_pu: float = -1.0  # instantaneous phase current, trips immediately
-    vac_uv_pu: float = -1.0
-    vac_ov_pu: float = -1.0
-    freq_band_hz: float = -1.0
-    vdc_band_pu: float = -1.0
-    hold_s: float = 0.02
-    rocof_alarm_hz_s: float = -1.0  # alarm only
-    rocof_window_s: float = 0.1
-
-    _quantities = {"i_alarm_pu": "current", "vac_uv_pu": "voltage",
-                   "vac_ov_pu": "voltage", "vdc_band_pu": "dc_voltage"}
-
-
-@dataclass(frozen=True)
-class StartupParams:
-    start: float = 0.0
-    duration: float = 0.0  # s; ramp of the DC source and of id0
-
-
-@dataclass(frozen=True)
-class SetpointStepParams:
-    """Step of a controller setpoint (GFM ``p_ref`` / ``q_ref`` / ``v_ref``)."""
-
-    t: float = -1.0
-    p_ref_pu: Optional[float] = None
-    q_ref_pu: Optional[float] = None
-    v_ref_pu: Optional[float] = None
-
-    _quantities = {"p_ref_pu": "power", "q_ref_pu": "power", "v_ref_pu": "voltage"}
-
-
-@dataclass(frozen=True)
-class PLLGainStepParams:
-    t: float = -1.0
-    kp_after_pu: float = 0.0
-
-    _quantities = {"kp_after_pu": "1/voltage"}
-
-
-@dataclass(frozen=True)
-class UnitEventParams:
-    """Events applied to one converter unit."""
-
-    startup: StartupParams = field(default_factory=StartupParams)
-    setpoint: SetpointStepParams = field(default_factory=SetpointStepParams)
-    pll_gain: PLLGainStepParams = field(default_factory=PLLGainStepParams)
+    overcurrent: OvercurrentParams = field(default_factory=OvercurrentParams)
+    undervoltage: VoltageLimitParams = field(default_factory=VoltageLimitParams)
+    overvoltage: VoltageLimitParams = field(default_factory=VoltageLimitParams)
+    frequency: FrequencyLimitParams = field(default_factory=FrequencyLimitParams)
+    dc_voltage: DCVoltageLimitParams = field(default_factory=DCVoltageLimitParams)
+    rocof: RocofParams = field(default_factory=RocofParams)
+    hold: float = 0.02  # s
 
 
 @dataclass(frozen=True)
 class UnitParams:
-    """One converter unit: rating, plant components, control, protection and events.
+    """One converter unit: rating, plant components, control and protection.
 
     ``bus``: terminal bus. Plant fields are stored in SI; controller parameters are
     pu on the unit's rating ``s_base`` (VA) and DC base (``dclink.vdc_ref``).
@@ -442,8 +429,9 @@ class UnitParams:
     s_base: Optional[float] = None  # rating (VA); default: the system base
     measurement: MeasurementParams = field(default_factory=MeasurementParams)
     protection: ProtectionParams = field(default_factory=ProtectionParams)
-    events: UnitEventParams = field(default_factory=UnitEventParams)
     base: BaseValues = field(init=False, default=None)  # set by resolved()
+    derived_defaults: frozenset = field(init=False, default=frozenset(), compare=False)
+    events: tuple = field(init=False, default=(), compare=False)
 
     @staticmethod
     def _bases(data: dict, base: BaseValues, where: str) -> tuple[BaseValues, dict[str, float]]:
@@ -460,12 +448,17 @@ class UnitParams:
             raise ConfigError(f"{where}.dclink.vdc_ref must be finite and positive")
         return base, base.parameter_scales(vdc_ref)
 
-    def resolved(self, system_base: BaseValues) -> UnitParams:
-        """Return a copy with ``base``, timing defaults and ``omega`` filled in (after validation)."""
-        pwm = replace(self.pwm, update_period=self.pwm.effective_update_period)
+    def resolved(self, system_base: BaseValues, events: tuple = ()) -> UnitParams:
+        """Return a copy with its base, target events and dependent defaults resolved."""
+        derived = set()
+        pwm = self.pwm
+        if pwm.update_period is None:
+            pwm = replace(pwm, update_period=pwm.switching_period)
+            derived.add("pwm.update_period")
         references = self.control.references
         if references.omega is None:
             references = replace(references, omega=system_base.w0)
+            derived.add("control.references.omega")
         control = replace(self.control, references=references)
         sampling_period = control.sampling_period if control.sampling_period is not None else pwm.update_period
         object.__setattr__(control, "samples_per_update",
@@ -474,6 +467,8 @@ class UnitParams:
         base = system_base if self.s_base is None else BaseValues(
             self.s_base, system_base.v_ll_rms, system_base.f0)
         object.__setattr__(unit, "base", base)
+        object.__setattr__(unit, "derived_defaults", frozenset(derived))
+        object.__setattr__(unit, "events", tuple(events))
         return unit
 
     @property
@@ -507,25 +502,6 @@ class SolverParams:
 
 
 @dataclass(frozen=True)
-class LogParams:
-    plant_period: float = 5e-4  # plant snapshot period, s
-    control_every: int = 1  # keep every n-th controller sample
-
-
-@dataclass(frozen=True)
-class SimulationParams:
-    t_end: float
-    bridge: str = "switching"  # "switching" | "averaged" | "step_averaged"
-    solver: SolverParams = field(default_factory=SolverParams)
-    log: LogParams = field(default_factory=LogParams)
-    stop_on_trip: bool = True
-    progress_every: float = 0.0  # s of simulated time between progress lines; 0: silent
-    energy_check: str = "warn"  # "warn" | "strict" | "off": verify the energy declarations before the run
-
-    _choices = {"bridge": ("switching", "averaged", "step_averaged"), "energy_check": ("warn", "strict", "off")}
-
-
-@dataclass(frozen=True)
 class InitialParams:
     """Start time ``t`` (s) and overrides of initial state values.
 
@@ -540,19 +516,48 @@ class InitialParams:
 
 @dataclass(frozen=True)
 class OutputParams:
-    """Files written by ``SimulationResult.save``."""
+    """What a run records and the files written by ``SimulationResult.save``."""
 
+    period: float = 5e-4  # plant snapshot interval, s
+    control_every: int = 1  # keep every n-th controller sample
     states: bool = True  # states.csv
     signals: bool = False  # plant.csv and control.csv
     energy: bool = False  # energy.csv
 
 
 @dataclass(frozen=True)
+class SimulationParams:
+    """How the model is simulated: time span, bridge model, solver, initial state and output."""
+
+    t_end: float
+    bridge: str = "switching"  # "switching" | "averaged" | "step_averaged"
+    solver: SolverParams = field(default_factory=SolverParams)
+    initial: InitialParams = field(default_factory=InitialParams)
+    output: OutputParams = field(default_factory=OutputParams)
+    stop_on_trip: bool = True
+    progress_every: float = 0.0  # s of simulated time between progress lines; 0: silent
+    energy_check: str = "warn"  # "warn" | "strict" | "off": verify the energy declarations before the run
+
+    _choices = {"bridge": ("switching", "averaged", "step_averaged"), "energy_check": ("warn", "strict", "off")}
+
+
+@dataclass(frozen=True)
+class MetaParams:
+    """Optional human-readable notes which do not affect the simulation."""
+
+    title: Optional[str] = None
+    description: Optional[str] = None
+
+    _text = ("title", "description")
+    _unknown_hint = "meta holds only a title and a description"
+
+
+@dataclass(frozen=True)
 class Params:
     """Complete configuration: system base, network elements, units and run settings.
 
-    ``buses``, ``branches``, ``sources`` and ``units`` map names to elements; names
-    are unique across all four and prefix the state names.
+    ``buses``, ``branches``, ``sources``, ``units`` and ``elements`` map names to entries;
+    their names are unique together and prefix state names.
     """
 
     base: BaseValues  # system base, used for network pu inputs
@@ -561,9 +566,9 @@ class Params:
     simulation: SimulationParams
     sources: dict[str, SourceParams] = field(default_factory=dict)
     branches: dict[str, BranchParams] = field(default_factory=dict)
-    initial: InitialParams = field(default_factory=InitialParams)
-    output: OutputParams = field(default_factory=OutputParams)
-    meta: dict = field(default_factory=dict)
+    elements: dict[str, Any] = field(default_factory=dict, metadata={"entries": "element"})
+    events: dict[str, Any] = field(default_factory=dict, metadata={"entries": "event"})
+    meta: MetaParams = field(default_factory=MetaParams)
 
     def unit(self, name: Optional[str] = None) -> UnitParams:
         """Return the unit ``name``, or the only unit if ``name`` is None."""
@@ -576,10 +581,14 @@ class Params:
             raise ConfigError(f"unknown unit {name!r}; known: {sorted(self.units)}")
         return self.units[name]
 
-    @property
-    def elements(self) -> dict[str, Any]:
-        """All named elements (buses, branches, sources, units) in assembly order."""
-        return {**self.buses, **self.branches, **self.sources, **self.units}
+    def section_of(self, name: str) -> Optional[str]:
+        """Return the named section containing ``name``, or ``None``."""
+        return next((section for section in NAMED if name in getattr(self, section)), None)
+
+    @functools.cached_property
+    def changes(self) -> tuple["Change", ...]:
+        """The checked parameter state after each ``set`` event, in event order."""
+        return set_changes(self)
 
     @staticmethod
     def _bases(data: dict, base: Any, where: str) -> tuple[Any, Optional[dict[str, float]]]:
@@ -593,9 +602,11 @@ class Params:
         """Return a copy with dotted paths replaced, e.g. ``replace(**{"units.vsc.control.loops.pll.kp_pu": 20})``."""
         d = to_dict(self)
         assigned = set()
-        free = ("initial.states.", "simulation.solver.subsystems.")  # keys that contain dots themselves
+        free = ("simulation.initial.states.", "simulation.solver.subsystems.")  # dotted keys themselves
         for path, value in path_values.items():
             head = next((h for h in free if path.startswith(h)), None)
+            if head is None and path.startswith("events.") and ".set." in path:
+                head = path[:path.index(".set.") + 5]
             if head is not None:  # remainder is one key
                 node = d
                 for k in head.rstrip(".").split("."):
@@ -623,18 +634,33 @@ class Params:
 # ------------------------------------------------------------------ construction from mappings
 
 def from_dict(data: dict) -> Params:
-    """Build, check and resolve a :class:`Params` tree from a mapping (the input is not modified)."""
+    """Build, validate and resolve parameters, including every successive ``set`` event."""
     p = _build(Params, _normalize(data), "", None, None)
     validate(p)
-    return replace(p, units={name: unit.resolved(p.base) for name, unit in p.units.items()})
+    p = replace(p, units={name: unit.resolved(p.base, events_for(p.events, name))
+                          for name, unit in p.units.items()})
+    p.changes
+    return p
 
 
-def to_dict(p: Any) -> dict:
-    """Convert a dataclass tree to mappings, omitting non-init (derived) fields."""
+def to_dict(p: Any, derived: bool = False) -> dict:
+    """Convert a dataclass tree to mappings, omitting non-init fields.
+
+    Values filled from other parameters are written as ``None`` unless ``derived`` is true,
+    so rebuilding the mapping derives them from any replacements again.
+    """
     if is_dataclass(p) and not isinstance(p, type):
-        return {f.name: to_dict(getattr(p, f.name)) for f in fields(p) if f.init}
+        d = {f.name: to_dict(getattr(p, f.name), derived) for f in fields(p) if f.init}
+        if not derived:
+            for path in getattr(p, "derived_defaults", ()):
+                *head, last = path.split(".")
+                node = d
+                for key in head:
+                    node = node[key]
+                node[last] = None
+        return d
     if isinstance(p, dict):
-        return {k: to_dict(v) for k, v in p.items()}
+        return {k: to_dict(v, derived) for k, v in p.items()}
     return p
 
 
@@ -648,15 +674,15 @@ def _numeric_string(value: Any) -> Any:
     return value
 
 
-def _flatten_states(states: Any, prefix: str = "") -> dict:
-    """Flatten nested state mappings to dotted keys; lists are kept as values."""
-    if not isinstance(states, dict):
-        raise ConfigError(f"initial.states{'.' + prefix if prefix else ''}: expected a mapping")
+def flat_paths(values: Any, where: str = "", prefix: str = "") -> dict:
+    """Flatten nested mappings to dotted paths; lists and scalars remain values."""
+    if not isinstance(values, dict):
+        raise ConfigError(f"{where}{'.' + prefix if prefix else ''}: expected a mapping")
     out: dict = {}
-    for key, value in states.items():
+    for key, value in values.items():
         name = f"{prefix}.{key}" if prefix else str(key)
         if isinstance(value, dict):
-            out.update(_flatten_states(value, name))
+            out.update(flat_paths(value, where, name))
         else:
             out[name] = value
     return out
@@ -667,11 +693,16 @@ def _normalize(data: dict) -> dict:
     data = deepcopy(data)
     if not isinstance(data, dict):
         return data  # type error reported by the construction
-    init = data.get("initial")
+    simulation = data.get("simulation")
+    init = simulation.get("initial") if isinstance(simulation, dict) else None
     if isinstance(init, dict) and init.get("states") is not None:
         init["states"] = {key: _numeric_string(value)
-                          for key, value in _flatten_states(init["states"]).items()}
-    simulation = data.get("simulation")
+                          for key, value in flat_paths(init["states"], "simulation.initial.states").items()}
+    events = data.get("events")
+    if isinstance(events, dict):
+        for name, event in events.items():
+            if isinstance(event, dict) and "set" in event:
+                event["set"] = flat_paths(event["set"], f"events.{name}.set")
     solver = simulation.get("solver") if isinstance(simulation, dict) else None
     subsystems = solver.get("subsystems") if isinstance(solver, dict) else None
     if isinstance(subsystems, dict):
@@ -692,18 +723,35 @@ def _is_optional(tp) -> tuple[bool, Any]:
     return False, tp
 
 
-def _loop_class(data: Any, path: str) -> type:
-    """The parameter class of a ``control.loops`` entry: that of its registered type."""
+_TYPED = {
+    "loop": (LOOP_TYPES, ""),
+    "element": (ELEMENT_TYPES, ". Register a custom element type with "
+                               "peslite.register_element_type before loading the file"),
+    "event": (EVENT_TYPES, ". Register a custom event type with peslite.register_event_type before loading the file"),
+}
+
+
+def _typed_class(what: str, data: Any, path: str) -> type:
+    registry, hint = _TYPED[what]
     kind = data.get("type") if isinstance(data, dict) else None
-    if kind not in LOOP_TYPES:
-        raise ConfigError(f"{path}.type: unknown loop type {kind!r}; known: {sorted(LOOP_TYPES)}")
-    return LOOP_TYPES[kind].Params
+    if not isinstance(kind, str) or kind not in registry:
+        raise ConfigError(f"{path}.type: unknown {what} type {kind!r}; known: {sorted(registry)}{hint}")
+    return registry[kind].Params
 
 
-def _build_named(item_cls, data: Any, path: str, base: Any, scales: Optional[dict]) -> dict:
+def _target_scales(event: Any, parent: dict, base: Any) -> Optional[dict]:
+    """Use a target unit's pu bases for a custom event's electrical parameters."""
+    target = event.get("target") if isinstance(event, dict) else None
+    units = parent.get("units")
+    if not isinstance(target, str) or not isinstance(units, dict) or not isinstance(units.get(target), dict):
+        return None
+    return UnitParams._bases(units[target], base, f"units.{target}")[1]
+
+
+def _build_named(item_cls, data: Any, path: str, base: Any, scales: Optional[dict], parent: dict) -> dict:
     """Build a name -> entry mapping; names must be non-empty and contain no dots.
 
-    ``item_cls``: the class of the entries, ``"loop"`` for loop entries, or anything else for raw values.
+    ``item_cls`` is a dataclass, a raw type, or a registered typed entry (``loop``/``event``).
     """
     if not isinstance(data, dict):
         raise ConfigError(f"{path}: expected a mapping of names to entries, got {type(data).__name__}")
@@ -713,8 +761,11 @@ def _build_named(item_cls, data: Any, path: str, base: Any, scales: Optional[dic
         if not name or "." in name:
             raise ConfigError(f"{path}: {name!r} is not a usable name (non-empty, no '.')")
         where = f"{path}.{name}"
-        if item_cls == "loop":
-            out[name] = _build(_loop_class(item, where), item, where, base, scales)
+        if item_cls in _TYPED:
+            if is_dataclass(item):
+                item = to_dict(item)
+            here = (_target_scales(item, parent, base) if item_cls == "event" else None) or scales
+            out[name] = _build(_typed_class(item_cls, item, where), item, where, base, here)
         else:
             out[name] = _build(item_cls, item, where, base, scales) if is_dataclass(item_cls) else item
     return out
@@ -742,7 +793,9 @@ def _build(cls, data: Any, path: str, base: Any, scales: Optional[dict]):
     known = {f.name for f in fields(cls) if f.init}
     unknown = set(data) - known
     if unknown:
-        raise ConfigError(f"{path}: unknown key(s) {sorted(unknown)}; known: {sorted(known)}")
+        hint = getattr(cls, "_unknown_hint", "")
+        raise ConfigError(f"{path}: unknown key(s) {sorted(unknown)}; known: {sorted(known)}"
+                          + (f". {hint}" if hint else ""))
     kwargs = {}
     for f in fields(cls):
         if not f.init:
@@ -759,7 +812,8 @@ def _build(cls, data: Any, path: str, base: Any, scales: Optional[dict]):
             elif is_dataclass(inner) and isinstance(inner, type):
                 kwargs[f.name] = _build(inner, value, key, base, scales)
             elif get_origin(inner) in (dict, _Mapping):
-                kwargs[f.name] = _build_named(f.metadata.get("entries", get_args(inner)[1]), value, key, base, scales)
+                kwargs[f.name] = _build_named(f.metadata.get("entries", get_args(inner)[1]), value, key,
+                                              base, scales, data)
             elif inner is float:
                 if isinstance(value, str):  # YAML 1.1 reads "2.0e6" as a string
                     try:
@@ -779,8 +833,10 @@ def _build(cls, data: Any, path: str, base: Any, scales: Optional[dict]):
                 elif isinstance(value, (int, float)) and value in (0, 1):
                     kwargs[f.name] = bool(value)
                 else:
-                    raise ConfigError(f"{key}: expected a boolean, got {value!r}")
+                    raise ConfigError(f"{key}: expected 1 (on) or 0 (off), got {value!r}")
             elif inner is str:
+                if f.name in getattr(cls, "_text", ()) and not isinstance(value, str):
+                    raise ConfigError(f"{key}: expected text, got {value!r}")
                 kwargs[f.name] = str(value)
             elif inner is dict:
                 kwargs[f.name] = dict(value)
@@ -804,6 +860,97 @@ def _build(cls, data: Any, path: str, base: Any, scales: Optional[dict]):
     return obj
 
 
+# ------------------------------------------------------------------ set events
+
+RUNTIME = (
+    "buses.*.c", "buses.*.r_d",
+    "branches.*.l", "branches.*.r",
+    "sources.*.v", "sources.*.f", "sources.*.angle", "sources.*.l", "sources.*.r",
+    "units.*.control.references.*",
+    "units.*.control.loops.*.** (not type, period)",
+    "units.*.protection.**",
+    "units.*.dclink.source.* (not type)",
+    "elements.*.* (not type, bus)",
+)
+
+
+@dataclass(frozen=True)
+class Change:
+    """Parameters after one ``set`` event and the stored SI paths changed by it."""
+
+    t: float
+    event: str
+    params: Any
+    paths: tuple[str, ...]
+
+    def touches(self, prefix: str) -> list[str]:
+        return [path[len(prefix):] for path in self.paths if path.startswith(prefix)]
+
+
+def runtime_changeable(path: str, p: Params) -> bool:
+    """Whether stored parameter ``path`` may be changed by a ``set`` event."""
+    section, _, rest = path.partition(".")
+    name, _, rest = rest.partition(".")
+    keys = rest.split(".")
+    if section == "buses":
+        return keys in (["c"], ["r_d"])
+    if section == "branches":
+        return keys in (["l"], ["r"])
+    if section == "sources":
+        return len(keys) == 1 and keys[0] in ("v", "f", "angle", "l", "r")
+    if section == "units":
+        if keys[:2] == ["control", "references"]:
+            return len(keys) == 3
+        if keys[:2] == ["control", "loops"]:
+            return len(keys) >= 4 and keys[3] not in ("type", "period")
+        if keys[0] == "protection":
+            return True
+        return keys[:2] == ["dclink", "source"] and len(keys) == 3 and keys[2] != "type"
+    if section == "elements":
+        element = p.elements.get(name)
+        return (element is not None and len(keys) == 1 and keys[0] != "type"
+                and keys[0] not in element_buses(element))
+    return False
+
+
+def set_changes(p: Params) -> tuple[Change, ...]:
+    """Apply and validate ``set`` events in time/file order and return their resulting parameters."""
+    events = [(event.t, index, name, event)
+              for index, (name, event) in enumerate(p.events.items()) if event.type == "set"]
+    if not events:
+        return ()
+    current = replace(p, events={})
+    flat = flat_paths(to_dict(current, derived=True))
+    changed_by: dict[tuple[float, str], str] = {}
+    out: list[Change] = []
+    for event_t, _index, name, event in sorted(events, key=lambda item: item[:2]):
+        where = f"events.{name}"
+        if not event.set:
+            raise ConfigError(f"{where}.set: nothing to change")
+        for path in event.set:
+            if path.split(".", 1)[0] not in NAMED:
+                raise ConfigError(f"{where}.set.{path}: cannot change during a run; a set event changes "
+                                  f"{', '.join(RUNTIME)}")
+        try:
+            after = current.replace(**event.set)
+        except ConfigError as exc:
+            raise ConfigError(f"{where}: after this event, {exc}") from None
+        new = flat_paths(to_dict(after, derived=True))
+        paths = tuple(path for path in new if new[path] != flat.get(path))
+        for path in paths:
+            if not runtime_changeable(path, after):
+                raise ConfigError(f"{where}: {path} cannot change during a run; a set event changes "
+                                  f"{', '.join(RUNTIME)}")
+            key = (event_t, path)
+            if key in changed_by:
+                raise ConfigError(f"{where}: {path} is also set at t = {event_t} "
+                                  f"by events.{changed_by[key]}")
+            changed_by[key] = name
+        out.append(Change(event_t, name, after, paths))
+        current, flat = after, new
+    return tuple(out)
+
+
 # ------------------------------------------------------------------ files
 
 def load(path: str | Path, initial: str | Path | None = None,
@@ -811,13 +958,13 @@ def load(path: str | Path, initial: str | Path | None = None,
     """Load a YAML/JSON configuration, optionally replace its initial state, and apply overrides.
 
     ``initial``: states CSV (last row, or the row at ``initial_time`` in s) or YAML/JSON.
-    ``overrides``: dotted paths, e.g. ``load("case.yaml", **{"simulation.t_end": 5.0})``.
+    ``overrides``: dotted paths, e.g. ``load("case.pes", **{"simulation.t_end": 5.0})``.
     """
     p = from_dict(read_tree(path))
     if initial is not None:
         init = read_initial(initial, initial_time)
         merged = to_dict(p)
-        merged["initial"] = init
+        merged["simulation"]["initial"] = init
         if merged["simulation"]["t_end"] <= init.get("t", 0.0):
             # keep the configured duration after the new start time
             merged["simulation"]["t_end"] = init.get("t", 0.0) + p.simulation.t_end
@@ -828,7 +975,7 @@ def load(path: str | Path, initial: str | Path | None = None,
 
 
 def _read(path: Path) -> Any:
-    """The content of a ``.json`` file, or of a YAML file."""
+    """Read YAML or JSON configuration text."""
     if path.suffix.lower() == ".json":
         return json.loads(path.read_text(encoding="utf-8"))
     try:
@@ -844,7 +991,8 @@ def read_initial(path: str | Path, t: Optional[float] = None) -> dict:
     """Read an ``initial`` mapping (``t``, ``states``) from YAML/JSON or a states CSV.
 
     CSV: last row, or the row at ``t`` (s); empty/NaN cells are omitted.
-    YAML/JSON: the mapping itself or an ``initial`` block; ``t`` overrides its time.
+    YAML/JSON: a simulation file's ``simulation.initial`` block or the mapping itself;
+    ``t`` overrides its time.
     """
     path = Path(path)
     if path.suffix.lower() == ".csv":
@@ -870,30 +1018,71 @@ def read_initial(path: str | Path, t: Optional[float] = None) -> dict:
                 states[name] = value
         return {"t": float(row[0]), "states": states}
     data = _read(path)
-    if isinstance(data, dict) and "initial" in data:
-        data = data["initial"]
+    if isinstance(data, dict) and isinstance(data.get("simulation"), dict):
+        if "initial" not in data["simulation"]:
+            raise ConfigError(f"{path}: a simulation file without a simulation.initial section")
+        data = data["simulation"]["initial"]
     if not isinstance(data, dict):
-        raise ConfigError(f"{path}: expected an 'initial' mapping")
+        raise ConfigError(f"{path}: expected an initial mapping (t, states)")
     if t is not None:
         data = {**data, "t": t}
     return data
 
 
 def read_tree(path: str | Path) -> dict:
-    """Return the top-level mapping of a ``.yaml``/``.yml``/``.json`` configuration file."""
+    """Return a top-level mapping from YAML or JSON configuration text."""
     data = _read(Path(path))
     if not isinstance(data, dict):
         raise ConfigError(f"{path}: top level must be a mapping")
     return data
 
 
-def dump(p: Any, path: str | Path) -> None:
-    """Write ``p`` as a configuration file (YAML if PyYAML is installed, else JSON)."""
-    path = Path(path)
-    d = to_dict(p)
+_FILE_ORDER = ("base", "buses", "branches", "sources", "units", "elements", "events", "simulation", "meta")
+
+
+def _written_out(p: Params) -> dict:
+    """Return ``p`` in file order, including defaults derived from other values."""
+    d = to_dict(p, derived=True)
+    for name, u in p.units.items():
+        unit = d["units"][name]
+        if unit["s_base"] is None:
+            unit["s_base"] = u.base.s_base
+        if unit["control"]["sampling_period"] is None:
+            unit["control"]["sampling_period"] = u.pwm.update_period
+        measurement = unit["measurement"]
+        if measurement["window"] is None and "window" in (measurement["average"], measurement["u_dc"]):
+            measurement["window"] = u.pwm.update_period
+    for name, source in d["sources"].items():
+        if source["f"] is None:
+            source["f"] = p.base.f0
+    return _switches({key: d[key] for key in _FILE_ORDER})
+
+
+def _switches(value: Any) -> Any:
+    """Write switches as 1 or 0, including switches nested in mappings and lists."""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, dict):
+        return {key: _switches(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_switches(item) for item in value]
+    return value
+
+
+def dumps(p: Params) -> str:
+    """Return a complete resolved simulation file as YAML (or JSON without PyYAML)."""
+    d = _written_out(p)
     try:
         import yaml  # type: ignore
-
-        path.write_text(yaml.safe_dump(d, sort_keys=False), encoding="utf-8")
     except ImportError:  # pragma: no cover
-        path.write_text(json.dumps(d, indent=2), encoding="utf-8")
+        return json.dumps(d, indent=2) + "\n"
+    from .. import __version__
+    header = (f"# PESLite {__version__} simulation file with every value written out (plant values in SI).\n"
+              f"# null: not used, or derived when the case is built (for example loop gains from bandwidth).\n"
+              f"# Run it with: peslite <this file>\n")
+    return header + yaml.safe_dump(d, sort_keys=False)
+
+
+def dump(p: Params, path: str | Path) -> None:
+    """Write a complete resolved simulation file (see :func:`dumps`)."""
+    Path(path).write_text(dumps(p), encoding="utf-8")

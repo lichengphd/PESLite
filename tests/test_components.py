@@ -21,7 +21,7 @@ PACKAGE = COMPONENTS.parent
 
 
 def test_unit_delegates_sampling_and_modulation_state_to_components():
-    p = peslite.load(EXAMPLES / "gfl-example.yaml")
+    p = peslite.load(EXAMPLES / "gfl-example.pes")
     unit = peslite.Simulation(p).unit()
 
     assert isinstance(unit.adc, ADC)

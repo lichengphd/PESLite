@@ -106,7 +106,7 @@ class OutputStage:
             raise TypeError("limiter must be callable or None")
         self.n_updates = 0
         self.n_saturated = 0
-        self.first_saturation_t = -1.0
+        self.first_saturation_t: float | None = None
         self.saturated = False
         self._memo = None  # cached evaluation for the current control instant
         # start-up modulation from u_init_ab and the rated dc voltage
@@ -168,6 +168,6 @@ class OutputStage:
             self.n_updates += 1
             if saturated:
                 self.n_saturated += 1
-                if self.first_saturation_t < 0.0:
+                if self.first_saturation_t is None:
                     self.first_saturation_t = t
         return 0.5 * (1.0 + self.m_abc)

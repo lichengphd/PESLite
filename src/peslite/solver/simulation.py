@@ -1,10 +1,10 @@
 """The run of a simulation: the system and solver built from its parameters, the initial states, the
 event loop, and the command line (the ``peslite`` command).
 
-Between events the solver integrates the model; the events are each unit's ADC samples, loop updates,
-PWM publications, averaging-window openings and switching instants, and the snapshots. Order at a
-coincident instant: over-current check, ADC samples, loop updates, PWM publication, window opening,
-switching instants, snapshot.
+Between events the solver integrates the model; the events are those of the file, each unit's ADC
+samples, loop updates, PWM publications, averaging-window openings and switching instants, and the
+snapshots. Order at a coincident instant: file events, over-current check, ADC samples, loop updates,
+PWM publication, window opening, switching instants, snapshot.
 """
 
 from __future__ import annotations
@@ -14,8 +14,10 @@ import csv
 import dataclasses
 import json
 import math
+import sysconfig
 import time
 import warnings
+from collections import deque
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
@@ -23,7 +25,8 @@ from typing import Any, Callable, Iterable, Mapping, Optional
 
 import numpy as np
 
-from ..assembly.params import Params, dump, load
+from ..assembly.events import EVENT_TYPES, SWITCHING, connected_at, switching_schedule
+from ..assembly.params import Change, Params, dump, dumps, load
 from ..assembly.system import System
 from ..assembly.unit import Unit
 from ..components.pwm import Delay, Modulator
@@ -62,7 +65,7 @@ class SimulationResult:
 
     @property
     def tripped(self) -> bool:
-        return bool(self.summary.get("tripped", 0.0))
+        return bool(self.summary.get("tripped", 0))
 
     def columns(self) -> dict[str, np.ndarray]:
         """Return flat real columns: plant quantities in SI and controller logs in pu.
@@ -87,7 +90,7 @@ class SimulationResult:
             if f"{name}.angle" in self.plant:
                 cols[f"{name}.angle"] = self.plant[f"{name}.angle"]
         for key, arr in self.plant.items():
-            if key.startswith("ctrl_"):
+            if key.startswith("ctrl."):
                 cols[key[5:]] = arr
         return cols
 
@@ -140,19 +143,20 @@ class SimulationResult:
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
         written = []
-        if self.params.output.states:
+        output = self.params.simulation.output
+        if output.states:
             self.states_to_csv(out / "states.csv")
             written.append(out / "states.csv")
-        if self.params.output.signals:
+        if output.signals:
             self.to_csv(out / "plant.csv")
             written += [out / "plant.csv"] + self.control_to_csv(out / "control.csv")
-        if self.params.output.energy and self.energy:
+        if output.energy and self.energy:
             self.energy_to_csv(out / "energy.csv")
             written.append(out / "energy.csv")
-        summary = {**(info or {}), "wall_time_s": self.wall_time, "n_rhs": self.n_rhs, **self.summary}
+        summary = {**(info or {}), "wall_time": self.wall_time, "n_rhs": self.n_rhs, **self.summary}
         (out / "summary.json").write_text(json.dumps(summary, indent=2, default=float), encoding="utf-8")
-        dump(self.params, out / "params.yaml")
-        written += [out / "summary.json", out / "params.yaml"]
+        dump(self.params, out / "simulation.pes")
+        written += [out / "summary.json", out / "simulation.pes"]
         return written
 
 def _write(path: str | Path, cols: dict) -> None:
@@ -203,7 +207,7 @@ class Recorder:
             self.plant.setdefault(k, []).append(v)
         for unit, log in self.last_ctrl_log.items():
             for k, v in log.items():
-                key = f"ctrl_{unit}.{k}"
+                key = f"ctrl.{unit}.{k}"
                 if key not in self.plant:  # controller signal appearing after the first snapshots
                     self.plant[key] = [math.nan] * n_before
                 self.plant[key].append(v)
@@ -325,6 +329,13 @@ class Simulation:
                 if not isinstance(obj, proto):
                     raise TypeError(f"{unit.name}: {type(obj).__name__} does not satisfy the "
                                     f"{proto.__name__} protocol")
+        check_events = getattr(self.system, "check_events", None)
+        if check_events is not None:
+            check_events(p)
+        for needed, what in (("switch", switching_schedule(p.events)), ("apply", p.changes)):
+            if what and not hasattr(self.system, needed):
+                raise ConfigError(f"the events need a system with {needed}(); "
+                                  f"{type(self.system).__name__} has none")
         if not isinstance(self.solver, Solver):
             raise TypeError(f"{type(self.solver).__name__} does not satisfy the Solver protocol")
         self.result: SimulationResult | None = None
@@ -340,6 +351,21 @@ class Simulation:
         """Return the named unit, or the only unit when ``name`` is omitted."""
         self.p.unit(name)  # checks the name
         return self.system.units[name if name is not None else next(iter(self.p.units))]
+
+    def _actions(self) -> list[tuple[float, int, Any]]:
+        """Return file-event actions as ``(time, file_order, action)``."""
+        order = {name: index for index, name in enumerate(self.p.events)}
+        actions = [(change.t, order[change.event], change) for change in self.p.changes]
+        actions += [(event.t, order[name], event) for name, event in self.p.events.items()
+                    if event.type != "set"]
+        return sorted(actions, key=lambda action: action[:2])
+
+    def _act(self, what: Any, t: float) -> None:
+        """Apply one file event; the caller repacks the solver vector afterwards."""
+        if isinstance(what, Change):
+            self.system.apply(what)
+        else:
+            EVENT_TYPES[what.type].apply(what, self.system, t)
 
     def _ratings(self):
         """Return a function giving the rated (effort, flow) of a storage, or ``None``."""
@@ -425,16 +451,33 @@ class Simulation:
             inner = presets
             presets = lambda key, word: inner(key[6:] if key.startswith("plant.") else key, word)  # noqa: E731
         self._start_duty()  # so that the duty ratios and delay pipelines have their states
-        parts = self._parts()
+        template = gather(self._parts())
         try:
-            values = resolve(gather(parts), expand_aliases(self.p.initial.states, aliases), presets)
+            given = expand_aliases(self.p.simulation.initial.states, aliases)
+            if callable(presets):
+                for bus in getattr(system, "buses", {}):
+                    key = f"plant.{bus}.u_C"
+                    if key not in template or any(name == key or name.startswith(key + ".") for name in given):
+                        continue
+                    try:
+                        given[key] = presets(key, "source")
+                    except ValueError:
+                        pass
+            values = resolve(template, given, presets)
         except (KeyError, ValueError) as exc:
             msg = exc.args[0] if exc.args else str(exc)
             if aliases:
                 msg += f". Aliases: {', '.join(f'{a} -> {c}' for a, c in aliases.items())}"
             raise ConfigError(msg) from None
-        # 1. power stage (unset states stay zero), then the solver vector
+        # 1. power stage (unset states stay zero), events up to t0, then the solver vector
         scatter({"plant": system}, values)
+        if hasattr(system, "switch"):
+            for name, steps in switching_schedule(self.p.events).items():
+                if not connected_at(steps, t0):
+                    system.switch(name, False, t0)
+        for event_t, _, what in self._actions():
+            if event_t <= t0 + _EPS and getattr(what, "type", None) not in SWITCHING:
+                self._act(what, event_t)
         y = system.model.get_initial_values()
         # 2. start-up modulation matching each unit's terminal voltage at t0, or the given duty ratios
         system.model.sync(t0, y)
@@ -461,23 +504,26 @@ class Simulation:
             raise RuntimeError("a Simulation runs once; build a new one for another run")
         p, system = self.p, self.system
         mdl, solver = system.model, self.solver
+        settle = getattr(solver, "settle", None)
+        parameters_changed = getattr(solver, "parameters_changed", None)
         t_end = p.simulation.t_end if t_end is None else t_end
-        log_period = p.simulation.log.plant_period
-        control_every = max(1, p.simulation.log.control_every)
+        output = p.simulation.output
+        log_period = output.period
+        control_every = max(1, output.control_every)
         stop_on_trip = p.simulation.stop_on_trip
         progress_every = p.simulation.progress_every
-        rec = Recorder(keep_states=p.output.states)
+        rec = Recorder(keep_states=output.states)
         wall0 = time.time()
 
         units = list(system.units.values())
         periods = [u.pwm.period for u in units]
-        t_start = min(round(p.initial.t / T) * T for T in periods)
+        t_start = min(round(p.simulation.initial.t / T) * T for T in periods)
         if t_end <= t_start + _EPS:
             raise ValueError(f"t_end = {t_end} must be after the start time {t_start}")
         # the run ends at the earliest period boundary at or after t_end
         t_final = min(math.ceil((t_end - _EPS) / T) * T for T in periods)
         # trips already handled, by unit (a trip loaded with the initial states is handled at the first sample)
-        tripped = {u.name: bool(getattr(u.ctrl, "tripped", False)) or u.breaker_open for u in units}
+        tripped = {u.name: bool(getattr(u.ctrl, "tripped", False)) or u.tripped for u in units}
         for unit in units:
             pwm = unit.pwm
             pwm.k = int(round(t_start / pwm.period))
@@ -487,9 +533,12 @@ class Simulation:
                 unit.ctrl.reset_clocks(t_start)
         averaging = [u for u in units if u.adc.averaging]  # units whose ADC averages
         y = self._apply_initial(t_start)
+        if parameters_changed is not None:
+            parameters_changed()
         for unit in units:
             unit.adc.latest = unit.adc.measure(t_start)
         n_log = max(0, math.ceil(t_start / log_period - 1e-9))
+        actions = deque(action for action in self._actions() if action[0] > t_start + _EPS)
         next_report = t_start + progress_every if progress_every > 0 else math.inf
         t_local = t_start
         n_rhs0 = getattr(solver, "n_rhs", 0)
@@ -518,14 +567,15 @@ class Simulation:
                 pass  # diverged state: not recorded
 
         @np.errstate(over="raise")  # overflow counts as divergence
-        def integrate(t_a: float, t_b: float, y: np.ndarray) -> np.ndarray:
-            return solver(mdl.rhs, t_a, t_b, y).y
+        def integrate(t_a: float, t_b: float, y: np.ndarray, event: bool) -> np.ndarray:
+            y = solver(mdl.rhs, t_a, t_b, y).y
+            return settle(t_b, y) if event and settle is not None else y
 
-        def advance(t_a: float, t_b: float) -> bool:
-            """Integrate over ``[t_a, t_b]``; return True when the run must stop (divergence, strict coarse window)."""
+        def advance(t_a: float, t_b: float, event: bool = False) -> bool:
+            """Integrate over ``[t_a, t_b]``; ``event`` means the model changes at ``t_b``."""
             nonlocal y, t_local, stop_reason, coarse_reported
             try:
-                y = integrate(t_a, t_b, y)
+                y = integrate(t_a, t_b, y, event)
             except (OverflowError, FloatingPointError):
                 stop_reason = f"diverged: the states overflowed between t = {t_a:.6g} s and {t_b:.6g} s"
                 t_local = t_a
@@ -552,10 +602,17 @@ class Simulation:
                     warnings.warn("energy check: " + msg, stacklevel=3)
             return False
 
+        def settle_now() -> None:
+            """Finish deferred integration with the current model before it changes now."""
+            nonlocal y
+            if settle is not None:
+                y = settle(t_local, y)
+            mdl.set_states(y)
+
         def do_trip(unit: Unit) -> None:
             nonlocal y
             tripped[unit.name] = True
-            mdl.set_states(y)
+            settle_now()
             unit.trip()
             y = mdl.get_initial_values()
 
@@ -588,10 +645,25 @@ class Simulation:
                 t_c = pwm.t_next
                 t_stop = min(t_stop, t_c if t_c < t_final - _EPS else t_final, pwm.next_switch,
                              adc.t_window(t_c), adc.t_sample(pwm.start), getattr(unit.ctrl, "next_event", math.inf))
-            if t_stop > t_local + _EPS and advance(t_local, t_stop):
+            if actions:
+                t_stop = min(t_stop, actions[0][0])
+            event_due = bool(actions and actions[0][0] <= t_stop + _EPS)
+            advancing = t_stop > t_local + _EPS
+            if advancing and advance(t_local, t_stop, event_due):
                 stopped = True
                 snapshot(t_local)
                 break
+            # File events run before the coincident protection/control/PWM events.
+            if event_due:
+                if advancing:  # advance() already settled at t_stop
+                    mdl.set_states(y)
+                else:
+                    settle_now()
+                while actions and actions[0][0] <= t_stop + _EPS:
+                    self._act(actions.popleft()[2], t_stop)
+                if parameters_changed is not None:
+                    parameters_changed()
+                y = mdl.get_initial_values()
             # 0. over-current check of units whose switching interval ends here
             for unit in units:
                 pwm = unit.pwm
@@ -660,9 +732,9 @@ class Simulation:
         for name, unit in system.units.items():
             if hasattr(unit.ctrl, "summary"):
                 summary.update({f"{name}.{k}": v for k, v in unit.ctrl.summary().items()})
-        summary["tripped"] = float(any(tripped.values()))
-        summary["t_start_s"] = t_start
-        summary["t_stop_s"] = float(t_arr[-1]) if len(t_arr) else t_start
+        summary["tripped"] = int(any(tripped.values()))
+        summary["t_start"] = t_start
+        summary["t_stop"] = float(t_arr[-1]) if len(t_arr) else t_start
         if stop_reason:
             summary["stop_reason"] = stop_reason
         coarse = getattr(solver, "coarse_hold", None)
@@ -670,12 +742,12 @@ class Simulation:
             summary["interface_coarse_hold"] = f"{coarse[1]} at t = {coarse[0]:.6g} s: {coarse[2]:.3g} of rating"
         if self.ph_report is not None:
             summary["ph_verdict"] = self.ph_report.verdict
-            summary["ph_defaulted"] = "|".join(self.ph_report.defaulted) if self.ph_report.defaulted else "none"
+            summary["ph_defaulted"] = list(self.ph_report.defaulted)
             summary["ph_report"] = self.ph_report.to_dict()
         if energy_on:
             summary["energy_tellegen_max_rel"] = worst["tellegen"]
             summary["energy_balance_max_rel"] = worst["balance"]
-            summary["energy_check"] = "|".join(self.energy_problems) if self.energy_problems else "ok"
+            summary["energy_problems"] = list(self.energy_problems)
         interface = getattr(solver, "interface", None)
         if interface:  # split-interface indicators
             summary.update({f"interface_{k}": v for k, v in interface.items()})
@@ -734,10 +806,10 @@ class SystemLoop:
         self._p = dataclasses.replace(
             p,
             simulation=dataclasses.replace(sp, energy_check="off", stop_on_trip=False, progress_every=0.0,
-                                           log=dataclasses.replace(sp.log, plant_period=self.period or 1.0),
+                                           output=dataclasses.replace(sp.output, period=self.period or 1.0,
+                                                                      states=True, energy=False, signals=False),
                                            solver=dataclasses.replace(sp.solver, subsystems={},
-                                                                      linearisations=0)),
-            output=dataclasses.replace(p.output, states=True, energy=False, signals=False))
+                                                                      linearisations=0)))
 
     # ------------------------------------------------------------ coordinates
     def coordinates(self, names: list[str]) -> list[tuple[str, list[str], float]]:
@@ -811,9 +883,11 @@ class SystemLoop:
         view: optional ``(plant state label, offset, channel)``; the offset is seen by the
         integration (``"b"``) or by the end-of-period sample (``"c"``).
         """
+        initial = dataclasses.replace(
+            self._p.simulation.initial, t=t,
+            states={k: v for k, v in row.items() if not k.startswith("solver.")})
         p = dataclasses.replace(self._p, simulation=dataclasses.replace(
-            self._p.simulation, t_end=t + self.period), initial=dataclasses.replace(
-            self._p.initial, t=t, states={k: v for k, v in row.items() if not k.startswith("solver.")}))
+            self._p.simulation, t_end=t + self.period, initial=initial))
         sim = self._cls(p, parts=self._factories)
         model = sim.system.model
         if view is not None:
@@ -845,18 +919,19 @@ def _example_configs_dir() -> Path:
         dist = distribution("peslite")
     except PackageNotFoundError:
         return source
-    for entry in dist.files or ():
-        parts = entry.parts
-        if len(parts) >= 3 and tuple(parts[-3:-1]) == ("peslite", "examples"):
-            candidate = Path(dist.locate_file(entry)).resolve().parent
-            if candidate.is_dir():
-                return candidate
+    # data-files live below the installation prefix, outside the import package.  A ``--target``
+    # installation puts them below the metadata root; a normal environment uses sysconfig's data root.
+    roots = (Path(dist.locate_file("")).resolve(), Path(sysconfig.get_path("data")).resolve())
+    for root in roots:
+        candidate = root / "share" / "peslite" / "examples"
+        if candidate.is_dir():
+            return candidate
     return source
 
 
 _EXAMPLE_CONFIGS = _example_configs_dir()
 _RESULTS = Path.cwd() / "output"
-_CONFIG_SUFFIXES = (".yaml", ".yml", ".json")
+_CONFIG_SUFFIXES = (".pes", ".yaml", ".yml", ".json")
 
 
 def _config_path(value: str | None) -> Path:
@@ -901,25 +976,26 @@ def parse_override(text: str):
 
 
 def main(argv=None) -> int:
-    """Run a converter configuration and save its states, summary and configured signals.
-
-    With no config argument, run the first bundled YAML/JSON example (sorted by filename).
-    """
+    """Run a simulation file and save its states, summary and configured signals."""
     ap = argparse.ArgumentParser(description=main.__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("config", nargs="?", help="configuration name or path; default: first bundled example by filename")
+    ap.add_argument("config", nargs="?",
+                    help="simulation file path or bundled example name; default: first example by filename")
     ap.add_argument("--set", action="append", default=[], type=parse_override, metavar="PATH=VALUE",
                     help="override a dotted parameter path (repeatable)")
     ap.add_argument("--initial", default=None, metavar="FILE",
-                    help="initial values: a states.csv (last row) or a YAML/JSON file with an 'initial' block")
+                    help="initial values: a states.csv row or a simulation file's simulation.initial block")
     ap.add_argument("--initial-time", type=float, default=None, metavar="T",
                     help="with a states.csv: start from the row at time T instead of the last row")
-    ap.add_argument("--out", default=None, help="output directory (default: output/<config name> in the current working directory)")
+    ap.add_argument("--out", default=None,
+                    help="output directory (default: output/<file name> in the current working directory)")
     ap.add_argument("--progress", type=float, default=None, metavar="SECONDS",
                     help="print a progress line every SECONDS of simulated time (overrides the config)")
     ap.add_argument("--list-states", action="store_true",
                     help="print the state names generated for this configuration and exit")
     ap.add_argument("--ph-report", action="store_true",
                     help="print the port-Hamiltonian structure report of the system (always built) and exit")
+    ap.add_argument("--resolved", action="store_true",
+                    help="print the complete resolved simulation file and exit")
     args = ap.parse_args(argv)
 
     try:
@@ -932,6 +1008,9 @@ def main(argv=None) -> int:
         overrides["simulation.progress_every"] = args.progress
     p = load(config, initial=args.initial,
                     initial_time=args.initial_time, **overrides)
+    if args.resolved:
+        print(dumps(p), end="")
+        return 0
     sim = Simulation(p)
     if args.list_states:
         print("\n".join(sim.state_names()))
@@ -943,17 +1022,19 @@ def main(argv=None) -> int:
                       for n, u in p.units.items())
     print(f"peslite: {config}  units={units}  bridge={p.simulation.bridge}  "
           f"solver={p.simulation.solver.type}/{p.simulation.solver.method}  "
-          f"t = {p.initial.t} .. {p.simulation.t_end} s  ({len(p.initial.states)} initial values given)")
+          f"t = {p.simulation.initial.t} .. {p.simulation.t_end} s  "
+          f"({len(p.simulation.initial.states)} initial values given)")
     if sim.ph_report is not None:
         print(f"structure: {sim.ph_report.verdict} (state coverage {sim.ph_report.coverage:.0%}"
               f"{'; ' + '; '.join(sim.energy_problems) if sim.energy_problems else ''})")
     r = sim.run()
     s = r.summary
-    print(f"done: wall {r.wall_time:.1f} s, rhs evaluations {r.n_rhs}, stop at {s.get('t_stop_s', 0):.4f} s, "
+    print(f"done: wall {r.wall_time:.1f} s, rhs evaluations {r.n_rhs}, stop at {s.get('t_stop', 0):.4f} s, "
           f"tripped={bool(s.get('tripped'))}")
     for name in p.units:
         print(f"  {name}: max |i| = {s.get(f'{name}.max_current_pu', 0):.4f} pu, "
-              f"trip: {s.get(f'{name}.trip_cause')}, alarms: {s.get(f'{name}.alarms')}")
+              f"trip: {s.get(f'{name}.trip_cause') or 'none'}, "
+              f"alarms: {', '.join(s.get(f'{name}.alarms') or []) or 'none'}")
     if "stop_reason" in s:
         print(f"stopped: {s['stop_reason']}")
     if "interface_kappa" in s:

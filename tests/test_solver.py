@@ -11,21 +11,21 @@ from peslite.solver import AdaptiveSolver, DormandPrince45, FixedStepSolver, Mul
 from peslite.solver.multirate import parse_step
 
 QUIET = {"simulation.progress_every": 0.0, "simulation.solver.linearisations": 0}
-FAST = {"units.vsc.events.startup.start": 0.0, "units.vsc.events.startup.duration": 0.01}
+FAST = {"events.connect_vsc.t": 0.0, "events.connect_vsc.ramp": 0.01}
 SOLVER = Path(peslite.solver.__file__).parent
 
 
-@pytest.mark.parametrize("path", sorted(EXAMPLES.glob("*-example.yaml")), ids=lambda p: p.stem)
+@pytest.mark.parametrize("path", sorted(EXAMPLES.glob("*-example.pes")), ids=lambda p: p.stem)
 def test_every_bundled_example_runs_with_the_solver(path):
     sim = peslite.Simulation(peslite.load(path, **QUIET, **{"simulation.t_end": 0.002}))
     result = sim.run()
     assert sim.ph_report.verdict == "port-hamiltonian"
-    assert result.summary["t_stop_s"] == pytest.approx(0.002)
+    assert result.summary["t_stop"] == pytest.approx(0.002)
     assert not result.tripped
 
 
 def test_make_solver_builds_the_configured_integrator():
-    params = peslite.load(EXAMPLES / "gfl-example.yaml")
+    params = peslite.load(EXAMPLES / "gfl-example.pes")
     model = peslite.System(params).model
     settings = params.simulation.solver
     cases = {
@@ -41,7 +41,7 @@ def test_make_solver_builds_the_configured_integrator():
 
 def test_a_run_continues_exactly_from_a_saved_state(tmp_path):
     def run(t_end, **changes):
-        params = peslite.load(EXAMPLES / "gfl-example.yaml", **QUIET, **FAST,
+        params = peslite.load(EXAMPLES / "gfl-example.pes", **QUIET, **FAST,
                               **{"simulation.t_end": t_end}, **changes)
         return peslite.Simulation(params).run()
 

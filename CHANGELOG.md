@@ -1,12 +1,50 @@
 # Changelog
 
+## 0.1.2
+
+### Issue #2 simulation-file and event model
+
+- Simulation files now keep `initial` and `output` under `simulation`; output-period settings are
+  part of `simulation.output`. Parameter names follow the SI/no-suffix and per-unit/`_pu`
+  convention, switches resolve to 0 or 1, and derived defaults continue to follow `--set` and
+  `Params.replace` changes. `peslite.dumps()` returns and `peslite.dump()` writes complete resolved
+  files.
+- One top-level `events` mapping provides `connect`, `disconnect` and `set`. Target names are
+  unique across buses, branches, sources, units and elements. Runtime paths are validated after
+  every `set`, and custom event types can be registered with `register_event_type`.
+- Components support connection changes and parameter retuning. Controllers retain their named
+  state when their parameters change. The built-in `load` element is an event-capable series R-L
+  load, and custom element types can be registered with `register_element_type`.
+- Every event time is an exact integration boundary. User solvers may implement `settle()` and
+  `parameters_changed()`; multirate runs preserve their window grid after an early event boundary.
+  Disconnected converters pause control, and tripped converters remain disconnected.
+
+### Output, examples and packaging
+
+- State, control-signal and summary names use the same SI/per-unit convention as inputs.
+  Controller columns use `ctrl.<unit>.<signal>`. Missing events are `None`/JSON `null`, switches
+  are 0 or 1, and alarms, port-Hamiltonian defaults and energy problems are lists.
+- Results save the fully resolved configuration as `simulation.pes`; `--resolved` prints the same
+  representation, and both resolved and result-saved files can be run again.
+- The single root `examples/` directory contains only YAML-format `*-example.pes` files. They are
+  included in the wheel and remain discoverable by the installed CLI. Custom Python examples are
+  executable tests instead of files under `examples/`.
+- Project version is 0.1.2. The existing PEP 639 `AGPL-3.0-only` metadata is retained.
+
+### Verification
+
+- Added migration and acceptance coverage for parameter resolution, output semantics, events,
+  protection, R-L loads, registered custom types, fixed/adaptive/multirate/user solvers, exact
+  event boundaries, continuation, resolved-file reruns and installed-wheel example discovery.
+
 ## 0.1.1
 
 ### Package layout
 
 - The repository is laid out as a PyPI package: `pyproject.toml`, the package in `src/peslite/`,
   the tests in `tests/` (`python -m pytest`; `pip install -e ".[test]"` installs pytest), and
-  bundled simulation files in the root `examples/` directory. That directory contains YAML only. The command is
+  bundled simulation files in the root `examples/` directory. That directory contains only
+  YAML-format `*-example.pes` files. The command is
   `peslite` after installation; names such as `peslite gfl-example` resolve from the installed
   wheel, while other files are given by path. `peslite.py` and the former Python example scripts
   are removed. The release workflow runs the tests before building and checks the packaged examples.
@@ -76,3 +114,46 @@
 - The results of a simulation file are unchanged: bit for bit on the bundled files and on the
   other settings (bridge models, averaging windows, oversampling, delays, synchronous PWM,
   multirate splits, adaptive solvers, trips, restarts).
+
+### Simulation file parameters (#2)
+
+- `initial` and `output` are inside `simulation`; the former `simulation.log` fields are now
+  `simulation.output.period` and `simulation.output.control_every`.
+- Parameter names follow the SI/pu convention (no suffix for SI and `_pu` for per unit).
+  `measurement.window_s`, current-loop `bw_hz`, VSG `h_s` and dVOC `kappa_rad` are now
+  `window`, `bandwidth`, `h` and `kappa`.
+- Protection criteria, the power measurement filter and the virtual-admittance current limit use
+  nested `enable` switches. Switches are accepted and written as 1 (on) or 0 (off).
+- Defaults derived from the system base, PWM frequency or nominal frequency continue to follow
+  those values through `--set` and `Params.replace`; explicitly supplied values remain fixed.
+- `meta` contains optional text-only `title` and `description` fields.
+- `peslite.dumps` returns and `peslite.dump` writes a complete resolved simulation file.
+  Run results contain this file as `simulation.pes`, and `peslite FILE --resolved` prints it.
+
+### Unified event model (#2)
+
+- Source and unit-specific event blocks are replaced by one top-level `events` mapping. Built-in
+  event types are `connect`, `disconnect` and `set`; an event which acts on one object names it
+  with `target`.
+- Event types can be registered with `peslite.register_event_type`. A custom event owns its frozen
+  parameter dataclass and an `apply(event, system, t)` method, and is parsed and validated like a
+  built-in event.
+- Names are unique across buses, branches, sources and units. Event targets, times and each
+  target's connect/disconnect sequence are checked while the simulation file is loaded.
+- `Scenario`, `UnitScenario` and `SourceScenario` describe connection ramps and source parameters
+  over time. Each unit carries its targeted events in time order.
+- A `set` event may change only declared runtime paths. Events are applied in time and file order
+  to the values left by preceding events; the complete parameter tree is rebuilt and validated
+  after every event. `Params.changes` exposes the resulting parameters and canonical SI paths.
+
+### Event-capable components (#2)
+
+- Network branches, sources, buses, converter units and DC sources expose connection or retuning
+  operations. `System.switch()` and `System.apply()` route checked events to the affected parts and
+  refresh their energy declarations after parameter changes.
+- Control-reference changes take effect at the next controller update. A changed loop is rebuilt
+  from its new parameters while retaining its named state and runtime counters; protection settings
+  can be retuned without replacing the controller.
+- The new top-level `elements` mapping contains typed circuit elements. `load` is the built-in
+  series R-L load to ground; custom types register with `peslite.register_element_type` and declare
+  their own parameter dataclass, buses, subsystems and optional event operations.

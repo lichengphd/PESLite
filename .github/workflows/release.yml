@@ -136,10 +136,10 @@ jobs:
           from peslite.solver.simulation import _config_path
 
           path = _config_path("gfl-example")
-          print("gfl-example.yaml:", path)
+          print("gfl-example.pes:", path)
 
           if not path.is_file():
-              raise SystemExit("gfl-example.yaml is missing from the installed wheel")
+              raise SystemExit("gfl-example.pes is missing from the installed wheel")
 
           print("Packaged config OK")
           PY
