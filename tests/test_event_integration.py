@@ -79,6 +79,23 @@ class _HookedHeun:
         self.hooks.append(("parameters", None))
 
 
+class _PlainHeun:
+    """User solver without optional hooks; its last stage is at each interval end."""
+
+    def __init__(self, dt):
+        self.dt, self.n_rhs = dt, 0
+
+    def __call__(self, f, t0, t1, y):
+        steps = max(1, math.ceil((t1 - t0) / self.dt - 1e-9))
+        step = (t1 - t0) / steps
+        for index in range(steps):
+            t = t0 + index * step
+            first = f(t, y)
+            y = y + 0.5 * step * (first + f(t + step, y + step * first))
+        self.n_rhs += 2 * steps
+        return SolverStep(t1, y, self.n_rhs)
+
+
 def test_event_is_an_exact_stop_and_solver_hooks_bracket_the_model_change():
     event_t = 0.000137
     p = _gfl(**{"simulation.t_end": 0.0003},
@@ -200,6 +217,78 @@ def test_multirate_refreshes_storage_parameters_after_a_set_event():
     sim.run()
     held = {storage.label: storage for storage in sim.solver.held_storages}
     assert held["grid.branch.i"].value == pytest.approx(2 * old_inductance)
+
+
+@pytest.mark.parametrize("kind", ["rk4", "DP45", "multirate", "user"])
+def test_fixed_adaptive_multirate_and_user_solver_use_the_right_model_at_event(kind):
+    event_t = 0.00137
+    solver_settings = {
+        "rk4": {},
+        "DP45": {"simulation.solver.type": "adaptive", "simulation.solver.method": "DP45"},
+        "multirate": {"simulation.solver.subsystems": {"grid.branch": 4}},
+        "user": {},
+    }[kind]
+    params = _gfl(
+        **{"simulation.t_end": 0.002, **solver_settings},
+        **_set("jump", event_t, **{"sources.grid.angle": 0.1, "sources.grid.r_pu": 0.08}),
+    )
+    simulation = peslite.Simulation(
+        params,
+        solver=_PlainHeun(params.simulation.solver.dt) if kind == "user" else None,
+    )
+    model, source = simulation.system.model, simulation.system.sources["grid"]
+    old_resistance = source.branch.R
+    apply, seen = simulation.system.apply, []
+    changed = False
+
+    def recorded_apply(change):
+        nonlocal changed
+        apply(change)
+        changed = True
+
+    def watch(rhs):
+        def watched(t, *args, **kwargs):
+            value = rhs(t, *args, **kwargs)
+            if changed:
+                assert t >= event_t - 1e-14
+            else:
+                assert source.branch.R == old_resistance
+                assert source.emf.out.phi == 0.0
+            seen.append((t, changed))
+            return value
+        return watched
+
+    simulation.system.apply = recorded_apply
+    model.rhs_list = watch(model.rhs_list)
+    model.rhs_group = watch(model.rhs_group)
+    simulation.run()
+
+    assert any(abs(t - event_t) < 1e-14 and not after for t, after in seen)
+    assert source.emf.out.phi == 0.1
+    assert source.branch.R == pytest.approx(2 * old_resistance)
+    if kind == "multirate":
+        ends = np.array([entry[0] for entry in simulation.solver.window_log])
+        assert np.any(abs(ends - event_t) < 1e-14)
+        regular = ends[abs(ends - event_t) >= 1e-14] / simulation.solver.window
+        assert np.max(abs(regular - np.round(regular))) < 1e-10
+
+
+def test_run_continued_across_an_event_matches_the_whole_run(tmp_path):
+    event_t = 0.00137
+    changes = {
+        "simulation.t_end": 0.003,
+        "simulation.solver.subsystems": {"grid.branch": 4},
+        **_set("jump", event_t, **{"sources.grid.angle": 0.1, "sources.grid.r_pu": 0.08}),
+    }
+    whole = peslite.Simulation(_gfl(**changes)).run()
+    peslite.Simulation(_gfl(**changes)).run(event_t).save(tmp_path)
+    continued_params = peslite.load(
+        EXAMPLES / "gfl-example.pes",
+        initial=tmp_path / "states.csv",
+        **{"simulation.energy_check": "off", "simulation.solver.linearisations": 0, **changes},
+    )
+    continued = peslite.Simulation(continued_params).run()
+    assert continued.final_states() == whole.final_states()
 
 
 def test_disconnected_converter_pauses_control_and_a_trip_cannot_reconnect():

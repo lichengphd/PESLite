@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Optional
 
 from ..solver.model import gather, scatter
 from .blocks import HoldTimer, MovingWindow
@@ -25,17 +25,19 @@ class TripEvent:
 
 @dataclass
 class ProtectionStats:
-    i_alarm_first_t: float = -1.0
-    i_alarm_steps: int = 0
-    vac_uv_first_t: float = -1.0
-    vac_ov_first_t: float = -1.0
-    freq_band_first_t: float = -1.0
-    vdc_band_first_t: float = -1.0
-    rocof_first_t: float = -1.0
-    rocof_max_hz_s: float = 0.0
+    """Protection observations; absent crossings and samples are ``None``."""
+
+    overcurrent_first_t: Optional[float] = None
+    overcurrent_steps: int = 0
+    undervoltage_first_t: Optional[float] = None
+    overvoltage_first_t: Optional[float] = None
+    frequency_first_t: Optional[float] = None
+    dc_voltage_first_t: Optional[float] = None
+    rocof_first_t: Optional[float] = None
+    rocof_max: float = 0.0
     max_current_pu: float = 0.0
-    vac_min_pu: float = -1.0
-    vac_max_pu: float = -1.0
+    vac_min_pu: Optional[float] = None
+    vac_max_pu: Optional[float] = None
     alarms: list[str] = field(default_factory=list)
 
 
@@ -89,66 +91,61 @@ class Protection:
     # ---------------------------------------------------------------- fast
     def check_current(self, t: float, peak_pu: float) -> bool:
         """Check the phase-current peak ``peak_pu`` (pu); return ``True`` if this call trips."""
-        self.stats.max_current_pu = max(self.stats.max_current_pu, peak_pu)
-        overcurrent = self.cfg.overcurrent
+        stats, overcurrent = self.stats, self.cfg.overcurrent
+        stats.max_current_pu = max(stats.max_current_pu, peak_pu)
         if overcurrent.enable and peak_pu > overcurrent.limit_pu:
-            if self.stats.i_alarm_steps == 0:
-                self.stats.i_alarm_first_t = t
+            if stats.overcurrent_steps == 0:
+                stats.overcurrent_first_t = t
                 self._raise("OVERCURRENT")
-            self.stats.i_alarm_steps += 1
+            stats.overcurrent_steps += 1
             if not self.tripped and self.armed(t):
                 self._do_trip(t, "overcurrent", f"|i|={peak_pu:.4f} pu > {overcurrent.limit_pu} pu")
                 return True
         return False
 
     # ---------------------------------------------------------- sampled
-    def _timed(self, t: float, met: bool, first: str, alarm: str, timer: str, cause: str, detail) -> bool:
-        """A timed criterion: alarm when first met, trip once met for ``hold``; return True on a trip."""
-        if met and getattr(self.stats, first) < 0.0:
-            setattr(self.stats, first, t)
+    def _timed(self, t: float, met: bool, criterion: str, alarm: str, timer: str) -> bool:
+        """Record a timed criterion and return whether it is currently held long enough."""
+        if met and getattr(self.stats, f"{criterion}_first_t") is None:
+            setattr(self.stats, f"{criterion}_first_t", t)
             self._raise(alarm)
-        if self._timers[timer].update(met) >= self.cfg.hold:
-            self._do_trip(t, cause, f"{detail()} held {self.cfg.hold} s")
-            return True
-        return False
+        held = self._timers[timer].update(met)
+        return met and held >= self.cfg.hold
 
-    def check_sampled(self, t: float, vac_pu: float, freq_dev_hz: float, vdc_err_pu: float) -> None:
+    def check_sampled(self, t: float, vac_pu: float, freq_dev: float, vdc_err_pu: float) -> None:
         """Check the timed criteria and the ROCOF alarm; call once per control period.
 
-        ``vac_pu`` ac voltage magnitude (pu), ``freq_dev_hz`` frequency deviation (Hz),
+        ``vac_pu`` ac voltage magnitude (pu), ``freq_dev`` frequency deviation (Hz),
         ``vdc_err_pu`` dc-voltage error (pu).
         """
         cfg, stats, armed = self.cfg, self.stats, self.armed(t)
         if not self.tripped:
-            old = self._rocof.push(freq_dev_hz)
+            old = self._rocof.push(freq_dev)
             if old is not None:
-                rocof = (freq_dev_hz - old) / self._rocof_window
-                stats.rocof_max_hz_s = max(stats.rocof_max_hz_s, abs(rocof))
+                rocof = (freq_dev - old) / self._rocof_window
+                stats.rocof_max = max(stats.rocof_max, abs(rocof))
                 if cfg.rocof.enable and abs(rocof) >= cfg.rocof.limit and armed:
-                    if stats.rocof_first_t < 0.0:
+                    if stats.rocof_first_t is None:
                         stats.rocof_first_t = t
                     self._raise("ROCOF")
         if self.tripped or not armed:
             return
         if cfg.dc_voltage.enable and self._timed(
-                t, abs(vdc_err_pu) >= cfg.dc_voltage.limit_pu,
-                "vdc_band_first_t", "VDC_BAND", "hold_vdc", "vdc",
-                lambda: f"|vdc error|={abs(vdc_err_pu):.4f} pu"):
+                t, abs(vdc_err_pu) >= cfg.dc_voltage.limit_pu, "dc_voltage", "VDC_BAND", "hold_vdc"):
+            self._do_trip(t, "vdc", f"|vdc error|={abs(vdc_err_pu):.4f} pu held {cfg.hold} s")
             return
         if cfg.frequency.enable and self._timed(
-                t, abs(freq_dev_hz) >= cfg.frequency.limit,
-                "freq_band_first_t", "FREQ_BAND", "hold_freq", "freq",
-                lambda: f"|f_pll - f0|={abs(freq_dev_hz):.4f} Hz"):
+                t, abs(freq_dev) >= cfg.frequency.limit, "frequency", "FREQ_BAND", "hold_freq"):
+            self._do_trip(t, "freq", f"|f_pll - f0|={abs(freq_dev):.4f} Hz held {cfg.hold} s")
             return
-        if stats.vac_min_pu < 0.0 or vac_pu < stats.vac_min_pu:
-            stats.vac_min_pu = vac_pu
-        stats.vac_max_pu = max(stats.vac_max_pu, vac_pu)
+        stats.vac_min_pu = vac_pu if stats.vac_min_pu is None else min(stats.vac_min_pu, vac_pu)
+        stats.vac_max_pu = vac_pu if stats.vac_max_pu is None else max(stats.vac_max_pu, vac_pu)
         if cfg.undervoltage.enable and self._timed(
-                t, vac_pu <= cfg.undervoltage.limit_pu,
-                "vac_uv_first_t", "VAC_UNDER", "hold_uv", "vac_uv",
-                lambda: f"|v|={vac_pu:.4f} pu <= {cfg.undervoltage.limit_pu} pu"):
+                t, vac_pu <= cfg.undervoltage.limit_pu, "undervoltage", "VAC_UNDER", "hold_uv"):
+            self._do_trip(t, "vac_uv", f"|v|={vac_pu:.4f} pu <= {cfg.undervoltage.limit_pu} pu "
+                          f"held {cfg.hold} s")
             return
-        if cfg.overvoltage.enable:
-            self._timed(t, vac_pu >= cfg.overvoltage.limit_pu,
-                        "vac_ov_first_t", "VAC_OVER", "hold_ov", "vac_ov",
-                        lambda: f"|v|={vac_pu:.4f} pu >= {cfg.overvoltage.limit_pu} pu")
+        if cfg.overvoltage.enable and self._timed(
+                t, vac_pu >= cfg.overvoltage.limit_pu, "overvoltage", "VAC_OVER", "hold_ov"):
+            self._do_trip(t, "vac_ov", f"|v|={vac_pu:.4f} pu >= {cfg.overvoltage.limit_pu} pu "
+                          f"held {cfg.hold} s")

@@ -22,7 +22,7 @@ def test_initial_and_output_belong_to_simulation():
     assert not hasattr(p, "initial") and not hasattr(p, "output")
 
     tree = _tree()
-    tree["initial"] = tree["simulation"].pop("initial")
+    tree["initial"] = {"t": 0.0, "states": {}}
     with pytest.raises(ConfigError, match=r"unknown key.*initial"):
         from_dict(tree)
 
@@ -119,7 +119,7 @@ def test_dump_and_initial_file_use_the_nested_simulation_section(tmp_path):
            "simulation.initial.states.plant.pcc.u_C": [500.0, 0.0]})
     path = tmp_path / "restart.pes"
     peslite.dump(p, path)
-    assert path.read_text(encoding="utf-8").startswith("# PESLite 0.1.1")
+    assert path.read_text(encoding="utf-8").startswith("# PESLite 0.1.2")
 
     restarted = peslite.load(EXAMPLES / "gfl-example.pes", initial=path)
     assert restarted.simulation.initial.t == 0.001

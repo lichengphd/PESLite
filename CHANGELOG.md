@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.1.2
+
+### Issue #2 simulation-file and event model
+
+- Simulation files now keep `initial` and `output` under `simulation`; output-period settings are
+  part of `simulation.output`. Parameter names follow the SI/no-suffix and per-unit/`_pu`
+  convention, switches resolve to 0 or 1, and derived defaults continue to follow `--set` and
+  `Params.replace` changes. `peslite.dumps()` returns and `peslite.dump()` writes complete resolved
+  files.
+- One top-level `events` mapping provides `connect`, `disconnect` and `set`. Target names are
+  unique across buses, branches, sources, units and elements. Runtime paths are validated after
+  every `set`, and custom event types can be registered with `register_event_type`.
+- Components support connection changes and parameter retuning. Controllers retain their named
+  state when their parameters change. The built-in `load` element is an event-capable series R-L
+  load, and custom element types can be registered with `register_element_type`.
+- Every event time is an exact integration boundary. User solvers may implement `settle()` and
+  `parameters_changed()`; multirate runs preserve their window grid after an early event boundary.
+  Disconnected converters pause control, and tripped converters remain disconnected.
+
+### Output, examples and packaging
+
+- State, control-signal and summary names use the same SI/per-unit convention as inputs.
+  Controller columns use `ctrl.<unit>.<signal>`. Missing events are `None`/JSON `null`, switches
+  are 0 or 1, and alarms, port-Hamiltonian defaults and energy problems are lists.
+- Results save the fully resolved configuration as `simulation.pes`; `--resolved` prints the same
+  representation, and both resolved and result-saved files can be run again.
+- The single root `examples/` directory contains only YAML-format `*-example.pes` files. They are
+  included in the wheel and remain discoverable by the installed CLI. Custom Python examples are
+  executable tests instead of files under `examples/`.
+- Project version is 0.1.2. The existing PEP 639 `AGPL-3.0-only` metadata is retained.
+
+### Verification
+
+- Added migration and acceptance coverage for parameter resolution, output semantics, events,
+  protection, R-L loads, registered custom types, fixed/adaptive/multirate/user solvers, exact
+  event boundaries, continuation, resolved-file reruns and installed-wheel example discovery.
+
 ## 0.1.1
 
 ### Package layout

@@ -40,10 +40,10 @@ def test_command_line_finds_bundled_pes_files():
     assert _config_path(None) == found
 
 
-def test_issue_two_does_not_change_the_release_version():
+def test_release_version_is_0_1_2():
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    assert '\nversion = "0.1.1"\n' in pyproject
-    assert peslite.__version__ == "0.1.1"
+    assert '\nversion = "0.1.2"\n' in pyproject
+    assert peslite.__version__ == "0.1.2"
 
 
 def test_wheel_data_comes_from_the_root_examples_directory():

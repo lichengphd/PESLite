@@ -2,8 +2,8 @@
 
 Time-domain simulation of power-electronic converters in Python.
 
-- Networks of buses, lines, grid sources and any number of converters, defined in YAML-format
-  simulation files named `.pes`.
+- Networks of buses, lines, grid sources and any number of converters, defined in YAML
+  simulation files, with run-time changes described as events.
 - Grid-following (PLL, current loop, dc-voltage loop) and grid-forming control
   (PSC, droop, VSG, dVOC, matching), each loop on its own clock.
 - Switching (ideal switches, exact switching instants), averaged and step-averaged bridges.
@@ -76,6 +76,37 @@ r.summary                          # trips, alarms, peaks
 r.save("output/run")               # states.csv, summary.json, simulation.pes
 ```
 
+## Simulation files and events
+
+A simulation file contains the model (`base`, `buses`, `branches`, `sources`, `units` and
+`elements`), what happens during the run (`events`), simulation settings (`simulation`) and
+optional text notes (`meta`). `simulation.initial` and `simulation.output` keep the initial-state
+and result settings together with the solver settings. Names without a suffix are SI quantities,
+names ending in `_pu` are per-unit quantities, and switches are written as 0 or 1.
+
+`--resolved` prints the complete parameter set after defaults and command-line overrides are
+applied. The same complete configuration is saved as `simulation.pes`; it can be loaded directly
+to repeat the run.
+
+Events use one common top-level mapping:
+
+```yaml
+events:
+  connect_vsc: {type: connect, target: vsc, t: 0.2, ramp: 1.0}
+  p_step: {type: set, t: 2.0, set: {units.vsc.control.references.p_ref_pu: 0.8}}
+  load_on: {type: connect, target: load, t: 3.0}
+  line_trip: {type: disconnect, target: line, t: 4.0}
+```
+
+`connect` and `disconnect` operate on units, sources, branches or elements. `set` changes a
+declared run-time parameter path and validates the resulting parameter set before it is used.
+Every event time is an exact integration boundary: the interval ending there uses the old model,
+and integration after it uses the updated model. A disconnected converter pauses its controller;
+a converter that trips remains disconnected.
+
+The built-in `load` element is a series R-L load from a bus to ground. It can be connected,
+disconnected or retuned by events; a small impedance can be used to model a fault.
+
 ## Example configurations
 
 | File | Content |
@@ -113,7 +144,13 @@ r.save("output/run")               # states.csv, summary.json, simulation.pes
 | `states.csv` | every state at each snapshot; any row can start a new run |
 | `plant.csv`, `control.<unit>.csv` | plant signals and controller logs (`simulation.output.signals: 1`) |
 | `energy.csv` | stored energy and power balance (`simulation.output.energy: 1`) |
-| `summary.json`, `simulation.pes` | run summary and the complete resolved simulation file |
+| `summary.json` | run summary |
+| `simulation.pes` | complete resolved simulation file; loading it repeats the run |
+
+Output names use the same unit convention as input parameters: an SI value has no unit suffix,
+while a per-unit value ends in `_pu`. Controller columns are named `ctrl.<unit>.<signal>`. In the
+summary, switches such as `tripped` are 0 or 1, events that did not occur are `null`, and alarms,
+port-Hamiltonian defaults and energy problems are lists.
 
 ## Custom parts
 
@@ -142,11 +179,17 @@ class MyLaw(SyncLaw):
         self.v_mag = v_ref_pu
 ```
 
-The registered name can then be used at
-`units.<u>.control.loops.<loop>.type`. A custom controller output stage can
-also be built with `UniteType(cfg, scenario, pwm_method=..., limiter=...)`.
-Other replaceable parts are `<unit>.modulator`, `<unit>.delay`, `solver`,
-and extra circuit elements through `System(p, elements=[...])`.
+The registered name can then be used at `units.<u>.control.loops.<loop>.type`. Circuit element
+types can likewise be registered with `register_element_type`, and event types with
+`register_event_type`; each type owns a frozen parameter dataclass, so its file parameters use the
+same parsing and validation as built-in types. A user solver may implement the normal solver call
+alone; event-aware solvers may additionally provide `settle()` and `parameters_changed()` hooks.
+
+A custom controller output stage can also be built with
+`UniteType(cfg, scenario, pwm_method=..., limiter=...)`. Other replaceable parts are
+`<unit>.modulator`, `<unit>.delay` and `solver`. Executable examples of a custom loop, element,
+event and user solver live in `tests/test_custom_parts.py`; the root `examples/` directory remains
+simulation-data-only.
 
 ## Layout
 
@@ -154,7 +197,7 @@ and extra circuit elements through `System(p, elements=[...])`.
 pyproject.toml
 src/peslite/            the package: __init__.py and four code parts
   components/           what the system is made of
-    network.py            three-phase source, R-L branch, bus (R-C node)
+    network.py            three-phase source, R-L branch, bus (R-C node), element types
     converter.py          bridge, dc link (capacitor, current or voltage source)
     adc.py                sampling of a converter's measurements, averaging window, oversampling
     pwm.py                PWM peripheral: publications, computation delay, carrier, modulators
@@ -165,11 +208,11 @@ src/peslite/            the package: __init__.py and four code parts
     modulation.py         output stage: voltage command to duty ratios, limiter, anti-windup
     blocks.py             transforms, filters and timers
   assembly/             a system built from a simulation file
-    params.py             parameter classes, pu bases, construction, file reading and writing
+    params.py             parameter classes, pu bases, runtime changes, file reading and writing
     validate.py           checks across the file's sections
-    events.py             time functions of events
+    events.py             event types, connection ramps, unit setpoints and source scenarios
     unit.py               a converter unit: power stage, ADC, controller, PWM
-    system.py             the network and its units as one model
+    system.py             the network, units and elements as one model; applies events
   solver/               the numerical kernel and the run
     model.py              subsystems, their connections and named states
     energy.py             energy declarations, power balance, port-Hamiltonian report

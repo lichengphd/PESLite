@@ -72,7 +72,7 @@ class Loop:
     delayed: ClassVar[frozenset[str]] = frozenset()
     role: ClassVar[Optional[str]] = None
     outputs_from_state: ClassVar[bool] = False  # held outputs = initial_outputs() after loading states
-    state_names: tuple[str, ...] = ()
+    state_names: tuple[str, ...] | Mapping[str, str] = ()
     carried: ClassVar[tuple[str, ...]] = ()
 
     def __init__(self, cfg: Any, unit: Any, scenario: Any) -> None:
@@ -85,7 +85,9 @@ class Loop:
         raise NotImplementedError
 
     def get_state(self) -> dict[str, Any]:
-        return {name: getattr(self, name) for name in self.state_names}
+        names = self.state_names
+        attrs = names if isinstance(names, Mapping) else {name: name for name in names}
+        return {name: getattr(self, attr) for name, attr in attrs.items()}
 
     def set_state(self, values: Mapping[str, Any]) -> None:
         assign(self, values, self.state_names)
@@ -175,7 +177,8 @@ class SRFPLL(Loop):
         self.kp, self.ki, self.w0, self.T = cfg.kp_pu, cfg.ki_pu, unit.base.w0, cfg.period
         self.theta, self.omega, self.integral = 0.0, self.w0, 0.0
         self.u_g = 1.0 if cfg.normalisation == "amplitude" else None
-        self.state_names = ("theta", "integral") if self.u_g is None else ("theta", "integral", "u_g")
+        self.state_names = {"theta": "theta", "integral_pu": "integral",
+                            **({} if self.u_g is None else {"u_g_pu": "u_g"})}
 
     def initial_outputs(self):
         return {"theta": self.theta, "frame": self.theta, "omega": self.omega}
@@ -326,8 +329,9 @@ class DCVoltageLoop(Loop):
         self.clamped = self.frozen = False
         self.n_updates = self.n_clamped = 0
         self.n_reverse = 0  # updates asking for reverse (import) current
-        self.first_clamp_t = -1.0
-        self.state_names = ("integral", "clamped") if cfg.antiwindup == "conditional" else ("integral",)
+        self.first_clamp_t: float | None = None
+        self.state_names = {"integral_pu": "integral",
+                            **({"clamped": "clamped"} if cfg.antiwindup == "conditional" else {})}
 
     def initial_outputs(self):
         return {"id_ref": 0.0}
@@ -346,7 +350,7 @@ class DCVoltageLoop(Loop):
         self.clamped = id_ref != self.raw
         if self.clamped:
             self.n_clamped += 1
-            if self.first_clamp_t < 0.0:
+            if self.first_clamp_t is None:
                 self.first_clamp_t = t
         if self.raw < 0.0:
             self.n_reverse += 1
@@ -387,10 +391,10 @@ class PowerLoop(Loop):
         return {"p": self.lpf_p.update(s.real), "q": self.lpf_q.update(s.imag)}
 
     def get_state(self):
-        return gather({"p": self.lpf_p, "q": self.lpf_q})
+        return gather({"p_pu": self.lpf_p, "q_pu": self.lpf_q})
 
     def set_state(self, values):
-        scatter({"p": self.lpf_p, "q": self.lpf_q}, values)
+        scatter({"p_pu": self.lpf_p, "q_pu": self.lpf_q}, values)
 
 
 class SyncLaw(Loop):
@@ -450,7 +454,7 @@ class PSC(SyncLaw):
         _quantities = {"k_p_pu": "1/power"}
 
     type = "psc"
-    state_names = ("theta", "v_int")
+    state_names = {"theta": "theta", "v_int_pu": "v_int"}
 
     def __init__(self, cfg, unit, scenario):
         super().__init__(cfg, unit, scenario)
@@ -514,7 +518,8 @@ class VSG(SyncLaw):
         super().__init__(cfg, unit, scenario)
         self.h, self.d_p, self.k_q, self.t_q = cfg.h, cfg.d_p_pu, cfg.k_q_pu, cfg.t_q
         self.dw_pu = 0.0
-        self.state_names = ("theta", "dw_pu", "v_mag") if self.t_q > 0.0 else ("theta", "dw_pu")
+        self.state_names = {"theta": "theta", "dw_pu": "dw_pu",
+                            **({"v_mag_pu": "v_mag"} if self.t_q > 0.0 else {})}
 
     def step(self, T, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
         self.dw_pu += T / (2.0 * self.h) * (p_ref_pu - p_pu - self.d_p * self.dw_pu)
@@ -546,7 +551,7 @@ class DVOC(SyncLaw):
         _quantities = {"eta_pu": "resistance", "alpha_pu": "1/resistance"}
 
     type = "dvoc"
-    state_names = ("theta", "v_mag")
+    state_names = {"theta": "theta", "v_mag_pu": "v_mag"}
 
     def __init__(self, cfg, unit, scenario):
         super().__init__(cfg, unit, scenario)

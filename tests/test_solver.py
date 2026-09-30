@@ -20,7 +20,7 @@ def test_every_bundled_example_runs_with_the_solver(path):
     sim = peslite.Simulation(peslite.load(path, **QUIET, **{"simulation.t_end": 0.002}))
     result = sim.run()
     assert sim.ph_report.verdict == "port-hamiltonian"
-    assert result.summary["t_stop_s"] == pytest.approx(0.002)
+    assert result.summary["t_stop"] == pytest.approx(0.002)
     assert not result.tripped
 
 

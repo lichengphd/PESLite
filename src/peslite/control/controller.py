@@ -573,11 +573,11 @@ class UniteType:
             frame = self.graph.input(self._frame_cc, "frame", control_meas)
         rot = cmath.exp(-1j * frame)
         self.v_dq, self.i_dq = control_meas.u_g * rot, control_meas.i_c * rot
-        freq_dev_hz = (self.omega - self.w0) / (2 * math.pi)
-        prot = self.protection
+        freq_dev = (self.omega - self.w0) / (2 * math.pi)
+        refs, prot = self.graph.references, self.protection
         prot.check_current(t, peak_abs(control_meas.i_abc))
-        prot.check_sampled(t, abs(self.v_dq), freq_dev_hz,
-                           control_meas.u_dc - self.graph.references["vdc_ref_pu"])
+        prot.check_sampled(t, abs(self.v_dq), freq_dev,
+                           control_meas.u_dc - refs["vdc_ref_pu"])
         tripped = prot.tripped
         duty = self.stage.modulate(t, 0j if tripped else self.u_cmd, self.command_theta, control_meas.u_dc)
         log = {"id_pu": self.i_dq.real, "iq_pu": self.i_dq.imag,
@@ -588,15 +588,13 @@ class UniteType:
         angle_rel = (self.theta - self.w0 * t + math.pi) % (2 * math.pi) - math.pi
         if self._is_gfl:
             id_ref = self.graph.input(self._log_cc, "id_ref", control_meas) if self._log_cc else 0.0
-            log.update(idref_pu=id_ref, pll_freq_dev_hz=freq_dev_hz, pll_angle_rel=angle_rel)
+            log.update(id_ref_pu=id_ref, freq_dev=freq_dev, angle_rel=angle_rel)
         else:
             values = self.graph.values
-            refs = self.graph.references
             pr, qr, vr = self.scenario.setpoints(t, refs["p_ref_pu"], refs["q_ref_pu"], refs["v_ref_pu"])
             log.update(p_pu=values.get(self._p_key, 0.0), q_pu=values.get(self._q_key, 0.0),
-                       p_ref_pu=pr, v_mag_pu=abs(self.v_dq),
-                       v_ref_pu=values.get(self._v_ref_key, 1.0),
-                       freq_dev_hz=freq_dev_hz, angle_rel=angle_rel)
+                       p_ref_pu=pr, v_ref_pu=values.get(self._v_ref_key, 1.0),
+                       freq_dev=freq_dev, angle_rel=angle_rel)
         self.last_log = log
         return ControlOutput(duty, tripped, log, theta=self.theta, omega=self.omega)
 
@@ -623,22 +621,27 @@ class UniteType:
         self.theta, self.omega = self.initial_sync()
 
     def summary(self):
+        """Return this unit's summary; values for events which did not occur are ``None``."""
         st, trip, stage = self.protection.stats, self.protection.trip, self.stage
         summary = {
-            "tripped": float(trip is not None),
-            "trip_time_s": trip.t if trip else -1.0,
-            "trip_cause": trip.cause if trip else "none",
+            "tripped": int(trip is not None),
+            "trip_time": trip.t if trip and math.isfinite(trip.t) else None,
+            "trip_cause": trip.cause if trip else None,
             "max_current_pu": st.max_current_pu,
             "modulation_saturation_fraction": stage.n_saturated / max(1, stage.n_updates),
-            "modulation_saturation_first_t_s": stage.first_saturation_t,
-            "rocof_max_hz_s": st.rocof_max_hz_s,
+            "modulation_saturation_first_t": stage.first_saturation_t,
+            "rocof_max": st.rocof_max,
             "vac_min_pu": st.vac_min_pu,
             "vac_max_pu": st.vac_max_pu,
-            "alarms": "|".join(st.alarms) if st.alarms else "none",
+            **{f"{criterion}_first_t": getattr(st, f"{criterion}_first_t")
+               for criterion in ("overcurrent", "undervoltage", "overvoltage", "frequency",
+                                 "dc_voltage", "rocof")},
+            "alarms": list(st.alarms),
         }
         if self._dc is not None:
             dc = self.graph.nodes[self._dc]
-            summary["idref_limit_fraction"] = dc.n_clamped / max(1, dc.n_updates)
+            summary["id_ref_limit_fraction"] = dc.n_clamped / max(1, dc.n_updates)
+            summary["id_ref_limit_first_t"] = dc.first_clamp_t
         if self._sync is not None:
             summary["law"] = self.p.control.loops[self._sync].type
         return summary

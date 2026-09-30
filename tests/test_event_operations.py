@@ -25,7 +25,7 @@ def _load(tree, name="load", **values):
 
 def _line(tree):
     tree["buses"]["remote"] = {"c_pu": 0.02, "r_d_pu": 0.5}
-    tree["branches"]["line"] = {
+    tree.setdefault("branches", {})["line"] = {
         "from_bus": "pcc", "to_bus": "remote", "x_pu": 0.1, "r_pu": 0.01,
     }
     return tree

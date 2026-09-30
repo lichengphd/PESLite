@@ -302,7 +302,7 @@ class MultirateSolver:
     def interface(self) -> dict[str, float]:
         """Coupling indicators of the run, relative to rated effort where given, else to the state's peak.
 
-        Keys: ``max_rel_error``, ``excursion_rel_max``, ``energy_residual_J``, ``energy_window_rel_max``,
+        Keys: ``max_rel_error``, ``excursion_rel_max``, ``energy_residual`` (J), ``energy_window_rel_max``,
         ``windows``, ``steps``; with ratings ``max_error_rated`` and ``excursion_rated``; with a split
         ``kappa`` (hold bound) and ``within_bound`` (1.0 if no hold exceeded its bound).
         """
@@ -322,7 +322,7 @@ class MultirateSolver:
                 exc_rated = max(exc_rated, float(self._exc_abs.get(idx, 0.0) / ref[sl.start]))
         out = {"max_rel_error": float(np.max(rel)) if rel.size else 0.0,
                "excursion_rel_max": exc_rel,
-               "energy_residual_J": self._energy_residual, "energy_window_rel_max": win_rel,
+               "energy_residual": self._energy_residual, "energy_window_rel_max": win_rel,
                "windows": self._windows, "steps": self._steps}
         if self.ratings:
             out["max_error_rated"] = err_rated  # worst held-effort error / rated effort
@@ -331,7 +331,7 @@ class MultirateSolver:
             # hold bound relative to the reference
             bound_rel = (self._bound_abs / ref)[seen]
             out["kappa"] = float(np.max(bound_rel)) if bound_rel.size else 0.0
-            out["within_bound"] = float(self.bound_violations == 0)
+            out["within_bound"] = int(self.bound_violations == 0)
         return out
 
     @property

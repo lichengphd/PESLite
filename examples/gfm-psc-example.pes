@@ -1,14 +1,7 @@
-meta:
-  title: PSC grid-forming converter
-  description: Power-synchronisation control with active damping.
-base:
-  s_base: 2000000.0
-  v_ll_rms: 690.0
-  f0: 50.0
+# Grid-forming converter: power-synchronization control (PSC) with active damping.
+base: {s_base: 2.0e6, v_ll_rms: 690.0, f0: 50.0}
 buses:
-  pcc:
-    c_pu: 0.02
-    r_d_pu: 0.5
+  pcc: {c_pu: 0.02, r_d_pu: 0.5}
 sources:
   grid:
     bus: pcc
@@ -17,51 +10,21 @@ sources:
 units:
   vsc:
     bus: pcc
-    ac_filter:
-      l_f_pu: 0.2
-      r_f_pu: 0.01
+    ac_filter: {l_f_pu: 0.2, r_f_pu: 0.01}
     dclink:
       vdc_ref: 1500.0
-      source:
-        type: voltage
-        v_pu: 1.0
-    measurement:              # ADC
-      average: instantaneous  # instantaneous | window (mean over (t_k - window, t_k])
-      # u_dc: instantaneous   # same choice for the dc voltage
-    pwm:
-      f_sw: 20000.0
-      modulation_limit: 0.95
-      carrier_phase: 0.0
+      source: {type: voltage}
+    pwm: {f_sw: 20000.0, modulation_limit: 0.95}
     control:
       type: gfm
       loops:
-        power:
-          type: power
-          period: 5.0e-05
-          filter: {enable: 0}
-        sync:
-          type: psc
-          period: 5.0e-05
-          k_p_pu: 6.2832
-          k_v: 0.0
-          k_vi: 20.0
-        impedance:
-          type: virtual_impedance
-          r_v_pu: 0.0
-          x_v_pu: 0.0
-        damp:
-          type: active_damping
-          period: 5.0e-05
-          r_a_pu: 0.2
-          alpha_d: 40.0
-      references:
-        p_ref_pu: 0.5
-        q_ref_pu: 0.0
-        v_ref_pu: 1.0
-    delay:
-      steps: 1
-    protection:
-      overcurrent: {enable: 1, limit_pu: 1.5}
+        power: {type: power, period: 5.0e-5}
+        sync: {type: psc, period: 5.0e-5, k_p_pu: 6.2832, k_vi: 20.0}
+        impedance: {type: virtual_impedance}
+        damp: {type: active_damping, period: 5.0e-5, r_a_pu: 0.2, alpha_d: 40.0}
+      references: {p_ref_pu: 0.5}
+    delay: {steps: 1}
+    protection: {overcurrent: {enable: 1, limit_pu: 1.5}}
 events:
   connect_vsc: {type: connect, target: vsc, t: 0.2, ramp: 1.0}
   p_step: {type: set, t: 2.0, set: {units.vsc.control.references.p_ref_pu: 0.8}}
@@ -69,15 +32,5 @@ events:
 simulation:
   t_end: 6.0
   bridge: averaged
-  solver:
-    type: fixed
-    method: rk4
-    dt: 1.25e-05
-  initial:
-    t: 0.0           # default: capacitors at 1 pu, every other state 0
-  output:
-    period: 0.0005
-    control_every: 10
-    states: 1
-    signals: 0
-  stop_on_trip: 1
+  solver: {dt: 12.5e-6}
+  output: {control_every: 10}

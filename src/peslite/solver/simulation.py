@@ -65,7 +65,7 @@ class SimulationResult:
 
     @property
     def tripped(self) -> bool:
-        return bool(self.summary.get("tripped", 0.0))
+        return bool(self.summary.get("tripped", 0))
 
     def columns(self) -> dict[str, np.ndarray]:
         """Return flat real columns: plant quantities in SI and controller logs in pu.
@@ -90,7 +90,7 @@ class SimulationResult:
             if f"{name}.angle" in self.plant:
                 cols[f"{name}.angle"] = self.plant[f"{name}.angle"]
         for key, arr in self.plant.items():
-            if key.startswith("ctrl_"):
+            if key.startswith("ctrl."):
                 cols[key[5:]] = arr
         return cols
 
@@ -153,7 +153,7 @@ class SimulationResult:
         if output.energy and self.energy:
             self.energy_to_csv(out / "energy.csv")
             written.append(out / "energy.csv")
-        summary = {**(info or {}), "wall_time_s": self.wall_time, "n_rhs": self.n_rhs, **self.summary}
+        summary = {**(info or {}), "wall_time": self.wall_time, "n_rhs": self.n_rhs, **self.summary}
         (out / "summary.json").write_text(json.dumps(summary, indent=2, default=float), encoding="utf-8")
         dump(self.params, out / "simulation.pes")
         written += [out / "summary.json", out / "simulation.pes"]
@@ -207,7 +207,7 @@ class Recorder:
             self.plant.setdefault(k, []).append(v)
         for unit, log in self.last_ctrl_log.items():
             for k, v in log.items():
-                key = f"ctrl_{unit}.{k}"
+                key = f"ctrl.{unit}.{k}"
                 if key not in self.plant:  # controller signal appearing after the first snapshots
                     self.plant[key] = [math.nan] * n_before
                 self.plant[key].append(v)
@@ -451,9 +451,19 @@ class Simulation:
             inner = presets
             presets = lambda key, word: inner(key[6:] if key.startswith("plant.") else key, word)  # noqa: E731
         self._start_duty()  # so that the duty ratios and delay pipelines have their states
-        parts = self._parts()
+        template = gather(self._parts())
         try:
-            values = resolve(gather(parts), expand_aliases(self.p.simulation.initial.states, aliases), presets)
+            given = expand_aliases(self.p.simulation.initial.states, aliases)
+            if callable(presets):
+                for bus in getattr(system, "buses", {}):
+                    key = f"plant.{bus}.u_C"
+                    if key not in template or any(name == key or name.startswith(key + ".") for name in given):
+                        continue
+                    try:
+                        given[key] = presets(key, "source")
+                    except ValueError:
+                        pass
+            values = resolve(template, given, presets)
         except (KeyError, ValueError) as exc:
             msg = exc.args[0] if exc.args else str(exc)
             if aliases:
@@ -722,9 +732,9 @@ class Simulation:
         for name, unit in system.units.items():
             if hasattr(unit.ctrl, "summary"):
                 summary.update({f"{name}.{k}": v for k, v in unit.ctrl.summary().items()})
-        summary["tripped"] = float(any(tripped.values()))
-        summary["t_start_s"] = t_start
-        summary["t_stop_s"] = float(t_arr[-1]) if len(t_arr) else t_start
+        summary["tripped"] = int(any(tripped.values()))
+        summary["t_start"] = t_start
+        summary["t_stop"] = float(t_arr[-1]) if len(t_arr) else t_start
         if stop_reason:
             summary["stop_reason"] = stop_reason
         coarse = getattr(solver, "coarse_hold", None)
@@ -732,12 +742,12 @@ class Simulation:
             summary["interface_coarse_hold"] = f"{coarse[1]} at t = {coarse[0]:.6g} s: {coarse[2]:.3g} of rating"
         if self.ph_report is not None:
             summary["ph_verdict"] = self.ph_report.verdict
-            summary["ph_defaulted"] = "|".join(self.ph_report.defaulted) if self.ph_report.defaulted else "none"
+            summary["ph_defaulted"] = list(self.ph_report.defaulted)
             summary["ph_report"] = self.ph_report.to_dict()
         if energy_on:
             summary["energy_tellegen_max_rel"] = worst["tellegen"]
             summary["energy_balance_max_rel"] = worst["balance"]
-            summary["energy_check"] = "|".join(self.energy_problems) if self.energy_problems else "ok"
+            summary["energy_problems"] = list(self.energy_problems)
         interface = getattr(solver, "interface", None)
         if interface:  # split-interface indicators
             summary.update({f"interface_{k}": v for k, v in interface.items()})
@@ -968,14 +978,16 @@ def parse_override(text: str):
 def main(argv=None) -> int:
     """Run a simulation file and save its states, summary and configured signals."""
     ap = argparse.ArgumentParser(description=main.__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("config", nargs="?", help="configuration name or path; default: first bundled example by filename")
+    ap.add_argument("config", nargs="?",
+                    help="simulation file path or bundled example name; default: first example by filename")
     ap.add_argument("--set", action="append", default=[], type=parse_override, metavar="PATH=VALUE",
                     help="override a dotted parameter path (repeatable)")
     ap.add_argument("--initial", default=None, metavar="FILE",
-                    help="initial values: a states.csv (last row) or a YAML/JSON file with an 'initial' block")
+                    help="initial values: a states.csv row or a simulation file's simulation.initial block")
     ap.add_argument("--initial-time", type=float, default=None, metavar="T",
                     help="with a states.csv: start from the row at time T instead of the last row")
-    ap.add_argument("--out", default=None, help="output directory (default: output/<config name> in the current working directory)")
+    ap.add_argument("--out", default=None,
+                    help="output directory (default: output/<file name> in the current working directory)")
     ap.add_argument("--progress", type=float, default=None, metavar="SECONDS",
                     help="print a progress line every SECONDS of simulated time (overrides the config)")
     ap.add_argument("--list-states", action="store_true",
@@ -1017,11 +1029,12 @@ def main(argv=None) -> int:
               f"{'; ' + '; '.join(sim.energy_problems) if sim.energy_problems else ''})")
     r = sim.run()
     s = r.summary
-    print(f"done: wall {r.wall_time:.1f} s, rhs evaluations {r.n_rhs}, stop at {s.get('t_stop_s', 0):.4f} s, "
+    print(f"done: wall {r.wall_time:.1f} s, rhs evaluations {r.n_rhs}, stop at {s.get('t_stop', 0):.4f} s, "
           f"tripped={bool(s.get('tripped'))}")
     for name in p.units:
         print(f"  {name}: max |i| = {s.get(f'{name}.max_current_pu', 0):.4f} pu, "
-              f"trip: {s.get(f'{name}.trip_cause')}, alarms: {s.get(f'{name}.alarms')}")
+              f"trip: {s.get(f'{name}.trip_cause') or 'none'}, "
+              f"alarms: {', '.join(s.get(f'{name}.alarms') or []) or 'none'}")
     if "stop_reason" in s:
         print(f"stopped: {s['stop_reason']}")
     if "interface_kappa" in s:

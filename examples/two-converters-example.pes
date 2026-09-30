@@ -1,30 +1,13 @@
 # Two converters, each on its own bus and connected to the PCC by a line:
 # a grid-forming unit (PSC, 2 MVA, 20 kHz) and a grid-following unit (1 MVA, 10 kHz).
-base:
-  s_base: 2.0e6
-  v_ll_rms: 690.0
-  f0: 50.0
+base: {s_base: 2.0e6, v_ll_rms: 690.0, f0: 50.0}
 buses:
-  pcc:
-    c_pu: 0.02
-    r_d_pu: 0.5
-  bus1:
-    c_pu: 0.02
-    r_d_pu: 0.5
-  bus2:
-    c_pu: 0.02
-    r_d_pu: 0.5
+  pcc: {c_pu: 0.02, r_d_pu: 0.5}
+  bus1: {c_pu: 0.02, r_d_pu: 0.5}
+  bus2: {c_pu: 0.02, r_d_pu: 0.5}
 branches:
-  line1:
-    from_bus: bus1
-    to_bus: pcc
-    x_pu: 0.05
-    r_pu: 0.005
-  line2:
-    from_bus: bus2
-    to_bus: pcc
-    x_pu: 0.08
-    r_pu: 0.008
+  line1: {from_bus: bus1, to_bus: pcc, x_pu: 0.05, r_pu: 0.005}
+  line2: {from_bus: bus2, to_bus: pcc, x_pu: 0.08, r_pu: 0.008}
 sources:
   grid:
     bus: pcc
@@ -33,98 +16,41 @@ sources:
 units:
   vsc_m:
     bus: bus1
-    ac_filter:
-      l_f_pu: 0.2
-      r_f_pu: 0.01
+    ac_filter: {l_f_pu: 0.2, r_f_pu: 0.01}
     dclink:
       vdc_ref: 1500.0
-      source:
-        type: voltage
-        v_pu: 1.0
-    pwm:
-      f_sw: 20000.0
-      modulation_limit: 0.95
-      carrier_phase: 0.0
+      source: {type: voltage}
+    pwm: {f_sw: 20000.0, modulation_limit: 0.95}
     control:
       type: gfm
       loops:
-        power:
-          type: power
-          period: 5.0e-05
-          filter: {enable: 0}
-        sync:
-          type: psc
-          period: 5.0e-05
-          k_p_pu: 6.2832
-          k_v: 0.0
-          k_vi: 20.0
-        impedance:
-          type: virtual_impedance
-          r_v_pu: 0.0
-          x_v_pu: 0.0
-        damp:
-          type: active_damping
-          period: 5.0e-05
-          r_a_pu: 0.2
-          alpha_d: 40.0
-      references:
-        p_ref_pu: 0.5
-        q_ref_pu: 0.0
-        v_ref_pu: 1.0
-    delay:
-      steps: 1
-    protection:
-      overcurrent: {enable: 1, limit_pu: 1.5}
-    s_base: 2000000.0
+        power: {type: power, period: 5.0e-5}
+        sync: {type: psc, period: 5.0e-5, k_p_pu: 6.2832, k_vi: 20.0}
+        impedance: {type: virtual_impedance}
+        damp: {type: active_damping, period: 5.0e-5, r_a_pu: 0.2, alpha_d: 40.0}
+      references: {p_ref_pu: 0.5}
+    delay: {steps: 1}
+    protection: {overcurrent: {enable: 1, limit_pu: 1.5}}
   vsc_l:
     bus: bus2
-    ac_filter:
-      l_f_pu: 0.2
-      r_f_pu: 0.01
+    s_base: 1.0e6
+    ac_filter: {l_f_pu: 0.2, r_f_pu: 0.01}
     dclink:
       vdc_ref: 1500.0
-      capacitor:
-        c_pu: 35.0
-        r_esr_pu: 0.001
-      source:
-        type: current
-        i_pu: 0.9
-        k_pu: 0.0
-    pwm:
-      f_sw: 10000.0
-      modulation_limit: 0.95
-      carrier_phase: 0.0
+      capacitor: {c_pu: 35.0, r_esr_pu: 0.001}
+      source: {type: current, i_pu: 0.9}
+    pwm: {f_sw: 10000.0, modulation_limit: 0.95}
     control:
       type: gfl
       loops:
-        pll:
-          type: srf_pll
-          period: 0.0001
-          kp_pu: 20.0
-          ki_pu: 1200.0
-        cc:
-          type: dq_current_pi
-          period: 0.0001
-          bandwidth: 200.0
-          antiwindup: conditional
-        dvc:
-          type: dc_voltage_pi
-          period: 0.0001
-          limit_pu: 1.15
-          kp_pu: 0.8
-          ki_pu: 90.0
-          id0_export_pu: 0.9
-          bidirectional: 0
-    delay:
-      steps: 0
+        pll: {type: srf_pll, period: 1.0e-4, kp_pu: 20.0, ki_pu: 1200.0}
+        cc: {type: dq_current_pi, period: 1.0e-4, bandwidth: 200.0}
+        dvc: {type: dc_voltage_pi, period: 1.0e-4, kp_pu: 0.8, ki_pu: 90.0, limit_pu: 1.15, id0_export_pu: 0.9}
     protection:
       overcurrent: {enable: 1, limit_pu: 1.15}
       undervoltage: {enable: 1, limit_pu: 0.5}
       overvoltage: {enable: 1, limit_pu: 1.2}
-      frequency: {enable: 0}
-      dc_voltage: {enable: 0}
-      rocof: {enable: 1, limit: 1.0, window: 0.1}
-    s_base: 1000000.0
+      rocof: {enable: 1, limit: 1.0}
 events:
   connect_vsc_m: {type: connect, target: vsc_m, t: 0.05, ramp: 0.3}
   connect_vsc_l: {type: connect, target: vsc_l, t: 0.05, ramp: 0.3}
@@ -132,21 +58,6 @@ events:
   grid_f: {type: set, t: 0.75, set: {sources.grid.f: 49.8}}
 simulation:
   t_end: 1.0
-  bridge: switching
-  solver:
-    type: fixed
-    method: rk4
-    dt: 1.25e-05
-    rtol: 1.0e-06
-    atol: 1.0e-09
-  initial:
-    t: 0.0           # default: capacitors at 1 pu, every other state 0
-  output:
-    period: 0.0005
-    control_every: 10
-    states: 1
-    signals: 0
-    energy: 0
+  solver: {dt: 12.5e-6}
   stop_on_trip: 0
-  progress_every: 0.0
-  energy_check: warn
+  output: {control_every: 10}
