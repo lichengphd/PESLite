@@ -64,7 +64,7 @@ def test_parse_step_rejects_invalid_ratios(value):
 
 
 def test_solver_kernel_does_not_import_application_layers():
-    forbidden = {"assembly", "control", "firmware", "modulation", "params", "power",
+    forbidden = {"assembly", "components", "control", "firmware", "modulation", "params", "power",
                  "protection", "results", "sensing", "simulation"}
     for path in SOLVER.glob("*.py"):
         imported = set()

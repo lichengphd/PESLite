@@ -1,4 +1,4 @@
-"""Assembly of named buses, R-L branches, sources and converter units into one Model.
+"""The system: named buses, R-L branches, sources and converter units wired into one model.
 
 Element names are the namespaces of their subsystems and states.
 """
@@ -7,10 +7,11 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Optional, Sequence
 
-from ..solver.model import Model, gather, scatter
-from ..params import Params
-from ..power import RCNode, RLBranch, ThreePhaseSource
+from ..components.network import RCNode, RLBranch, ThreePhaseSource
+from ..solver.model import Model
+from ..solver.model import gather
 from .events import SourceScenario
+from ..params import Params
 from .unit import Unit
 
 __all__ = ["System"]
@@ -109,7 +110,6 @@ class System:
         self.state_aliases: dict[str, str] = {}
         for unit in self.units.values():
             self.state_aliases.update(unit.aliases())
-        self.breakers = [b for unit in self.units.values() for b in unit.breakers]
 
     # ---------------------------------------------------------------- states
     def get_state(self) -> dict[str, Any]:
@@ -161,16 +161,7 @@ class System:
 
         return preset
 
-    # ---------------------------------------------------------------- the loop
-    def trip(self) -> None:
-        """Trip every unit (open all breakers)."""
-        for unit in self.units.values():
-            unit.trip()
-
-    @property
-    def breaker_open(self) -> bool:
-        return any(unit.breaker_open for unit in self.units.values())
-
+    # ---------------------------------------------------------------- the run
     def signals(self, t: float) -> dict[str, float | complex]:
         """Return the plant signals (SI) for the recorder; outputs must be synced to ``t``."""
         out: dict[str, float | complex] = {}

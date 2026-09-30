@@ -157,17 +157,17 @@ src/peslite/          installable package
   __init__.py         package exports
   solver/             circuit model, energy accounting, fixed/adaptive/multirate solvers
   params/             parameter schema, validation, file I/O
-  power/              sources, lines, buses, bridge, dc link
   control/            converter controller
     loops.py            loop types, their parameter dataclasses, ports and updates
     controller.py       loop graph, controller interface, GFL/GFM wiring, UniteType
     modulation.py       voltage command to duty ratios, limiting and anti-windup
     protection.py       trip and alarm criteria
     blocks.py           transforms, filters and timers
-  firmware/           computation delay and temporary compatibility imports
-  modulation/         bridge-side carrier and modulators
-  sensing/            ADC sampling
-  protection/         temporary compatibility import for control.protection
+  components/         power circuit and converter hardware
+    network.py          sources, R-L branches and R-C nodes
+    converter.py        bridge and DC-link components
+    adc.py              sampling, averaging windows and oversampling
+    pwm.py              PWM publications, computation delay, carriers and modulators
   results/            recording and result files
   assembly/           converter unit and system assembly
   configs/            bundled *-example simulation files

@@ -1,30 +1,29 @@
-"""Converter unit: power stage, sensing, controller and PWM peripherals.
+"""A converter unit: dc link, bridge and filter branch, its ADC, controller and PWM.
 
-Plant quantities are in SI; the controller works in the unit's pu bases. The
-controller itself lives in :mod:`peslite.control`; this module only assembles
-it with the hardware that has not yet moved to the refactored components layer.
+Plant quantities are in SI; the controller works in the unit's pu bases.
 """
 
 from __future__ import annotations
 
 from typing import Any, Mapping, Optional
 
-import numpy as np
-
-from ..control import Controller, Measurement, make_controller
-from ..firmware import ComputationDelay
-from ..modulation import make_modulator
-from ..params import SimulationParams, UnitParams
-from ..power import Bridge, RLBranch, make_dclink
-from ..sensing import MeasurementPorts, Sampler, SamplingWindow
+from ..components.adc import ADC, MeasurementPorts
+from ..components.converter import Bridge, make_dclink
+from ..components.network import RLBranch
+from ..components.pwm import PWM, ComputationDelay, Delay, Modulator, make_modulator
+from ..control.controller import Controller, make_controller
 from .events import UnitScenario
-from .protocols import Delay, Modulator
+from ..params import SimulationParams, UnitParams
 
 __all__ = ["Unit"]
 
 
 class Unit:
-    """One converter unit built from its parameter section, connected to ``bus``."""
+    """One converter unit built from its parameter section, connected to ``bus``.
+
+    ``ctrl``, ``modulator``, ``delay``: replacements of the parts built from the section. The unit
+    samples with ``adc``, controls with ``ctrl`` and switches its bridge through ``pwm``.
+    """
 
     def __init__(self, name: str, cfg: UnitParams, sim: SimulationParams, bus: Any,
                  ctrl: Optional[Controller] = None, modulator: Optional[Modulator] = None,
@@ -33,42 +32,35 @@ class Unit:
         self.cfg = cfg
         self.bus = bus
         self.scenario = sc = UnitScenario(cfg)
-        base = cfg.base
 
         # ------------------------------------------------------------ power
         self.dclink = make_dclink(cfg.dclink, ramp=sc.startup)
         self.bridge = Bridge()
         self.branch_f = RLBranch(cfg.ac_filter.l_f, cfg.ac_filter.r_f)
+        self.breakers = [self.branch_f, self.dclink]
+        self.breaker_open = False
 
-        # ------------------------------------------------------------ sensing
-        # ADC: instantaneous samples or window means; the window holds only the averaged channels
+        # ------------------------------------------------------------ ADC
+        # instantaneous samples or window means; the window holds only the averaged channels
         meas = cfg.measurement
         channels: dict[str, complex | float] = {}
         if meas.average == "window":
             channels["v"], channels["i"] = 0j, 0j
         if meas.u_dc == "window":
             channels["dc"] = 0.0
-        self.window: Optional[SamplingWindow] = SamplingWindow(
-            meas.window_s if meas.window_s is not None else cfg.pwm.update_period, channels
-        ) if channels else None
-        self.T_avg: Optional[float] = self.window.length if self.window is not None else None
         self.ports = MeasurementPorts(
             u_g=lambda: bus.out.u, i_c=lambda: self.branch_f.out.i,
             i_c_state=lambda: self.branch_f.state.i, u_dc=lambda: self.dclink.out.u_dc,
             i_dc=lambda: self.dclink.inp.i_dc)
-        self.sampler = Sampler(self.ports, self.window)
-        self.breakers = [self.branch_f, self.dclink]
-        self.breaker_open = False
+        T_s = cfg.pwm.update_period  # PWM publication interval
+        self.adc = ADC(self.ports, T_s, int(cfg.control.samples_per_update),
+                       meas.window_s if meas.window_s is not None else T_s, channels)
 
         # ------------------------------------------------------------ control
         self.ctrl = ctrl if ctrl is not None else make_controller(cfg, sc)
-        self.modulator = modulator if modulator is not None else make_modulator(cfg.pwm, base.f0, sim)
-        self.delay = delay if delay is not None else ComputationDelay(cfg.delay.steps)
-        c = cfg.control
-        self.T_s = cfg.pwm.update_period                    # PWM publication interval
-        self.samples_per_update = int(c.samples_per_update)
-        self.T_samp = self.T_s / self.samples_per_update   # sampling period
-        self.zoh = f"{name}.q"                             # held bridge switching state
+        self.pwm = PWM(T_s, modulator if modulator is not None else make_modulator(cfg.pwm, cfg.base.f0, sim),
+                       delay if delay is not None else ComputationDelay(cfg.delay.steps))
+        self.zoh = f"{name}.q"                   # model label of the bridge's held switching state
 
     # ---------------------------------------------------------------- assembly
     def subsystems(self) -> dict[str, Any]:
@@ -78,10 +70,7 @@ class Unit:
 
     def connections(self) -> dict:
         """Return this unit's internal wiring and its filter branch's connection to the bus."""
-        return {
-            (self.branch_f, "u_to"): (self.bus, "u"),
-            **self.bridge.connections(self.dclink, self.branch_f),
-        }
+        return {(self.branch_f, "u_to"): (self.bus, "u"), **self.bridge.connections(self.dclink, self.branch_f)}
 
     def zoh_connections(self) -> dict:
         return self.bridge.zoh_connections(self.zoh)
@@ -96,15 +85,11 @@ class Unit:
         return (self.branch_f, "i")
 
     def aliases(self) -> dict[str, str]:
-        """Return aliases for converter current and dc-link voltage."""
+        """Return the aliases ``<unit>.i_c`` (filter current) and ``<unit>.u_dc`` (dc-link voltage)."""
         out = {f"{self.name}.i_c": f"{self.name}.branch_f.i"}
         if self.cfg.dclink.capacitor is not None:
             out[f"{self.name}.u_dc"] = f"{self.name}.dclink.u_C"
         return out
-
-    def presets(self, t: float) -> dict[str, Any]:
-        """Return this unit's ``initial.states`` keyword values."""
-        return {"rated": self.cfg.dclink.vdc_ref}
 
     # ---------------------------------------------------------------- states
     def get_state(self) -> dict[str, Any]:
@@ -114,35 +99,12 @@ class Unit:
         if values.get("breaker_open", False) and not self.breaker_open:
             self.trip()
 
-    # ---------------------------------------------------------------- the loop
-    def measure(self, t: float) -> Measurement:
-        """Return the sampled measurement (SI) at ``t``; model outputs must be synced."""
-        return self.sampler.measure(t)
-
-    def open_window(self) -> None:
-        """Open the next averaging window at the current instant."""
-        self.sampler.open_window()
-
-    def _measured(self) -> dict[str, complex | float]:
-        ports = self.ports
-        return {"v": ports.u_g(), "i": ports.i_c(), "dc": ports.u_dc()}
-
-    def seed_window(self) -> None:
-        """Seed the averaging window at the start instant."""
-        if self.window is not None:
-            self.window.seed(self._measured())
-
-    def accumulate(self, dt: float) -> None:
-        """Advance the averaging window over the interval ending now."""
-        if self.window is not None:
-            self.window.accumulate(dt, self._measured())
-
-    def phase_currents(self) -> np.ndarray:
-        """Return the instantaneous phase currents (A) from the state."""
-        return self.sampler.phase_currents()
-
+    # ---------------------------------------------------------------- the run
     def trip(self) -> None:
-        """Open this unit's breakers; other units keep running."""
+        """Open this unit's breakers (filter branch and dc source); other units keep running.
+
+        The caller must repack the solver state vector afterwards.
+        """
         self.breaker_open = True
         for breaker in self.breakers:
             breaker.open_breaker()

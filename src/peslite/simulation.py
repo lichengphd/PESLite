@@ -22,8 +22,8 @@ from .solver.multirate import make_solver
 from .solver.splitbound import split_error_bound
 from .solver.model import expand_aliases, flatten, gather, resolve, scatter
 from .params import ConfigError, Params, load
+from .components.pwm import Delay, Modulator
 from .control import Controller
-from .assembly.protocols import Delay, Modulator
 from .results import Recorder, SimulationResult
 from .control.blocks import abc2complex, complex2abc
 
@@ -39,51 +39,6 @@ _EPS = 1e-10  # seconds; intervals shorter than this are not integrated separate
 def _finite(y: np.ndarray) -> bool:
     """Return True when every entry of ``y`` is finite."""
     return all(map(math.isfinite, y.tolist()))
-
-
-class _UnitLoop:
-    """Event-loop bookkeeping for one converter unit."""
-
-    __slots__ = ("unit", "name", "ctrl", "delay", "modulator", "T_s", "n_samples", "T_samp", "k", "d",
-                 "sync", "peeks", "n_samp", "schedule", "next_switch", "start", "period_end", "tripped",
-                 "T_avg", "window_open", "latest_meas")
-
-    def __init__(self, unit: Unit, k0: int) -> None:
-        self.unit, self.name = unit, unit.name
-        self.ctrl, self.delay, self.modulator = unit.ctrl, unit.delay, unit.modulator
-        self.T_s = unit.T_s
-        self.n_samples = unit.samples_per_update
-        self.T_samp = unit.T_samp
-        self.k = k0
-        self.d = np.zeros(3)
-        self.sync: tuple[float | None, float | None] = (
-            unit.ctrl.initial_sync() if hasattr(unit.ctrl, "initial_sync") else (None, None))
-        self.peeks: list[Any] = []
-        self.n_samp = 1  # sample 0 of a period is its control instant
-        self.T_avg = unit.T_avg  # ADC averaging window (s); None for instantaneous sampling
-        # a full-period window opens at the control instant itself
-        self.window_open = self.T_avg is None or self.T_avg >= unit.T_s * (1.0 - 1e-12)
-        self.schedule: list[tuple[float, Any]] = []  # remaining switching instants of this period
-        self.next_switch = math.inf
-        self.start = k0 * unit.T_s  # start of the current period
-        self.period_end = math.inf
-        self.tripped = bool(getattr(unit.ctrl, "tripped", False)) or unit.breaker_open
-        self.latest_meas = None
-
-    @property
-    def t_control(self) -> float:
-        return self.k * self.T_s
-
-    @property
-    def t_window(self) -> float:
-        """Opening time of the next averaging window; ``inf`` when none is pending."""
-        if self.window_open:
-            return math.inf
-        return self.t_control - self.T_avg
-
-    @property
-    def t_sample(self) -> float:
-        return (self.start + self.n_samp * self.T_samp) if self.n_samp < self.n_samples else math.inf
 
 
 class Simulation:
@@ -139,7 +94,7 @@ class Simulation:
             self.solver = make_solver(p.simulation.solver, model=self.system.model,
                                       ratings=self._ratings())
         for unit in self.system.units.values():
-            for obj, proto in ((unit.ctrl, Controller), (unit.modulator, Modulator), (unit.delay, Delay)):
+            for obj, proto in ((unit.ctrl, Controller), (unit.pwm.modulator, Modulator), (unit.pwm.delay, Delay)):
                 if not isinstance(obj, proto):
                     raise TypeError(f"{unit.name}: {type(obj).__name__} does not satisfy the "
                                     f"{proto.__name__} protocol")
@@ -215,31 +170,32 @@ class Simulation:
             warnings.warn("energy check: " + msg, stacklevel=3)
 
     # ------------------------------------------------------------ states
-    def _state(self, duty: Mapping[str, np.ndarray]) -> dict[str, Any]:
-        s = gather({"plant": self.system})
+    def _parts(self) -> dict[str, Any]:
+        """The parts that have named states, by their prefix in the state table, in its order."""
+        parts: dict[str, Any] = {"plant": self.system}
         for name, unit in self.system.units.items():
-            s.update(gather({f"ctrl.{name}": unit.ctrl}))
-            for k, ph in enumerate("abc"):
-                s[f"pwm.{name}.d_{ph}"] = float(duty[name][k])
-            s.update(gather({f"delay.{name}": unit.delay}))
-            if unit.window is not None:
-                s.update(gather({f"meas.{name}": unit.window}))
-        s.update(gather({"solver": self.solver}))
-        return s
+            parts[f"ctrl.{name}"] = unit.ctrl
+            parts[f"pwm.{name}"] = unit.pwm
+            parts[f"delay.{name}"] = unit.pwm.delay
+            if unit.adc.averaging:
+                parts[f"meas.{name}"] = unit.adc
+        parts["solver"] = self.solver
+        return parts
 
-    def _initial_duty(self) -> dict[str, np.ndarray]:
-        return {name: np.asarray(unit.ctrl.initial_duty(), dtype=float)
-                for name, unit in self.system.units.items()}
+    def _start_duty(self) -> None:
+        """Put the controllers' start-up duty ratios in force and fill the delay pipelines with them."""
+        for unit in self.system.units.values():
+            unit.pwm.d = np.array(unit.ctrl.initial_duty(), dtype=float)
+            unit.pwm.delay.reset(unit.pwm.d)
 
     def state_names(self) -> list[str]:
         """Return the state-table column names after ``t``, i.e. the valid ``initial.states`` keys."""
         if self.result is None:
-            for unit in self.system.units.values():
-                unit.delay.reset(unit.ctrl.initial_duty())
-        return list(flatten(self._state(self._initial_duty())))
+            self._start_duty()
+        return list(flatten(gather(self._parts())))
 
-    def _apply_initial(self, t0: float) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-        """Load ``initial.states`` into the parts; return the solver vector and the first duty ratios."""
+    def _apply_initial(self, t0: float) -> np.ndarray:
+        """Load ``initial.states`` into the parts; return the solver vector."""
         system = self.system
         aliases = {f"plant.{a}": f"plant.{c}" for a, c in getattr(system, "state_aliases", {}).items()}
         presets_of = getattr(system, "state_presets", None)
@@ -247,11 +203,10 @@ class Simulation:
         if callable(presets):  # state-dependent keywords: strip the "plant." prefix
             inner = presets
             presets = lambda key, word: inner(key[6:] if key.startswith("plant.") else key, word)  # noqa: E731
-        for unit in system.units.values():
-            unit.delay.reset(unit.ctrl.initial_duty())  # fill the pipeline so its states exist
-        template = self._state(self._initial_duty())
+        self._start_duty()  # so that the duty ratios and delay pipelines have their states
+        parts = self._parts()
         try:
-            values = resolve(template, expand_aliases(self.p.initial.states, aliases), presets)
+            values = resolve(gather(parts), expand_aliases(self.p.initial.states, aliases), presets)
         except (KeyError, ValueError) as exc:
             msg = exc.args[0] if exc.args else str(exc)
             if aliases:
@@ -260,28 +215,24 @@ class Simulation:
         # 1. power stage (unset states stay zero), then the solver vector
         scatter({"plant": system}, values)
         y = system.model.get_initial_values()
-        # 2. start-up modulation matching each unit's terminal voltage at t0
+        # 2. start-up modulation matching each unit's terminal voltage at t0, or the given duty ratios
         system.model.sync(t0, y)
-        duty: dict[str, np.ndarray] = {}
         for name, unit in system.units.items():
             align = getattr(unit.ctrl, "align_startup", None)
             if align is not None:
                 align(unit.ports.u_g(), unit.ports.u_dc())
-            unit.seed_window()  # averaging window starts at t0
-            pwm = np.asarray(unit.ctrl.initial_duty(), dtype=float).copy()
-            for k, ph in enumerate("abc"):
-                if f"pwm.{name}.d_{ph}" in values:
-                    pwm[k] = values[f"pwm.{name}.d_{ph}"]
-            duty[name] = pwm
+            unit.adc.seed()  # averaging window starts at t0
+            unit.pwm.d = np.array(unit.ctrl.initial_duty(), dtype=float)
+            scatter({f"pwm.{name}": unit.pwm}, values)
         # 3. controllers, delay pipelines, measurement windows, solver
         for name, unit in system.units.items():
             scatter({f"ctrl.{name}": unit.ctrl}, values)
-            unit.delay.reset(duty[name])
-            scatter({f"delay.{name}": unit.delay}, values)
-            if unit.window is not None:
-                scatter({f"meas.{name}": unit.window}, values)
+            unit.pwm.delay.reset(unit.pwm.d)
+            scatter({f"delay.{name}": unit.pwm.delay}, values)
+            if unit.adc.averaging:
+                scatter({f"meas.{name}": unit.adc}, values)
         scatter({"solver": self.solver}, values)
-        return y, duty
+        return y
 
     # ------------------------------------------------------------ the loop
     def run(self, t_end: float | None = None) -> SimulationResult:
@@ -297,21 +248,26 @@ class Simulation:
         rec = Recorder(keep_states=p.output.states)
         wall0 = time.time()
 
-        periods = [u.T_s for u in system.units.values()]
+        units = list(system.units.values())
+        periods = [u.pwm.period for u in units]
         t_start = min(round(p.initial.t / T) * T for T in periods)
         if t_end <= t_start + _EPS:
             raise ValueError(f"t_end = {t_end} must be after the start time {t_start}")
         # the run ends at the earliest period boundary at or after t_end
         t_final = min(math.ceil((t_end - _EPS) / T) * T for T in periods)
-        loops = [_UnitLoop(u, int(round(t_start / u.T_s))) for u in system.units.values()]
-        averaging = [lp for lp in loops if lp.unit.window is not None]  # units whose ADC averages
-        for loop in loops:
-            if hasattr(loop.ctrl, "reset_clocks"):
-                loop.ctrl.reset_clocks(t_start)
-        y, duty = self._apply_initial(t_start)
-        for loop in loops:
-            loop.d = duty[loop.name]
-            loop.latest_meas = loop.unit.measure(t_start)
+        # trips already handled, by unit (a trip loaded with the initial states is handled at the first sample)
+        tripped = {u.name: bool(getattr(u.ctrl, "tripped", False)) or u.breaker_open for u in units}
+        for unit in units:
+            pwm = unit.pwm
+            pwm.k = int(round(t_start / pwm.period))
+            pwm.start = pwm.t_next
+            pwm.sync = unit.ctrl.initial_sync() if hasattr(unit.ctrl, "initial_sync") else (None, None)
+            if hasattr(unit.ctrl, "reset_clocks"):
+                unit.ctrl.reset_clocks(t_start)
+        averaging = [u for u in units if u.adc.averaging]  # units whose ADC averages
+        y = self._apply_initial(t_start)
+        for unit in units:
+            unit.adc.latest = unit.adc.measure(t_start)
         n_log = max(0, math.ceil(t_start / log_period - 1e-9))
         next_report = t_start + progress_every if progress_every > 0 else math.inf
         t_local = t_start
@@ -323,13 +279,14 @@ class Simulation:
         stop_reason = ""
         coarse_reported = False
         stopped = False
+        parts = self._parts()
 
         def snapshot(t_now: float) -> None:
             try:
                 with np.errstate(over="raise"):
                     mdl.sync(t_now, y)
                     rec.plant_snapshot(t_now, system.signals(t_now))
-                    rec.state_row(t_now, flatten(self._state({lp.name: lp.d for lp in loops})))
+                    rec.state_row(t_now, flatten(gather(parts)))
                     if energy_on and _finite(y):
                         rep = mdl.energy_balance(t_now, y)
                         rec.energy_row(t_now, rep.columns())
@@ -356,8 +313,8 @@ class Simulation:
             finite = _finite(y)
             if averaging and finite:
                 mdl.sync(t_b, y)
-                for lp in averaging:
-                    lp.unit.accumulate(t_b - t_a)
+                for unit in averaging:
+                    unit.adc.accumulate(t_b - t_a)
             if not finite:
                 stop_reason = f"diverged: non-finite states at t = {t_b:.6g} s"
                 return True
@@ -374,116 +331,88 @@ class Simulation:
                     warnings.warn("energy check: " + msg, stacklevel=3)
             return False
 
-        def do_trip(loop: _UnitLoop, t_now: float) -> None:
+        def do_trip(unit: Unit) -> None:
             nonlocal y
-            loop.tripped = True
+            tripped[unit.name] = True
             mdl.set_states(y)
-            loop.unit.trip()
+            unit.trip()
             y = mdl.get_initial_values()
 
-        def control_step(loop: _UnitLoop, t_k: float) -> bool:
-            """Sample, run the controller and advance the delay; return True if a new trip stops the run."""
-            unit = loop.unit
+        def publish(unit: Unit, t_k: float) -> bool:
+            """Sample, run the controller and publish its duty ratios; return True if a new trip stops the run."""
             mdl.sync(t_k, y)
-            meas = unit.measure(t_k)
-            loop.latest_meas = meas
-            if loop.T_avg is not None:  # rearm the averaging window
-                loop.window_open = loop.T_avg >= loop.T_s * (1.0 - 1e-12)
-                if loop.window_open:    # full-period window opens now
-                    unit.open_window()
-            if loop.n_samples > 1:  # oversampling: this update's samples, oldest first
-                meas = dataclasses.replace(meas, samples=tuple(loop.peeks) + (meas,))
-            loop.peeks, loop.n_samp = [], 1
-            out = loop.ctrl(t_k, meas)
+            out = unit.ctrl(t_k, unit.adc.sample(t_k))
             if out.log is not None:
-                rec.last_ctrl_log[loop.name] = out.log
-                if loop.k % control_every == 0:
-                    rec.control_sample(loop.name, t_k, out.log)
-            new_trip = out.tripped and not loop.tripped
+                rec.last_ctrl_log[unit.name] = out.log
+                if unit.pwm.k % control_every == 0:
+                    rec.control_sample(unit.name, t_k, out.log)
+            new_trip = out.tripped and not tripped[unit.name]
             if new_trip:
-                do_trip(loop, t_k)
-            loop.d = loop.delay(out.d_abc)
-            loop.sync = (out.theta, out.omega)
+                do_trip(unit)
+            unit.pwm.publish(out.d_abc, out.theta, out.omega)
             return new_trip and stop_on_trip
 
-        def schedule(loop: _UnitLoop, t_k: float) -> None:
-            """Get the next period's switching sequence from the modulator and schedule its instants."""
-            seq = loop.modulator(t_k, loop.T_s, loop.d, *loop.sync)
-            dt = np.asarray(seq.dt, dtype=float).tolist()
-            n = len(dt)
-            loop.start, loop.period_end = t_k, t_k + loop.T_s
-            times, t = [], t_k
-            for i in range(n - 1):
-                t = t + dt[i]
-                times.append(t)
-            # switching states as Python complex numbers
-            q =[abc2complex(row) for row in np.asarray(seq.q_abc, dtype=float).tolist()]
-            loop.schedule = [(times[i], q[i + 1]) for i in range(n - 1)]
-            mdl.set_zoh_input(loop.unit.zoh, q[0])
-            loop.next_switch = loop.schedule[0][0] if loop.schedule else math.inf
+        def modulate(unit: Unit, t_k: float) -> None:
+            """Start the unit's PWM period at ``t_k``."""
+            mdl.set_zoh_input(unit.zoh, unit.pwm.modulate(t_k))
 
         # ---------------------------------------------------------------- the event grid
-        for loop in loops:  # first period: start-up duty ratios, no controller call
-            schedule(loop, loop.t_control)
-            loop.k += 1
+        for unit in units:  # first period: start-up duty ratios, no controller call
+            modulate(unit, unit.pwm.t_next)
         while True:
             t_log = n_log * log_period
             t_stop = t_log if t_log < t_final - _EPS else t_final  # the earliest event of all
-            for lp in loops:
-                t_c = lp.t_control
-                t_stop = min(t_stop, t_c if t_c < t_final - _EPS else t_final, lp.next_switch,
-                             lp.t_window, lp.t_sample, getattr(lp.ctrl, "next_event", math.inf))
+            for unit in units:
+                pwm, adc = unit.pwm, unit.adc
+                t_c = pwm.t_next
+                t_stop = min(t_stop, t_c if t_c < t_final - _EPS else t_final, pwm.next_switch,
+                             adc.t_window(t_c), adc.t_sample(pwm.start), getattr(unit.ctrl, "next_event", math.inf))
             if t_stop > t_local + _EPS and advance(t_local, t_stop):
                 stopped = True
                 snapshot(t_local)
                 break
             # 0. over-current check of units whose switching interval ends here
-            for loop in loops:
-                ends = abs(loop.next_switch - t_stop) < _EPS or abs(loop.period_end - t_stop) < _EPS
-                check = getattr(loop.ctrl, "fast_check", None)
-                if ends and check is not None and not loop.tripped:
+            for unit in units:
+                pwm = unit.pwm
+                ends = abs(pwm.next_switch - t_stop) < _EPS or abs(pwm.end - t_stop) < _EPS
+                check = getattr(unit.ctrl, "fast_check", None)
+                if ends and check is not None and not tripped[unit.name]:
                     mdl.set_states(y)
-                    if check(t_local, loop.unit.phase_currents()):
-                        do_trip(loop, t_local)
+                    if check(t_local, unit.adc.phase_currents()):
+                        do_trip(unit)
                         if stop_on_trip:
                             stopped = True
             if stopped:
                 snapshot(t_local)
                 break
             # ADC samples due here, before any loop update
-            for loop in loops:
-                if abs(loop.t_sample - t_stop) < _EPS:
+            for unit in units:
+                if abs(unit.adc.t_sample(unit.pwm.start) - t_stop) < _EPS:
                     mdl.sync(t_local, y)
-                    sample = loop.unit.measure(t_local)
-                    loop.peeks.append(sample)
-                    loop.latest_meas = sample
-                    loop.n_samp += 1
+                    unit.adc.peek(t_local)
             # loop-only updates: latest sample, no PWM/delay advance
-            for loop in loops:
-                if (getattr(loop.ctrl, "next_event", math.inf) <= t_stop + _EPS
-                        and abs(loop.t_control - t_stop) >= _EPS and t_stop < t_final - _EPS):
-                    loop.ctrl.update(t_stop, loop.latest_meas)
+            for unit in units:
+                if (getattr(unit.ctrl, "next_event", math.inf) <= t_stop + _EPS
+                        and abs(unit.pwm.t_next - t_stop) >= _EPS and t_stop < t_final - _EPS):
+                    unit.ctrl.update(t_stop, unit.adc.latest)
             # 1. PWM publications due here (with any due loop updates)
-            for loop in loops:
-                if abs(loop.t_control - t_stop) < _EPS and t_stop < t_final - _EPS:
-                    if control_step(loop, t_stop):
+            for unit in units:
+                if abs(unit.pwm.t_next - t_stop) < _EPS and t_stop < t_final - _EPS:
+                    if publish(unit, t_stop):
                         stopped = True
-                    schedule(loop, t_stop)
-                    loop.k += 1
+                    modulate(unit, t_stop)
             if stopped:
                 snapshot(t_local)
                 break
             # 1b. an averaging window shorter than the PWM update period opens here
-            for loop in loops:
-                if abs(loop.t_window - t_stop) < _EPS:
+            for unit in units:
+                if abs(unit.adc.t_window(unit.pwm.t_next) - t_stop) < _EPS:
                     mdl.sync(t_local, y)
-                    loop.unit.open_window()
-                    loop.window_open = True
+                    unit.adc.open()
             # 2. switching instants due here
-            for loop in loops:
-                while loop.schedule and abs(loop.schedule[0][0] - t_stop) < _EPS:
-                    mdl.set_zoh_input(loop.unit.zoh, loop.schedule.pop(0)[1])
-                loop.next_switch = loop.schedule[0][0] if loop.schedule else math.inf
+            for unit in units:
+                for q in unit.pwm.switches(t_stop, _EPS):
+                    mdl.set_zoh_input(unit.zoh, q)
             # 3. snapshots
             if abs(t_log - t_stop) < _EPS and t_stop < t_final - _EPS:
                 snapshot(t_local)
@@ -496,11 +425,11 @@ class Simulation:
 
         if not stopped:
             # final instant: only the loop/PWM events due here
-            for loop in loops:
-                if abs(loop.t_control - t_local) < _EPS:
-                    control_step(loop, t_local)
-                elif getattr(loop.ctrl, "next_event", math.inf) <= t_local + _EPS:
-                    loop.ctrl.update(t_local, loop.latest_meas)
+            for unit in units:
+                if abs(unit.pwm.t_next - t_local) < _EPS:
+                    publish(unit, t_local)
+                elif getattr(unit.ctrl, "next_event", math.inf) <= t_local + _EPS:
+                    unit.ctrl.update(t_local, unit.adc.latest)
         if not rec.t or rec.t[-1] < t_local - _EPS:
             snapshot(t_local)
         if stop_reason:
@@ -510,7 +439,7 @@ class Simulation:
         for name, unit in system.units.items():
             if hasattr(unit.ctrl, "summary"):
                 summary.update({f"{name}.{k}": v for k, v in unit.ctrl.summary().items()})
-        summary["tripped"] = float(any(lp.tripped for lp in loops))
+        summary["tripped"] = float(any(tripped.values()))
         summary["t_start_s"] = t_start
         summary["t_stop_s"] = float(t_arr[-1]) if len(t_arr) else t_start
         if stop_reason:
@@ -570,12 +499,12 @@ class SystemLoop:
 
         self._cls = Simulation
         self._factories = dict(sim._factories)
-        self.periods = [float(u.T_s) for u in sim.units.values()]
+        self.periods = [float(u.pwm.period) for u in sim.units.values()]
         for u in sim.units.values():
             self.periods.extend(T for T in getattr(u.ctrl, "periods", {}).values() if T)
         self.period = macro_period(self.periods)
         self.w0 = 2.0 * math.pi * sim.p.base.f0
-        self._flags = {k for k, v in sim._state(sim._initial_duty()).items() if isinstance(v, bool)}
+        self._flags = {k for k, v in gather(sim._parts()).items() if isinstance(v, bool)}
         rated = sim.solver.rated_effort
         self._rated = ({lab: float(r) for lab, r in zip(sim.system.model.state_labels(), rated)}
                        if rated is not None else {})

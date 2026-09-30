@@ -1,21 +1,71 @@
-"""DC-side blocks: capacitor, current and voltage sources, and the composed dc link (SI units)."""
+"""The converter's power stage: the ideal bridge and the dc link (capacitor, current or voltage source).
+
+Quantities are SI; ``q`` is the space vector of the phase switching states (or duty ratios).
+"""
 from __future__ import annotations
 
-import math
-from typing import Callable, ClassVar, Optional
+from typing import Any, Callable, ClassVar, Optional
 
-from ..solver.model import Bag, Empty
 from ..solver.energy import PowerPort, StoragePort
-from ..params import DCLinkParams
+from ..solver.model import Bag, Empty, OutputStage
 
-__all__ = ["DCLink", "DCCapacitor", "DCCurrentSource", "DCVoltageSource", "make_dclink"]
+__all__ = ["Bridge", "DCLink", "DCCapacitor", "DCCurrentSource", "DCVoltageSource", "make_dclink"]
 
 
-def _finite(value: float, name: str, minimum: float | None = None) -> float:
-    value = float(value)
-    if not math.isfinite(value) or (minimum is not None and value < minimum):
-        raise ValueError(f"{name} must be finite" + (f" and >= {minimum}" if minimum is not None else ""))
-    return value
+class _BridgeInp(Bag):
+    __slots__ = ("q", "u_dc", "i_c")
+
+
+class _BridgeOut(Bag):
+    __slots__ = ("u_c", "i_dc")
+
+
+class Bridge:
+    """Lossless bridge: ``u_c = q u_dc``, ``i_dc = 1.5 Re(q conj(i_c))`` (SI).
+
+    ``connections`` and ``zoh_connections`` return the power and switching-state wiring.
+    """
+
+    state_names: ClassVar[tuple[str, ...]] = ()
+    outputs_need_inputs: ClassVar[bool] = True
+    dirac: ClassVar[bool] = True
+    output_stages: ClassVar[tuple[OutputStage, ...]] = (
+        OutputStage("set_dc_current", inputs=("q", "i_c"), outputs=("i_dc",)),
+        OutputStage("set_ac_voltage", inputs=("q", "u_dc"), outputs=("u_c",)),
+    )
+
+    def __init__(self) -> None:
+        self.state = Empty()
+        self.inp = _BridgeInp(q=0j, u_dc=0.0, i_c=0j)
+        self.out = _BridgeOut(u_c=0j, i_dc=0.0)
+
+    def set_dc_current(self, t: float) -> None:
+        self.out.i_dc = 1.5 * (self.inp.q * self.inp.i_c.conjugate()).real
+
+    def set_ac_voltage(self, t: float) -> None:
+        self.out.u_c = self.inp.q * self.inp.u_dc
+
+    def set_outputs(self, t: float) -> None:
+        """Evaluate dc current and ac voltage from the current inputs."""
+        self.set_dc_current(t)
+        self.set_ac_voltage(t)
+
+    def rhs(self, t: float):
+        return ()
+
+    def connections(self, dc_link, ac_branch) -> dict:
+        """Return the connections of the bridge to ``dc_link`` and ``ac_branch``."""
+        return {
+            (ac_branch, "u_from"): (self, "u_c"),
+            (self, "i_c"): (ac_branch, "i"),
+            (dc_link, "i_dc"): (self, "i_dc"),
+            (self, "u_dc"): (dc_link, "u_dc"),
+        }
+
+    def zoh_connections(self, label: str) -> dict:
+        """Return the connection of the held switching state ``label`` to ``q``."""
+        return {(self, "q"): label}
+
 
 
 class _DCState(Bag):
@@ -34,11 +84,8 @@ class DCCapacitor:
     """Capacitor ``C`` (F) with series resistance ``R_esr`` (ohm); current positive into the capacitor."""
 
     def __init__(self, u0: float, C: float, R_esr: float = 0.0) -> None:
-        self.C = _finite(C, "C", 0.0)
-        if self.C == 0:
-            raise ValueError("C must be positive")
-        self.R_esr = _finite(R_esr, "R_esr", 0.0)
-        self.state = _DCState(u_C=_finite(u0, "u0"))
+        self.C, self.R_esr = float(C), float(R_esr)
+        self.state = _DCState(u_C=float(u0))
 
     def terminal_voltage(self, i: float) -> float:
         return self.state.u_C + self.R_esr * i
@@ -58,9 +105,7 @@ class DCCurrentSource:
 
     def __init__(self, i_nom: float, k_dc: float = 0.0, u_ref: float = 0.0,
                  ramp: Optional[Callable[[float], float]] = None) -> None:
-        self.i_nom = _finite(i_nom, "i_nom")
-        self.k_dc = _finite(k_dc, "k_dc")
-        self.u_ref = _finite(u_ref, "u_ref")
+        self.i_nom, self.k_dc, self.u_ref = float(i_nom), float(k_dc), float(u_ref)
         self.ramp = ramp
 
     def __call__(self, t: float, u_C: float) -> float:
@@ -74,8 +119,7 @@ class DCVoltageSource:
     """Constant dc voltage source ``u_dc`` (V) with series resistance ``R`` (ohm)."""
 
     def __init__(self, u_dc: float, R: float = 0.0) -> None:
-        self.u_dc = _finite(u_dc, "u_dc", 0.0)
-        self.R = _finite(R, "R", 0.0)
+        self.u_dc, self.R = float(u_dc), float(R)
 
     def terminal_voltage(self, i: float) -> float:
         return self.u_dc - self.R * i
@@ -156,8 +200,7 @@ class DCLink:
         return self.out.u_dc * self.out.i_src
 
 
-def make_dclink(cfg: DCLinkParams,
-                ramp: Optional[Callable[[float], float]] = None) -> DCLink:
+def make_dclink(cfg: Any, ramp: Optional[Callable[[float], float]] = None) -> DCLink:
     """Build a :class:`DCLink` from SI parameters; source type ``"current"``, ``"voltage"`` or ``"none"``."""
     capacitor = None
     if cfg.capacitor is not None:

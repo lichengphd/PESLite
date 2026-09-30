@@ -75,11 +75,9 @@ def test_loop_registration_and_loop_owned_validation():
 
 
 def test_controller_interfaces_have_one_definition():
-    from peslite.assembly.protocols import Measurement as CompatibilityMeasurement
-    from peslite.sensing.sampler import Measurement as SamplerMeasurement
+    from peslite.components.adc import Measurement as ADCMeasurement
 
-    assert CompatibilityMeasurement is Measurement
-    assert SamplerMeasurement is Measurement
+    assert ADCMeasurement is Measurement
 
 
 def test_control_imports_only_itself_and_the_solver_kernel():
