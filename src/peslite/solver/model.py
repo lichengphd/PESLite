@@ -1,7 +1,12 @@
-"""Continuous-time model assembled from subsystems and signal connections.
+"""Continuous-time model: what a subsystem is, subsystems connected by signals into one model, and
+named states.
 
-States are packed into a flat real vector (two entries per complex state)
-and named ``<subsystem>.<state>``.
+A subsystem has ``state``, ``inp`` and ``out`` records (:class:`Bag`) and state derivatives; the
+:class:`Model` packs the states of its subsystems into a flat real vector (two entries per complex
+state) named ``<subsystem>.<state>`` and evaluates their outputs and connections in signal order.
+Every part with a state (a model, a controller, a delay line, a solver) is :class:`Stateful`: it
+gives its state by name, parts are composed by dotted names (``ctrl.vsc.pll``), flattened to the
+real columns of ``states.csv`` and resolved from ``initial.states`` values.
 """
 
 from __future__ import annotations
@@ -10,15 +15,221 @@ import keyword
 import linecache
 import re
 from collections import Counter, deque
-from typing import Any, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any, ClassVar, Mapping, Protocol, Sequence, runtime_checkable
 
 import numpy as np
 from numpy.typing import NDArray
 
 from . import energy as _energy
-from .protocols import OutputStage, Subsystem
 
-__all__ = ["Model", "GroupPlan"]
+__all__ = ["ConfigError", "Bag", "Empty", "OutputStage", "Subsystem", "Model", "GroupPlan",
+           "Stateful", "join", "gather", "scatter", "flatten", "resolve", "expand_aliases", "assign"]
+
+
+# ------------------------------------------------------------------ subsystems
+
+class ConfigError(ValueError):
+    """Invalid model or solver configuration."""
+
+
+class Bag:
+    """Record whose ``__slots__`` fields default to ``0.0`` unless given as keywords (``state``, ``inp``, ``out``)."""
+
+    __slots__ = ()
+
+    def __init__(self, **kwargs):
+        for name in self.__slots__:
+            setattr(self, name, kwargs.get(name, 0.0))
+
+
+class Empty(Bag):
+    """Record with no fields."""
+
+    __slots__ = ()
+
+
+@dataclass(frozen=True)
+class OutputStage:
+    """One output method of a subsystem and its direct input dependencies.
+
+    ``method``: name of a method taking ``t``; ``inputs``: ``inp`` fields it reads;
+    ``outputs``: ``out`` fields it writes. Every output field needs exactly one producer.
+    """
+
+    method: str
+    inputs: tuple[str, ...]
+    outputs: tuple[str, ...]
+
+
+@runtime_checkable
+class Subsystem(Protocol):
+    """Continuous block with ``state``, ``inp`` and ``out`` records and state derivatives.
+
+    ``state_names``: packing order (a complex state takes two real entries);
+    ``outputs_need_inputs``: whether ``set_outputs`` reads ``inp``; optional ``output_stages``
+    (tuple of :class:`OutputStage`) replaces ``set_outputs``.
+    ``out`` and connected ``inp`` fields are current when ``rhs`` runs.
+    """
+
+    state: Any
+    inp: Any
+    out: Any
+    state_names: ClassVar[tuple[str, ...]]
+    outputs_need_inputs: ClassVar[bool]
+
+    def set_outputs(self, t: float) -> None:
+        """Update ``out`` from ``state`` (and ``inp`` if ``outputs_need_inputs``)."""
+
+    def rhs(self, t: float) -> Sequence[complex | float]:
+        """Time derivatives of the states, in ``state_names`` order."""
+
+
+# ------------------------------------------------------------------ named states
+
+@runtime_checkable
+class Stateful(Protocol):
+    """Named state access for initialization and continuation.
+
+    ``get_state()`` returns ``{name: float | complex | bool}`` (``""`` names the part itself);
+    ``set_state(values)`` accepts any subset of those names.
+    """
+
+    def get_state(self) -> dict[str, Any]: ...
+
+    def set_state(self, values: Mapping[str, Any]) -> None: ...
+
+
+def join(prefix: str, name: str) -> str:
+    """Join two name parts with a dot; an empty part is dropped."""
+    if not prefix:
+        return name
+    return f"{prefix}.{name}" if name else prefix
+
+
+def gather(parts: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the states of the named parts with keys prefixed by the part names.
+
+    Parts without ``get_state`` are skipped; an empty part name adds no prefix.
+    """
+    out: dict[str, Any] = {}
+    for pname, part in parts.items():
+        get = getattr(part, "get_state", None)
+        if get is None:
+            continue
+        if pname:
+            for key, value in get().items():
+                out[f"{pname}.{key}" if key else pname] = value
+        else:
+            out.update(get())
+    return out
+
+
+def scatter(parts: Mapping[str, Any], values: Mapping[str, Any]) -> None:
+    """Pass each part the entries of ``values`` prefixed with its name."""
+    if not values:
+        return
+    for pname, part in parts.items():
+        if not isinstance(part, Stateful):
+            continue
+        own = {key: values[join(pname, key)] for key in part.get_state() if join(pname, key) in values}
+        if own:
+            part.set_state(own)
+
+
+def flatten(states: Mapping[str, Any]) -> dict[str, float]:
+    """Convert states to real columns: complex ``x`` -> ``x.re``, ``x.im``; flags -> 0.0 / 1.0."""
+    out: dict[str, float] = {}
+    for key, value in states.items():
+        if isinstance(value, complex):
+            out[key + ".re"] = value.real
+            out[key + ".im"] = value.imag
+        elif isinstance(value, bool):
+            out[key] = 1.0 if value else 0.0
+        else:
+            out[key] = float(value)
+    return out
+
+
+def expand_aliases(given: Mapping[str, Any], aliases: Mapping[str, str]) -> dict[str, Any]:
+    """Rename alias keys (and their ``.re`` / ``.im`` parts) to canonical names."""
+    out: dict[str, Any] = {}
+    for key, value in given.items():
+        for alias, canonical in aliases.items():
+            if key == alias or key.startswith(alias + "."):
+                key = canonical + key[len(alias):]
+                break
+        if key in out:
+            raise ValueError(f"state {key!r} is given twice (directly and through an alias)")
+        out[key] = value
+    return out
+
+
+def _convert(where: str, target: Any, value: Any, presets: Any, name: str = "") -> Any:
+    if isinstance(value, str):
+        word = value.strip()
+        if callable(presets):  # presets(state name, keyword)
+            try:
+                value = presets(name or where, word)
+            except ValueError as exc:
+                raise ValueError(f"{where}: {exc.args[0] if exc.args else exc}") from None
+        elif word in presets:
+            value = presets[word]
+        else:
+            known = ", ".join(sorted(presets)) or "none"
+            raise ValueError(f"{where}: unknown keyword {value!r} (keywords here: {known})")
+    if isinstance(value, (list, tuple)):
+        if not isinstance(target, complex) or len(value) != 2:
+            raise ValueError(f"{where}: a [re, im] pair only fits a complex state")
+        return complex(float(value[0]), float(value[1]))
+    if isinstance(target, complex):
+        return complex(value)
+    if isinstance(value, complex):
+        raise ValueError(f"{where}: complex value {value} for a real state")
+    if isinstance(target, bool):
+        return bool(round(float(value)))
+    return float(value)
+
+
+def resolve(template: Mapping[str, Any], given: Mapping[str, Any],
+            presets: Any = None, where: str = "initial.states") -> dict[str, Any]:
+    """Convert the entries of ``given`` to the types of the matching ``template`` entries.
+
+    ``template``: state name -> current value. ``given``: state names or ``x.re``/``x.im`` parts;
+    values are a number, ``[re, im]``, 0/1 or true/false for a flag, or a keyword of ``presets``.
+    ``presets``: mapping keyword -> value, or callable ``(state name, keyword) -> value``.
+    Raises KeyError for unknown names.
+    """
+    presets = presets or {}
+    out: dict[str, Any] = {}
+    parts: dict[str, dict[str, float]] = {}
+    for name, value in given.items():
+        if name in template:
+            out[name] = _convert(f"{where}.{name}", template[name], value, presets, name)
+            continue
+        base, _, part = name.rpartition(".")
+        if part in ("re", "im") and isinstance(template.get(base), complex):
+            parts.setdefault(base, {})[part] = _convert(f"{where}.{name}", 0.0, value, presets, base)
+            continue
+        known = ", ".join(flatten(template))
+        raise KeyError(f"{where}: unknown state {name!r}. Known states: {known}")
+    for base, pr in parts.items():
+        if base in out:
+            raise ValueError(f"{where}: {base!r} is given both whole and by its .re/.im parts")
+        t = template[base]
+        out[base] = complex(pr.get("re", t.real), pr.get("im", t.imag))
+    return out
+
+
+def assign(obj: Any, values: Mapping[str, Any], names: tuple[str, ...]) -> None:
+    """Set attributes of ``obj`` from ``values``; keys must be in ``names``."""
+    for key, value in values.items():
+        if key not in names:
+            raise KeyError(f"{type(obj).__name__} has no state {key!r} (states: {', '.join(names)})")
+        setattr(obj, key, value)
+
+
+# ------------------------------------------------------------------ the model
 
 Connection = tuple[Any, str]
 
@@ -500,27 +711,14 @@ class Model:
 
     # ---------------------------------------------------------------- energy
     def energy_balance(self, t: float, y: NDArray[np.float64]) -> "_energy.EnergyReport":
-        """Energy accounting at ``(t, y)`` from the subsystems' declarations (see :mod:`peslite.phs.energy`)."""
+        """Energy accounting at ``(t, y)`` from the subsystems' declarations (see :mod:`peslite.solver.energy`)."""
         return _energy.balance(self, t, y)
-
-    def verify_energy(self, rtol: float = 1e-8, zoh: Mapping[str, Any] | None = None) -> list[str]:
-        """Check the energy declarations against the right-hand sides at random states.
-
-        Returns a list of inconsistencies (empty if consistent); undeclared subsystems are skipped.
-        """
-        return _energy.verify(self, rtol=rtol, zoh=dict(zoh) if zoh else None)
 
     def ph_report(self, zoh: Mapping[str, Any] | None = None, groups: Mapping[str, Any] | None = None,
                   rtol: float = 1e-8, hold: Mapping[str, float] | None = None) -> "_energy.PHReport":
-        """Return the port-Hamiltonian report of the model (:class:`peslite.phs.energy.PHReport`).
+        """Return the port-Hamiltonian report of the model (:class:`peslite.solver.energy.PHReport`).
 
         ``groups``: result of :meth:`groups`; ``hold``: ``{"step": dt, "window": W}`` hold times in s.
         """
         return _energy.ph_report(self, zoh=dict(zoh) if zoh else None, rtol=rtol,
                                  groups=dict(groups) if groups else None, hold=dict(hold) if hold else None)
-
-    def defaulted(self) -> list[str]:
-        """Names of the subsystems accounted with the default energy declaration."""
-        return [n for n, spec in self.energy_specs.items() if spec.kind == "default"]
-
-    undeclared = defaulted  # alias

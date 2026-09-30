@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from ..phs.states import assign
+from ..solver.model import assign
 from ..firmware.blocks import clamp
 
 __all__ = ["DCVoltageController"]

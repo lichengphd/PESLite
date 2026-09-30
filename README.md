@@ -136,7 +136,7 @@ pyproject.toml
 src/peslite/          installable package
   simulation.py       simulation loop and command line
   __init__.py         package exports
-  phs/                circuit model, energy accounting, solvers
+  solver/             circuit model, energy accounting, fixed/adaptive/multirate solvers
   params/             parameter schema, validation, file I/O
   power/              sources, lines, buses, bridge, dc link
   control/            converter control

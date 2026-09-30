@@ -8,8 +8,8 @@ from __future__ import annotations
 import math
 import warnings
 
-from ..phs.protocols import ConfigError
-from ..phs.solvers import ADAPTIVE_METHODS, FIXED_METHODS
+from ..solver.model import ConfigError
+from ..solver.integrators import ADAPTIVE_METHODS, FIXED_METHODS
 
 from .schema import Params
 

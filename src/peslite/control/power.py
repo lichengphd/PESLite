@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from ..firmware.blocks import LowPass1
-from ..phs.states import gather, scatter
+from ..solver.model import gather, scatter
 
 __all__ = ["PowerCalculator"]
 

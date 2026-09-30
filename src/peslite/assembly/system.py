@@ -7,8 +7,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Optional, Sequence
 
-from ..phs.model import Model
-from ..phs.states import gather, scatter
+from ..solver.model import Model, gather, scatter
 from ..params import Params
 from ..power import RCNode, RLBranch, ThreePhaseSource
 from .events import SourceScenario
@@ -49,7 +48,7 @@ class _Source:
 
 
 class System:
-    """Buses, branches, sources and units wired into one :class:`~peslite.phs.model.Model`."""
+    """Buses, branches, sources and units wired into one :class:`~peslite.solver.model.Model`."""
 
     def __init__(self, p: Params, parts: Optional[Mapping[str, Any]] = None,
                  elements: Sequence[Any] = ()) -> None:

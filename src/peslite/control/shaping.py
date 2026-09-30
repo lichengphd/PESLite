@@ -9,7 +9,7 @@ import math
 from typing import Any, Mapping
 
 from ..firmware.blocks import HighPass1
-from ..phs.states import gather, scatter
+from ..solver.model import gather, scatter
 
 __all__ = ["VirtualImpedance", "VirtualAdmittance", "ActiveDamping"]
 

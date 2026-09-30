@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import ClassVar
 
-from ..phs.containers import Bag
-from ..phs.protocols import PowerPort, StoragePort
+from ..solver.model import Bag
+from ..solver.energy import PowerPort, StoragePort
 
 __all__ = ["RLBranch", "RCNode"]
 

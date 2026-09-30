@@ -1,12 +1,11 @@
-"""Power-electronics converter simulation built on the :mod:`peslite.phs` model and solver kernel.
+"""Power-electronics converter simulation built on the :mod:`peslite.solver` model and solver kernel.
 
 Plant quantities are in SI; controllers work in each unit's pu bases.
 """
 
-from .phs.model import Model
-from .phs.solvers import AdaptiveSolver, DormandPrince45, FixedStepSolver, MultirateSolver, make_solver
+from .solver import AdaptiveSolver, DormandPrince45, FixedStepSolver, Model, MultirateSolver, make_solver
 
-from . import (phs, assembly, control, firmware, modulation, params, power, protection, results,
+from . import (solver, assembly, control, firmware, modulation, params, power, protection, results,
                sensing)
 from .assembly import (UniteType, ConverterFirmware, System, Unit,
                        SourceScenario, UnitScenario, make_controller)
@@ -21,7 +20,7 @@ __version__ = "0.1.1"
 
 __all__ = [
     "assembly", "control", "firmware", "modulation", "params", "power", "protection",
-    "results", "sensing", "simulation", "phs",
+    "results", "sensing", "simulation", "solver",
     "Params", "load", "System", "Unit", "MeasurementPorts", "Model", "SourceScenario", "UnitScenario",
     "Simulation", "SimulationResult", "UniteType", "main",
     "make_controller", "make_modulator", "make_solver", "ConverterFirmware",

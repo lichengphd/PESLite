@@ -5,7 +5,7 @@ from __future__ import annotations
 import cmath
 from typing import Any, Mapping
 
-from ..phs.states import assign
+from ..solver.model import assign
 
 __all__ = ["SRFPLL"]
 

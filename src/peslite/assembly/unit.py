@@ -11,7 +11,7 @@ from typing import Any, Callable, Mapping, Optional
 
 import numpy as np
 
-from ..phs.states import gather, scatter
+from ..solver.model import gather, scatter
 from ..control import ControlGraph, default_wiring
 from ..firmware import ComputationDelay, ModulationLimiter
 from ..modulation import make_modulator, make_pwm_method

@@ -4,9 +4,9 @@ Electrical inputs without suffix are SI values; ``_pu`` names are per unit.
 Plant quantities are stored in SI, controller quantities in pu.
 """
 
-from ..phs.protocols import ConfigError
+from ..solver.model import ConfigError
 from .schema import to_dict
-from ..phs.solvers import ADAPTIVE_METHODS, FIXED_METHODS
+from ..solver.integrators import ADAPTIVE_METHODS, FIXED_METHODS
 
 from .base import BaseValues, DCBase
 from .io import dump, from_dict, load, read_initial

@@ -158,7 +158,7 @@ def split_error_bound(solver: Any, loop: LoopMap, t: np.ndarray, states: dict[st
                       prefix: str = "") -> dict[str, Any]:
     """Estimate the split error of a finished multirate run.
 
-    ``solver``: the :class:`~peslite.phs.solvers.MultirateSolver` that ran; ``loop``: the
+    ``solver``: the :class:`~peslite.solver.multirate.MultirateSolver` that ran; ``loop``: the
     application's :class:`LoopMap`; ``t``: logged instants (s); ``states``: recorded state table
     including ``"t"``; ``rows``: number of rows to linearise at; ``labels``: the model's state
     labels; ``prefix``: prefix of those labels in the state table.

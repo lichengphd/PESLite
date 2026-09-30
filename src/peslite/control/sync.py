@@ -9,7 +9,7 @@ import cmath
 from typing import Any, Mapping
 
 from ..assembly.protocols import SyncOutput
-from ..phs.states import assign
+from ..solver.model import assign
 from ..params import DroopParams, DVOCParams, GFMParams, MatchingParams, PSCParams, VSGParams
 
 __all__ = ["PSC", "Droop", "VSG", "DVOC", "Matching", "make_law"]

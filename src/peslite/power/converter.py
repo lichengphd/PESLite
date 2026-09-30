@@ -7,8 +7,7 @@ from __future__ import annotations
 
 from typing import ClassVar
 
-from ..phs.containers import Bag, Empty
-from ..phs.protocols import OutputStage
+from ..solver.model import Bag, Empty, OutputStage
 
 __all__ = ["Bridge"]
 

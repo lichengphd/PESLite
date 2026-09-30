@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import peslite  # noqa: E402
-from peslite.phs.protocols import SolverStep  # noqa: E402
+from peslite.solver import SolverStep  # noqa: E402
 from peslite.assembly import UniteType  # noqa: E402
 from peslite.assembly.protocols import SyncOutput  # noqa: E402
 

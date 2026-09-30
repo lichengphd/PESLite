@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from ..phs.protocols import ConfigError
+from ..solver.model import ConfigError
 from .schema import (PLLParams, CurrentLoopParams, DCVoltageLoopParams, PSCParams,
                      DroopParams, VSGParams, DVOCParams, MatchingParams, build)
 

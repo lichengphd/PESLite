@@ -17,10 +17,10 @@ from typing import Any, Callable, Mapping, Optional
 
 import numpy as np
 
-from .phs.protocols import Solver
-from .phs.solvers import make_solver
-from .phs.splitbound import split_error_bound
-from .phs.states import expand_aliases, flatten, gather, resolve, scatter
+from .solver.integrators import Solver
+from .solver.multirate import make_solver
+from .solver.splitbound import split_error_bound
+from .solver.model import expand_aliases, flatten, gather, resolve, scatter
 from .params import ConfigError, Params, load
 from .assembly.protocols import Controller, Delay, Modulator
 from .results import Recorder, SimulationResult

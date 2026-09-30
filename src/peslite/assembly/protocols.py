@@ -1,7 +1,7 @@
 """Protocols and data classes shared by sensing, control, firmware, modulation and assembly.
 
 Signal chain: Controller -> Delay -> Modulator -> solver. Model, energy and state
-protocols are in :mod:`peslite.phs.protocols`.
+protocols are in :mod:`peslite.solver`.
 """
 
 from __future__ import annotations
@@ -66,7 +66,7 @@ class UnitLike(Protocol):
 class SystemLike(Protocol):
     """System as used by the simulation loop: one model and its converter units."""
 
-    model: Any  # a peslite.phs.model.Model
+    model: Any  # a peslite.solver.model.Model
     units: Any  # a mapping of name to UnitLike
 
     def signals(self, t: float) -> dict[str, Any]: ...

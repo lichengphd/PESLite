@@ -1,7 +1,8 @@
-"""Multirate fixed-step solver: named subsystems step at ``dt/N`` or advance over windows of ``M*dt``.
+"""Multirate fixed-step solver, and :func:`make_solver`, which builds the solver of the settings.
 
-Windowed subsystems advance on window-averaged inputs while the rest sees their extrapolated states;
-with every step equal to ``dt`` the result equals :class:`FixedStepSolver`.
+Named subsystems step at ``dt/N`` or advance over windows of ``M*dt``. Windowed subsystems advance on
+window-averaged inputs while the rest sees their extrapolated states; with every step equal to
+``dt`` the result equals :class:`~peslite.solver.integrators.FixedStepSolver`.
 """
 
 from __future__ import annotations
@@ -13,55 +14,53 @@ from typing import Any, Mapping, Optional
 import numpy as np
 from numpy.typing import NDArray
 
-from ..energy import signal
-from ..protocols import RHS, Solver, SolverStep
-from .adaptive import AdaptiveSolver, DormandPrince45
-from .fixed import FixedStepSolver
+from .energy import re_product, signal
+from .integrators import RHS, TABLEAUS, FixedStepSolver, SolverStep, combine, integrator, stage_state
+from .model import ConfigError
 
-__all__ = ["MultirateSolver"]
+__all__ = ["MultirateSolver", "HeldStorage", "make_solver", "parse_step"]
 
-_FIXED = ("euler", "heun", "rk4")
-# explicit Runge-Kutta tableaus: (c, a_rows, b); a_rows[j - 1] holds the coefficients of stage j
-_TABLEAUS: dict[str, tuple[tuple[float, ...], tuple[tuple[float, ...], ...], tuple[float, ...]]] = {
-    "euler": ((0.0,), (), (1.0,)),
-    "heun": ((0.0, 1.0), ((1.0,),), (0.5, 0.5)),
-    "rk4": ((0.0, 0.5, 0.5, 1.0), ((0.5,), (0.0, 0.5), (0.0, 0.0, 1.0)), (1 / 6, 1 / 3, 1 / 3, 1 / 6)),
-}
 _EPS = 1e-12
 
 
-def _re(a: Any, b: Any) -> float:
-    """``Re(a conj(b))`` for real or complex signals."""
-    return float((a * np.conj(b)).real) if isinstance(a, complex) or isinstance(b, complex) else float(a * b)
+def make_solver(cfg: Any, model: Optional[Any] = None, ratings: Any = None):
+    """Build the solver of the ``simulation.solver`` settings: single-rate, or multirate when
+    ``cfg.subsystems`` names subsystems of ``model`` on their own step.
+
+    ``ratings``: mapping storage scale -> (rated effort, rated flow), or a callable
+    ``(subsystem_name, storage) -> (effort, flow)``.
+    """
+    if cfg.type == "fixed" and cfg.subsystems:
+        if model is None:
+            raise ConfigError("simulation.solver.subsystems needs the model whose subsystems it names")
+        try:
+            return MultirateSolver(model, cfg.subsystems, cfg.dt, cfg.method, cfg.sweeps, cfg.rtol, cfg.atol,
+                                   ratings)
+        except (KeyError, ValueError) as exc:
+            raise ConfigError(f"simulation.solver.subsystems: {exc.args[0]}") from None
+    return integrator(cfg.method, cfg.dt, cfg.rtol, cfg.atol, cfg.max_step, cfg.warm_start)
 
 
-def _normalize_step(name: str, value: Any) -> tuple[float, Optional[str]]:
+def parse_step(value: Any) -> tuple[float, Optional[str]]:
     """Parse a step (number relative to ``dt`` or ``{"step": ..., "method": ...}``) into ``(ratio, method)``."""
     method = None
     if isinstance(value, Mapping):
         if "step" not in value:
-            raise ValueError(f"subsystem {name!r}: a mapping needs a 'step'")
+            raise ValueError("a mapping needs a 'step'")
         method = value.get("method")
         value = value["step"]
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0.0:
-        raise ValueError(f"subsystem {name!r}: the step must be a positive number (relative to dt)")
+    if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+            or value <= 0.0):
+        raise ValueError(f"the step must be a positive number (relative to dt), got {value!r}")
     r = float(value)
     if r >= 1.0:
         if abs(r - round(r)) > 1e-9:
-            raise ValueError(f"subsystem {name!r}: a step longer than dt must be an integer multiple, got {r}")
+            raise ValueError(f"a step longer than dt must be an integer multiple, got {r}")
         return float(round(r)), method
     inv = 1.0 / r
     if abs(inv - round(inv)) > 1e-9:
-        raise ValueError(f"subsystem {name!r}: a step shorter than dt must be 1/N with N an integer, got {r}")
+        raise ValueError(f"a step shorter than dt must be 1/N with N an integer, got {r}")
     return 1.0 / round(inv), method
-
-
-def _outer_solver(method: str, window: float, rtol: float, atol: float) -> Solver:
-    if method in _FIXED:
-        return FixedStepSolver(window, method)
-    if method == "DP45":
-        return DormandPrince45(rtol, atol)
-    return AdaptiveSolver(method, rtol, atol)
 
 
 @dataclass(frozen=True)
@@ -88,13 +87,14 @@ class MultirateSolver:
     ``steps``: ``{name: ratio}`` or ``{name: {"step": ratio, "method": ...}}``, ratio ``1/N`` or an
     integer ``M``; ``method``: ``"euler"``, ``"heun"`` or ``"rk4"``; ``sweeps``: coupling sweeps
     for ``1/N`` steps (>= 1); ``rtol`` / ``atol``: for an adaptive windowed method; ``ratings``:
-    as in :func:`make_solver`. ``n_system``, ``n_inner`` and ``n_outer`` count RHS evaluations.
+    as in :func:`make_solver`. ``n_system``, ``n_inner`` and ``n_outer`` count RHS evaluations;
+    ``groups``: the ``{label: GroupPlan}`` of the split (see :meth:`~peslite.solver.model.Model.groups`).
     """
 
     def __init__(self, model: Any, steps: Mapping[str, Any], dt: float, method: str = "rk4",
                  sweeps: int = 2, rtol: float = 1e-6, atol: float = 1e-9,
                  ratings: Any = None) -> None:
-        if method not in _TABLEAUS:
+        if method not in TABLEAUS:
             raise ValueError(f"unknown fixed-step method {method!r}")
         if int(sweeps) < 1:
             raise ValueError("sweeps must be >= 1")
@@ -114,7 +114,10 @@ class MultirateSolver:
         outer: dict[str, float] = {}
         outer_method: Optional[str] = None
         for name, value in steps.items():
-            r, meth = _normalize_step(name, value)
+            try:
+                r, meth = parse_step(value)
+            except ValueError as exc:
+                raise ValueError(f"subsystem {name!r}: {exc}") from None
             if r < 1.0:
                 if meth is not None and meth != method:
                     raise ValueError(f"subsystem {name!r}: a step inside the system step shares the system "
@@ -126,13 +129,11 @@ class MultirateSolver:
                     if outer_method is not None and meth != outer_method:
                         raise ValueError("subsystems on windows share one method")
                     outer_method = meth
-        self.inner_names = tuple(inner)
-        self.outer_names = tuple(outer)
         self.ratio = int(round(1.0 / min(inner.values()))) if inner else 1  # steps per system step
         self.window_steps = int(round(min(outer.values()))) if outer else 1  # system steps per window
         assignment = {n: "inner" for n in inner}
         assignment.update({n: "outer" for n in outer})
-        groups = model.groups(assignment)  # validates the names
+        self.groups = groups = model.groups(assignment)  # validates the names
         self.system = groups["system"]
         self.inner = groups.get("inner")
         self.outer = groups.get("outer")
@@ -141,7 +142,7 @@ class MultirateSolver:
         self._mask_moving = ~self._mask_outer  # what the system step advances (system and inner states)
         self.window = self.window_steps * self.dt
         self.outer_method = outer_method or method
-        self._outer_solver = (_outer_solver(self.outer_method, self.window, rtol, atol)
+        self._outer_solver = (integrator(self.outer_method, self.window, rtol, atol)
                               if self.outer is not None else None)
         self._single = FixedStepSolver(dt, method)  # single-rate path
         # window bookkeeping (outer group)
@@ -413,7 +414,7 @@ class MultirateSolver:
                 flow = 0.0
                 for name, sign in st.flows:
                     flow += sign * signal(sub, name)
-                self._acc_energy[idx] = self._acc_energy.get(idx, 0.0) + weight * st.scale * _re(e_seen, flow)
+                self._acc_energy[idx] = self._acc_energy.get(idx, 0.0) + weight * st.scale * re_product(e_seen, flow)
                 # running flow integral
                 run = self._acc_flow.get(idx, 0.0) + weight * flow
                 self._acc_flow[idx] = run
@@ -428,7 +429,7 @@ class MultirateSolver:
         return k
 
     def _macro_step(self, t0: float, H: float, y0: NDArray[np.float64]) -> NDArray[np.float64]:
-        c, a, b = _TABLEAUS[self.method]
+        c, a, b = TABLEAUS[self.method]
         m = self.ratio
         h = H / m
         moving = self._mask_moving
@@ -440,14 +441,8 @@ class MultirateSolver:
             if j == 0:
                 y_i = y_s = y0
             else:
-                acc_i = acc_s = None
-                for coef, k in zip(a[j - 1], ks):
-                    if coef == 0.0:
-                        continue
-                    acc_i = coef * h * k if acc_i is None else acc_i + coef * h * k
-                    acc_s = coef * H * k if acc_s is None else acc_s + coef * H * k
-                y_i = y0 + acc_i
-                y_s = y0 + acc_s
+                y_i = stage_state(y0, h, a[j - 1], ks)
+                y_s = stage_state(y0, H, a[j - 1], ks)
             k_s = self._f_system(t0 + c[j] * H, self._place_outer(t0 + c[j] * H, y_s), b[j] * H if last_sweep else 0.0)
             k_sys.append(k_s)
             if self.inner is not None:
@@ -455,14 +450,14 @@ class MultirateSolver:
                 ks.append(k_i + k_s)
             else:
                 ks.append(k_s)
-        y1 = self._combine(y0, H, ks)  # system states at t0 + H (inner entries: discarded unless m == 1)
+        y1 = combine(self.method, y0, H, ks)  # system states at t0 + H (inner entries: discarded unless m == 1)
         if self.inner is None or m == 1:
             self._track_flow(t0 + H)
             return np.where(moving, y1, y0) if self._anchor is not None else y1
         mask_i = self._mask_inner
         # -- remaining inner steps on Hermite-interpolated system states
         k_end = self._f_system(t0 + H, self._place_outer(t0 + H, y1), 0.0)
-        traj = self._inner_steps(t0, h, m, y0, y1, k_sys[0], k_end, first=self._combine(y0, h, ks))
+        traj = self._inner_steps(t0, h, m, y0, y1, k_sys[0], k_end, first=combine(self.method, y0, h, ks))
         seen = y0 + H * (ks[-2] if len(ks) > 1 else ks[0])  # inner states seen by the last system stage
         # -- coupling sweeps
         for sweep in range(2, self.sweeps + 1):
@@ -474,14 +469,9 @@ class MultirateSolver:
                 if j == 0:
                     y_s = y0
                 else:
-                    acc = None
-                    for coef, k in zip(a[j - 1], ks2):
-                        if coef == 0.0:
-                            continue
-                        acc = coef * H * k if acc is None else acc + coef * H * k
-                    y_s = np.where(mask_i, self._inner_at(traj, t0, h, tj), y0 + acc)
+                    y_s = np.where(mask_i, self._inner_at(traj, t0, h, tj), stage_state(y0, H, a[j - 1], ks2))
                 ks2.append(self._f_system(tj, self._place_outer(tj, y_s), b[j] * H if last_sweep else 0.0))
-            y1 = np.where(mask_i, traj[-1], self._combine(y0, H, ks2))
+            y1 = np.where(mask_i, traj[-1], combine(self.method, y0, H, ks2))
             k_end = self._f_system(t0 + H, self._place_outer(t0 + H, y1), 0.0)
             traj = self._inner_steps(t0, h, m, y0, y1, ks2[0], k_end)
         out = np.where(mask_i, traj[-1], y1)
@@ -502,7 +492,7 @@ class MultirateSolver:
                      k0: NDArray[np.float64], k1: NDArray[np.float64],
                      first: Optional[NDArray[np.float64]] = None) -> list[NDArray[np.float64]]:
         """Run ``m`` inner steps on interpolated system states; return the ``m + 1`` step-end states."""
-        c, a, _b = _TABLEAUS[self.method]
+        c, a, _b = TABLEAUS[self.method]
         mask_i = self._mask_inner
         H = m * h
         s0 = np.where(mask_i, 0.0, y0)
@@ -530,14 +520,9 @@ class MultirateSolver:
                 if j == 0:
                     yj = np.where(mask_i, y, system_at(tj))
                 else:
-                    acc = None
-                    for coef, k in zip(a[j - 1], k_list):
-                        if coef == 0.0:
-                            continue
-                        acc = coef * h * k if acc is None else acc + coef * h * k
-                    yj = np.where(mask_i, y + acc, system_at(tj))
+                    yj = np.where(mask_i, stage_state(y, h, a[j - 1], k_list), system_at(tj))
                 k_list.append(self._f_inner(tj, self._place_outer(tj, yj)))
-            y = np.where(mask_i, self._combine(y, h, k_list), y)
+            y = np.where(mask_i, combine(self.method, y, h, k_list), y)
             traj.append(y)
             t += h
         return traj
@@ -552,14 +537,6 @@ class MultirateSolver:
         if frac <= 1e-9 or i == len(traj) - 1:
             return traj[i]
         return traj[i] + frac * (traj[i + 1] - traj[i])
-
-    def _combine(self, y: NDArray[np.float64], h: float, ks: list) -> NDArray[np.float64]:
-        """Final RK combination, with the same arithmetic as :class:`FixedStepSolver`."""
-        if self.method == "rk4":
-            return y + (h / 6.0) * (ks[0] + 2.0 * (ks[1] + ks[2]) + ks[3])
-        if self.method == "heun":
-            return y + 0.5 * h * (ks[0] + ks[1])
-        return y + h * ks[0]
 
     # -------------------------------------------------------------- windows
     def _close_window(self, y: NDArray[np.float64]) -> None:
@@ -603,7 +580,7 @@ class MultirateSolver:
                 where, _, attr = name.partition(".")
                 flow += sign * self._acc.get((id(getattr(sub, where)), attr), 0.0)
             # energy residual: delivered minus accepted by the storage
-            r = self._acc_energy.get(idx, 0.0) - st.scale * _re(0.5 * (e_old + e_new), flow)
+            r = self._acc_energy.get(idx, 0.0) - st.scale * re_product(0.5 * (e_old + e_new), flow)
             residual += r
             self._win_abs[idx] = max(self._win_abs.get(idx, 0.0), abs(r))
             # sub-window excursion of the effort

@@ -9,8 +9,8 @@ from __future__ import annotations
 import math
 from typing import Callable, ClassVar, Optional
 
-from ..phs.containers import Bag, Empty
-from ..phs.protocols import PowerPort, StoragePort
+from ..solver.model import Bag, Empty
+from ..solver.energy import PowerPort, StoragePort
 
 __all__ = ["ThreePhaseSource"]
 

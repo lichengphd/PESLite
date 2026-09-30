@@ -12,7 +12,7 @@ from typing import Any, Mapping
 
 from ..params import ProtectionParams
 from ..firmware.blocks import HoldTimer, MovingWindow
-from ..phs.states import gather, scatter
+from ..solver.model import gather, scatter
 
 __all__ = ["Protection", "TripEvent", "ProtectionStats"]
 

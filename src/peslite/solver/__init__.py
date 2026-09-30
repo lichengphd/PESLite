@@ -1,0 +1,18 @@
+"""The port-Hamiltonian model kernel and its fixed, adaptive and multirate integrators.
+
+``model``: subsystems connected into one model, and named states; ``energy``: their energy
+declarations and accounting; ``integrators`` and ``multirate``: the solvers; ``splitbound``: the
+error of a multirate split. The simulation runner remains at :mod:`peslite.simulation` until the
+assembly and component layers are refactored.
+"""
+
+from .model import Bag, ConfigError, Empty, GroupPlan, Model, OutputStage, Stateful, Subsystem
+from .energy import Energetic, PowerPort, StoragePort
+from .integrators import (ADAPTIVE_METHODS, FIXED_METHODS, RHS, AdaptiveSolver, DormandPrince45, FixedStepSolver,
+                          Solver, SolverStep)
+from .multirate import HeldStorage, MultirateSolver, make_solver
+
+__all__ = ["Model", "GroupPlan", "Bag", "Empty", "ConfigError", "Subsystem", "OutputStage", "Energetic",
+           "StoragePort", "PowerPort", "Solver", "SolverStep", "Stateful", "RHS",
+           "FixedStepSolver", "AdaptiveSolver", "DormandPrince45", "MultirateSolver", "HeldStorage",
+           "make_solver", "FIXED_METHODS", "ADAPTIVE_METHODS"]

@@ -5,7 +5,7 @@ import math
 from dataclasses import replace
 from typing import Any
 
-from ..phs.states import gather, scatter
+from ..solver.model import gather, scatter
 from ..params import ConfigError, to_dict
 from ..assembly.protocols import ControlMeasurement
 from .loops import (LOOP_TYPES, V_AB, I_AB, V_DQ, VOLTAGE, CURRENT, ANGLE,

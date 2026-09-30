@@ -4,8 +4,8 @@ from __future__ import annotations
 import math
 from typing import Callable, ClassVar, Optional
 
-from ..phs.containers import Bag, Empty
-from ..phs.protocols import PowerPort, StoragePort
+from ..solver.model import Bag, Empty
+from ..solver.energy import PowerPort, StoragePort
 from ..params import DCLinkParams
 
 __all__ = ["DCLink", "DCCapacitor", "DCCurrentSource", "DCVoltageSource", "make_dclink"]

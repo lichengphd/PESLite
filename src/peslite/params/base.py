@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from ..phs.protocols import ConfigError
+from ..solver.model import ConfigError
 
 __all__ = ["BaseValues", "DCBase"]
 

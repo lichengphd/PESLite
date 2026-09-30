@@ -1,6 +1,6 @@
 """Continuous-time power-stage blocks: grid source, R-L branches, R-C nodes, bridge and dc link.
 
-Blocks are connected through :class:`peslite.phs.model.Model`; breakers expose ``open_breaker()``.
+Blocks are connected through :class:`peslite.solver.model.Model`; breakers expose ``open_breaker()``.
 """
 
 from .converter import Bridge

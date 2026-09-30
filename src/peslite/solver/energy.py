@@ -7,15 +7,63 @@ connection-port powers; undeclared subsystems get their net power from neighbour
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, ClassVar, Optional, Protocol, runtime_checkable
 
 import numpy as np
 
-from .protocols import Energetic, PowerPort, StoragePort
+__all__ = ["StoragePort", "PowerPort", "Energetic", "EnergySpec", "EnergyReport", "SubsystemEnergy", "PHReport", "SubsystemStatus", "CutStatus", "signal",
+           "re_product", "spec_of", "energy_of", "power_in", "balance", "ph_report"]
 
-__all__ = ["EnergySpec", "EnergyReport", "SubsystemEnergy", "PHReport", "SubsystemStatus", "CutStatus", "signal",
-           "spec_of", "default_spec", "energy_of", "power_in", "balance", "declared", "verify", "ph_report"]
 
+# ------------------------------------------------------------------ declarations
+
+@dataclass(frozen=True)
+class StoragePort:
+    """Linear storage with ``H = scale * value * |state|^2 / 2``.
+
+    ``state``: name of the effort state; ``value``: capacitance or inductance;
+    ``scale``: power-convention factor of the signal; ``flows``: external conjugate-flow
+    inputs as ``("inp.name", sign)`` pairs; ``kind``: ``"capacitor"`` or ``"inductor"``.
+    """
+
+    state: str
+    value: float
+    scale: float = 1.0
+    flows: tuple[tuple[str, float], ...] = ()
+    kind: str = "capacitor"
+
+
+@dataclass(frozen=True)
+class PowerPort:
+    """Connection port with power entering the subsystem ``P_in = sign * scale * Re(effort * conj(flow))``.
+
+    ``effort`` and ``flow`` name signals of the subsystem: ``"inp.x"``, ``"out.x"`` or ``"state.x"``.
+    """
+
+    effort: str
+    flow: str
+    scale: float = 1.0
+    sign: float = 1.0
+
+
+@runtime_checkable
+class Energetic(Protocol):
+    """Energy declaration of a subsystem, checked as ``P_in + P_supplied = dH/dt + P_dissipated``.
+
+    Members: ``storage``, ``ports``, ``dissipated_power()`` (W, >= 0) and ``supplied_power()``
+    (W, zero if passive). Optional flags: ``dirac`` (lossless interconnection),
+    ``observer`` (non-loading reader), ``has_source`` (internal source).
+    """
+
+    storage: ClassVar[tuple[StoragePort, ...]]
+    ports: ClassVar[tuple[PowerPort, ...]]
+
+    def dissipated_power(self) -> float: ...
+
+    def supplied_power(self) -> float: ...
+
+
+# ------------------------------------------------------------------ accounting
 
 def signal(sub: Any, name: str) -> Any:
     """Read ``"inp.x"`` / ``"out.x"`` / ``"state.x"`` from a subsystem's records."""
@@ -44,13 +92,11 @@ class EnergySpec:
         return self.kind in ("declared", "default")
 
 
-def default_spec() -> EnergySpec:
-    """Return the declaration of an undeclared subsystem: no storage or dissipation, net power inferred."""
-    return EnergySpec("default", (), (), lambda sub: 0.0, lambda sub: 0.0, has_source=True)
-
-
 def spec_of(sub: Any) -> EnergySpec:
-    """The effective declaration of a subsystem (explicit, or the default)."""
+    """The effective declaration of a subsystem (explicit, or the default).
+
+    The default, for an undeclared subsystem: no storage or dissipation, net power inferred.
+    """
     if getattr(sub, "observer", False):
         return EnergySpec("observer")
     if getattr(sub, "dirac", False):
@@ -59,12 +105,7 @@ def spec_of(sub: Any) -> EnergySpec:
         return EnergySpec("declared", tuple(getattr(sub, "storage", ())), tuple(getattr(sub, "ports", ())),
                           type(sub).dissipated_power, type(sub).supplied_power,
                           has_source=bool(getattr(sub, "has_source", False)))
-    return default_spec()
-
-
-def declared(sub: Any) -> bool:
-    """Whether the subsystem declares its energy structure itself."""
-    return spec_of(sub).kind == "declared"
+    return EnergySpec("default", (), (), lambda sub: 0.0, lambda sub: 0.0, has_source=True)
 
 
 def energy_of(sub: Any, spec: Optional[EnergySpec] = None) -> float:
@@ -86,12 +127,13 @@ def energy_rate(sub: Any, derivatives: dict[str, Any], spec: EnergySpec) -> floa
     return float(total)
 
 
-def _re_product(e: Any, f: Any) -> float:
+def re_product(e: Any, f: Any) -> float:
+    """``Re(e conj(f))`` for real or complex signals."""
     return float((e * np.conj(f)).real) if isinstance(e, complex) or isinstance(f, complex) else float(e * f)
 
 
 def port_power(sub: Any, port: PowerPort) -> float:
-    return port.sign * port.scale * _re_product(signal(sub, port.effort), signal(sub, port.flow))
+    return port.sign * port.scale * re_product(signal(sub, port.effort), signal(sub, port.flow))
 
 
 def power_in(sub: Any, spec: Optional[EnergySpec] = None) -> float:
@@ -119,7 +161,7 @@ def port_terms(model: Any, sub: Any, port: PowerPort) -> list[tuple[Any, float]]
             src, out_name = entry[0], entry[1]
             gain = float(entry[2]) if len(entry) > 2 else 1.0
             piece = gain * getattr(src.out, out_name)
-            p = _re_product(other, piece) if is_flow else _re_product(piece, other)
+            p = re_product(other, piece) if is_flow else re_product(piece, other)
             terms.append((src, port.sign * port.scale * p))
         return terms
     return []
@@ -225,38 +267,6 @@ def balance(model: Any, t: float, y: np.ndarray) -> EnergyReport:
         report.subsystems.append(SubsystemEnergy(name, energy_of(sub, spec), p_in, supplied, dissipated, rate,
                                                  p_in + supplied - dissipated - rate))
     return report
-
-
-def verify(model: Any, rtol: float = 1e-8, n_states: int = 4, seed: int = 0,
-           zoh: Optional[dict[str, Any]] = None) -> list[str]:
-    """Check the declarations at random states and return the problems found (empty if consistent).
-
-    Restores the model's states afterwards. ``zoh``: held inputs to set by label for the check.
-    """
-    saved = model.get_initial_values()
-    rng = np.random.default_rng(seed)
-    problems: list[str] = []
-    try:
-        for label, value in (zoh or {}).items():
-            model.set_zoh_input(label, value)
-        for k in range(n_states):
-            y = rng.normal(size=model.n_states) * 100.0
-            rep = balance(model, 0.01 * (k + 1), y)
-            tol = rtol * rep.scale
-            for s in rep.subsystems:
-                if abs(s.residual) > tol:
-                    problems.append(f"{s.name}: power balance off by {s.residual:.3e} W "
-                                    f"(P_in {s.power_in:.3e}, supplied {s.supplied:.3e}, dissipated {s.dissipated:.3e}, "
-                                    f"dH/dt {s.energy_rate:.3e})")
-            if abs(rep.tellegen) > tol:
-                problems.append(f"Tellegen: connection-port powers sum to {rep.tellegen:.3e} W "
-                                f"(declared: {[s.name for s in rep.subsystems if s.kind == 'declared']}, "
-                                f"dirac: {rep.dirac}, default: {rep.defaulted})")
-            if problems:
-                break
-    finally:
-        model.set_states(saved)
-    return sorted(set(problems))
 
 
 # ------------------------------------------------------------------ the pH report

@@ -11,8 +11,8 @@ from collections.abc import Mapping as _Mapping
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from typing import Any, Optional, Union, get_args, get_origin, get_type_hints
 
-from ..phs.protocols import ConfigError
-from ..phs.solvers import ADAPTIVE_METHODS, FIXED_METHODS
+from ..solver.model import ConfigError
+from ..solver.integrators import ADAPTIVE_METHODS, FIXED_METHODS
 
 from .base import BaseValues, DCBase, quantity_name
 

@@ -10,7 +10,7 @@ import math
 from pathlib import Path
 from typing import Any, Optional, get_args, get_type_hints
 
-from ..phs.protocols import ConfigError
+from ..solver.model import ConfigError
 
 from .base import BaseValues, convert_quantities
 from .schema import Params, BusParams, BranchParams, SourceParams, DCSourceParams, UnitParams, build, to_dict
