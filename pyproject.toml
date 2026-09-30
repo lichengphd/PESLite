@@ -31,7 +31,7 @@ Issues = "https://github.com/lonaparte/PESLite/issues"
 where = ["src"]
 
 [tool.setuptools.data-files]
-"share/peslite/examples" = ["examples/*.yaml"]
+"share/peslite/examples" = ["examples/*.pes"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

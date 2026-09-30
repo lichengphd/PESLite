@@ -811,7 +811,7 @@ def load(path: str | Path, initial: str | Path | None = None,
     """Load a YAML/JSON configuration, optionally replace its initial state, and apply overrides.
 
     ``initial``: states CSV (last row, or the row at ``initial_time`` in s) or YAML/JSON.
-    ``overrides``: dotted paths, e.g. ``load("case.yaml", **{"simulation.t_end": 5.0})``.
+    ``overrides``: dotted paths, e.g. ``load("case.pes", **{"simulation.t_end": 5.0})``.
     """
     p = from_dict(read_tree(path))
     if initial is not None:
@@ -828,7 +828,7 @@ def load(path: str | Path, initial: str | Path | None = None,
 
 
 def _read(path: Path) -> Any:
-    """The content of a ``.json`` file, or of a YAML file."""
+    """Read YAML or JSON configuration text."""
     if path.suffix.lower() == ".json":
         return json.loads(path.read_text(encoding="utf-8"))
     try:
@@ -880,7 +880,7 @@ def read_initial(path: str | Path, t: Optional[float] = None) -> dict:
 
 
 def read_tree(path: str | Path) -> dict:
-    """Return the top-level mapping of a ``.yaml``/``.yml``/``.json`` configuration file."""
+    """Return a top-level mapping from YAML or JSON configuration text."""
     data = _read(Path(path))
     if not isinstance(data, dict):
         raise ConfigError(f"{path}: top level must be a mapping")

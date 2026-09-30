@@ -856,7 +856,7 @@ def _example_configs_dir() -> Path:
 
 _EXAMPLE_CONFIGS = _example_configs_dir()
 _RESULTS = Path.cwd() / "output"
-_CONFIG_SUFFIXES = (".yaml", ".yml", ".json")
+_CONFIG_SUFFIXES = (".pes", ".yaml", ".yml", ".json")
 
 
 def _config_path(value: str | None) -> Path:

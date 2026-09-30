@@ -2,7 +2,8 @@
 
 Time-domain simulation of power-electronic converters in Python.
 
-- Networks of buses, lines, grid sources and any number of converters, defined in YAML.
+- Networks of buses, lines, grid sources and any number of converters, defined in YAML-format
+  simulation files named `.pes`.
 - Grid-following (PLL, current loop, dc-voltage loop) and grid-forming control
   (PSC, droop, VSG, dVOC, matching), each loop on its own clock.
 - Switching (ideal switches, exact switching instants), averaged and step-averaged bridges.
@@ -31,9 +32,9 @@ peslite
 peslite gfl-example
 peslite gfm-psc-example --out output/psc
 
-# run your own configuration
-peslite case.yaml
-peslite ./cases/my-converter.yaml
+# run your own simulation file
+peslite case.pes
+peslite ./cases/my-converter.pes
 
 # A suffix may be omitted
 peslite case
@@ -63,7 +64,7 @@ From Python (in this folder, or anywhere after `pip install -e .`):
 ```python
 import peslite
 
-p = peslite.load("case.yaml", **{"simulation.t_end": 1.0})
+p = peslite.load("case.pes", **{"simulation.t_end": 1.0})
 r = peslite.Simulation(p).run()
 
 r.states["plant.vsc.dclink.u_C"]   # a state over time
@@ -78,13 +79,13 @@ r.save("output/run")               # states.csv, summary.json, params.yaml
 
 | File | Content |
 |---|---|
-| `gfl-example` | Grid-following converter; every key is annotated |
-| `gfm-psc-example` | Grid-forming, power-synchronization control |
-| `gfm-droop-example` | Grid-forming, droop with virtual admittance and current loop |
-| `gfm-vsg-example` | Grid-forming, virtual synchronous generator |
-| `gfm-dvoc-example` | Grid-forming, dispatchable virtual oscillator control |
-| `gfm-matching-example` | Grid-forming, matching control |
-| `two-converters-example` | A grid-forming and a grid-following unit on one grid |
+| `gfl-example.pes` | Grid-following converter; every key is annotated |
+| `gfm-psc-example.pes` | Grid-forming, power-synchronization control |
+| `gfm-droop-example.pes` | Grid-forming, droop with virtual admittance and current loop |
+| `gfm-vsg-example.pes` | Grid-forming, virtual synchronous generator |
+| `gfm-dvoc-example.pes` | Grid-forming, dispatchable virtual oscillator control |
+| `gfm-matching-example.pes` | Grid-forming, matching control |
+| `two-converters-example.pes` | A grid-forming and a grid-following unit on one grid |
 
 ## Frequently used settings
 
@@ -176,12 +177,13 @@ src/peslite/            the package: __init__.py and four code parts
     splitbound.py         error estimate of a multirate split
     simulation.py         run, records, result files and command line
 tests/                  development test suite (python -m pytest); not included in the wheel
-examples/               bundled *-example YAML files; no Python files
+examples/               bundled *-example.pes files (YAML); no Python files
 ```
 
 The controller depends only on the solver kernel; components depend on the controller interface;
 assembly builds a system from both; `solver.simulation` runs the assembled system. The YAML files
-under the root `examples/` directory are wheel data, so the named `*-example` cases remain available
+under the root `examples/` directory use the `.pes` extension and are wheel data, so the named
+`*-example` cases remain available
 after installing only the wheel.
 
 ## License

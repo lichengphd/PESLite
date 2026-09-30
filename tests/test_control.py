@@ -37,7 +37,7 @@ class _FixedFrequency(SyncLaw):
 
 def test_registered_loop_owns_its_schema_and_uses_default_role_wiring():
     p = peslite.load(
-        EXAMPLES / "gfm-psc-example.yaml",
+        EXAMPLES / "gfm-psc-example.pes",
         **QUIET,
         **FAST,
         **{"simulation.t_end": 0.01},
@@ -69,7 +69,7 @@ def test_loop_registration_and_loop_owned_validation():
         register_loop_type(LOOP_TYPES["psc"])
     with pytest.raises(ConfigError, match="loops.va.x_v_pu must be positive"):
         peslite.load(
-            EXAMPLES / "gfm-droop-example.yaml",
+            EXAMPLES / "gfm-droop-example.pes",
             **{"units.vsc.control.loops.va.x_v_pu": 0.0},
         )
 

@@ -6,7 +6,8 @@
 
 - The repository is laid out as a PyPI package: `pyproject.toml`, the package in `src/peslite/`,
   the tests in `tests/` (`python -m pytest`; `pip install -e ".[test]"` installs pytest), and
-  bundled simulation files in the root `examples/` directory. That directory contains YAML only. The command is
+  bundled simulation files in the root `examples/` directory. That directory contains only
+  YAML-format `*-example.pes` files. The command is
   `peslite` after installation; names such as `peslite gfl-example` resolve from the installed
   wheel, while other files are given by path. `peslite.py` and the former Python example scripts
   are removed. The release workflow runs the tests before building and checks the packaged examples.
