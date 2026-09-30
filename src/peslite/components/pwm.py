@@ -18,7 +18,7 @@ from numpy.typing import NDArray
 from ..control.blocks import abc2complex
 
 __all__ = ["PWM", "SwitchingSequence", "Modulator", "Delay", "ComputationDelay", "CarrierComparison",
-           "SynchronousCarrier", "ZOH", "StepAveragedCarrier", "carrier", "carrier_position", "duty_fraction",
+           "SynchronousCarrier", "ZOH", "TimeStepAveragedCarrier", "carrier", "carrier_position", "duty_fraction",
            "make_modulator"]
 
 
@@ -283,7 +283,7 @@ class SynchronousCarrier:
 
 
 class ZOH:
-    """Averaged bridge: hold the duty ratios as the switching state for the period."""
+    """PWM-period averaging: hold the duty ratios as the switching state for the period."""
 
     def __call__(self, t: float, T_s: float, d_abc: NDArray[np.float64],
                  theta: float | None = None, omega: float | None = None) -> SwitchingSequence:
@@ -291,8 +291,8 @@ class ZOH:
         return SwitchingSequence(np.array([T_s]), d.reshape(1, 3))
 
 
-class StepAveragedCarrier:
-    """Step-averaged bridge: per ``dt`` step, the on-fraction of the carrier comparison."""
+class TimeStepAveragedCarrier:
+    """Time-step averaging: per solver step, the on-fraction of the carrier comparison."""
 
     def __init__(self, f_sw: float, dt: float, phase: float = 0.0) -> None:
         self.f_sw, self.dt, self.phase = float(f_sw), float(dt), float(phase)
@@ -310,16 +310,16 @@ class StepAveragedCarrier:
         return SwitchingSequence(np.full(n, h), states)
 
 
-def make_modulator(pwm: Any, f0: float, sim: Any) -> Modulator:
-    """Return the modulator for ``simulation.bridge`` and ``pwm.sync``.
+def make_modulator(pwm: Any, f0: float, averaging: Any, sim: Any) -> Modulator:
+    """Return the modulator selected by one unit's ``averaging`` and ``pwm.sync``.
 
-    ``bridge``: ``"switching"``, ``"averaged"`` or ``"step_averaged"``.
+    A disabled averaging section uses carrier comparison. PWM-period averaging holds the duty
+    ratios continuously; time-step averaging uses the carrier's on-fraction per solver step.
     """
-    bridge = sim.bridge
-    if bridge == "switching":
+    if not averaging.enable:
         if pwm.sync == "synchronous":
             return SynchronousCarrier(round(pwm.f_sw / f0), pwm.carrier_phase)
         return CarrierComparison(pwm.f_sw, pwm.carrier_phase)
-    if bridge == "averaged":
-        return ZOH()
-    return StepAveragedCarrier(pwm.f_sw, sim.solver.dt, pwm.carrier_phase)
+    if averaging.over == "time_step":
+        return TimeStepAveragedCarrier(pwm.f_sw, sim.solver.dt, pwm.carrier_phase)
+    return ZOH()

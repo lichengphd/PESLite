@@ -211,14 +211,16 @@ def _network(p: Params) -> None:
                 raise ConfigError(f"elements.{name}.{key} must be finite")
 
 
-def _solver(s, bridge: str) -> None:
+def _solver(s, time_step_averaging: list[str]) -> None:
     """Check solver methods, bridge compatibility and subsystem step ratios."""
     if s.type == "fixed" and s.method not in FIXED_METHODS:
         raise ConfigError(f"simulation.solver.method {s.method!r} is not one of {FIXED_METHODS}")
     if s.type == "adaptive" and s.method not in ADAPTIVE_METHODS:
         raise ConfigError(f"simulation.solver.method {s.method!r} is not one of {ADAPTIVE_METHODS}")
-    if bridge == "step_averaged" and s.type != "fixed":
-        raise ConfigError("simulation.bridge = 'step_averaged' requires the fixed-step solver")
+    if time_step_averaging and s.type != "fixed":
+        name = time_step_averaging[0]
+        raise ConfigError(f"units.{name}.averaging.over = 'time_step' requires the fixed-step "
+                          f"solver (simulation.solver.type = 'fixed')")
     if s.sweeps < 1:
         raise ConfigError("simulation.solver.sweeps must be >= 1")
     if s.linearisations < 0:
@@ -293,12 +295,15 @@ def _initial(p: Params) -> None:
 def validate(p: Params) -> Params:
     """Check a :class:`Params` tree and return it unchanged; raise ConfigError if invalid."""
     _network(p)
+    time_step = [name for name, unit in p.units.items()
+                 if unit.averaging.enable and unit.averaging.over == "time_step"]
     for name, unit in p.units.items():
         _unit(unit, p.base, f"units.{name}")
-        if unit.pwm.sync == "synchronous" and p.simulation.bridge != "switching":
-            raise ConfigError(f"units.{name}.pwm.sync = 'synchronous' needs simulation.bridge = "
-                              f"'switching' (got {p.simulation.bridge!r}): an averaged bridge has no carrier")
-    _solver(p.simulation.solver, p.simulation.bridge)
+        if unit.pwm.sync == "synchronous" and name in time_step:
+            raise ConfigError(f"units.{name}.pwm.sync = 'synchronous' is not available with time-step "
+                              f"averaging (units.{name}.averaging.over = 'time_step'), which has an "
+                              f"asynchronous carrier")
+    _solver(p.simulation.solver, time_step)
     _events(p)
     _initial(p)
     return p

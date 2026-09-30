@@ -37,7 +37,7 @@ __all__ = [
     "ACFilterParams", "DCLinkParams", "DCCapacitorParams", "DCSourceParams", "PWMParams", "MeasurementParams",
     "ReferenceParams", "ControlParams", "DelayParams", "OvercurrentParams", "VoltageLimitParams",
     "FrequencyLimitParams", "DCVoltageLimitParams", "RocofParams", "ProtectionParams",
-    "UnitParams", "RUNTIME", "Change", "runtime_changeable", "set_changes",
+    "AveragingParams", "UnitParams", "RUNTIME", "Change", "runtime_changeable", "set_changes",
     "SolverParams", "SimulationParams", "InitialParams", "OutputParams", "MetaParams", "Params",
 ]
 
@@ -413,6 +413,20 @@ class ProtectionParams:
 
 
 @dataclass(frozen=True)
+class AveragingParams:
+    """The bridge model of one unit.
+
+    With ``enable`` set to 0, the bridge switches at the exact carrier-comparison instants.
+    With it set to 1, ``over`` selects averaging over a ``pwm_period`` or a solver ``time_step``.
+    """
+
+    enable: bool = False
+    over: str = "pwm_period"
+
+    _choices = {"over": ("pwm_period", "time_step")}
+
+
+@dataclass(frozen=True)
 class UnitParams:
     """One converter unit: rating, plant components, control and protection.
 
@@ -425,6 +439,7 @@ class UnitParams:
     dclink: DCLinkParams
     pwm: PWMParams
     control: ControlParams
+    averaging: AveragingParams = field(default_factory=AveragingParams)
     delay: DelayParams = field(default_factory=DelayParams)
     s_base: Optional[float] = None  # rating (VA); default: the system base
     measurement: MeasurementParams = field(default_factory=MeasurementParams)
@@ -527,10 +542,9 @@ class OutputParams:
 
 @dataclass(frozen=True)
 class SimulationParams:
-    """How the model is simulated: time span, bridge model, solver, initial state and output."""
+    """How the model is simulated: time span, solver, initial state and output."""
 
     t_end: float
-    bridge: str = "switching"  # "switching" | "averaged" | "step_averaged"
     solver: SolverParams = field(default_factory=SolverParams)
     initial: InitialParams = field(default_factory=InitialParams)
     output: OutputParams = field(default_factory=OutputParams)
@@ -538,7 +552,7 @@ class SimulationParams:
     progress_every: float = 0.0  # s of simulated time between progress lines; 0: silent
     energy_check: str = "warn"  # "warn" | "strict" | "off": verify the energy declarations before the run
 
-    _choices = {"bridge": ("switching", "averaged", "step_averaged"), "energy_check": ("warn", "strict", "off")}
+    _choices = {"energy_check": ("warn", "strict", "off")}
 
 
 @dataclass(frozen=True)

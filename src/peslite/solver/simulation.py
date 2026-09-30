@@ -986,8 +986,12 @@ def main(argv=None) -> int:
                     help="initial values: a states.csv row or a simulation file's simulation.initial block")
     ap.add_argument("--initial-time", type=float, default=None, metavar="T",
                     help="with a states.csv: start from the row at time T instead of the last row")
+    ap.add_argument("--averaging", action="store_true",
+                    help="run every unit with averaging enabled; each unit keeps its configured "
+                         "averaging.over value, and this option wins over --set")
     ap.add_argument("--out", default=None,
-                    help="output directory (default: output/<file name> in the current working directory)")
+                    help="output directory (default: output/<file name>, or "
+                         "output/<file name>-averaging when --averaging changes a unit)")
     ap.add_argument("--progress", type=float, default=None, metavar="SECONDS",
                     help="print a progress line every SECONDS of simulated time (overrides the config)")
     ap.add_argument("--list-states", action="store_true",
@@ -1008,6 +1012,9 @@ def main(argv=None) -> int:
         overrides["simulation.progress_every"] = args.progress
     p = load(config, initial=args.initial,
                     initial_time=args.initial_time, **overrides)
+    averaged = args.averaging and any(not unit.averaging.enable for unit in p.units.values())
+    if args.averaging:
+        p = p.replace(**{f"units.{name}.averaging.enable": 1 for name in p.units})
     if args.resolved:
         print(dumps(p), end="")
         return 0
@@ -1018,9 +1025,14 @@ def main(argv=None) -> int:
     if args.ph_report:
         print(sim.ph_report)
         return 0
-    units = ", ".join(f"{n} ({u.control.type}, PWM {1e-3 / u.pwm.update_period:.0f} kHz, delay {u.delay.steps})"
+    def bridge_model(unit):
+        return (f"averaging over the {unit.averaging.over.replace('_', ' ')}"
+                if unit.averaging.enable else "switching")
+
+    units = ", ".join(f"{n} ({u.control.type}, {bridge_model(u)}, "
+                      f"PWM {1e-3 / u.pwm.update_period:.0f} kHz, delay {u.delay.steps})"
                       for n, u in p.units.items())
-    print(f"peslite: {config}  units={units}  bridge={p.simulation.bridge}  "
+    print(f"peslite: {config}  units={units}  "
           f"solver={p.simulation.solver.type}/{p.simulation.solver.method}  "
           f"t = {p.simulation.initial.t} .. {p.simulation.t_end} s  "
           f"({len(p.simulation.initial.states)} initial values given)")
@@ -1044,7 +1056,7 @@ def main(argv=None) -> int:
     if "split_error_bound_rated" in s:
         print(f"split error, from the linearised closed loop: <= {s['split_error_bound_rated']:.2e} of rating "
               f"({s['split_bound']})")
-    out = Path(args.out) if args.out else _RESULTS / config.stem
+    out = Path(args.out) if args.out else _RESULTS / (f"{config.stem}-averaging" if averaged else config.stem)
     written = r.save(out, info={"config": str(config)})
     print("wrote", ", ".join(str(w) for w in written))
     final = r.final_states()

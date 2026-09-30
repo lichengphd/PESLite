@@ -10,10 +10,10 @@ from .network import (ELEMENT_TYPES, Element, Load, RCNode, RLBranch, ThreePhase
                       register_element_type)
 from .converter import Bridge, DCCapacitor, DCCurrentSource, DCLink, DCVoltageSource, make_dclink
 from .adc import ADC, MeasurementPorts
-from .pwm import (ZOH, CarrierComparison, ComputationDelay, StepAveragedCarrier, SwitchingSequence,
+from .pwm import (ZOH, CarrierComparison, ComputationDelay, SwitchingSequence, TimeStepAveragedCarrier,
                   SynchronousCarrier, make_modulator)
 
 __all__ = ["ThreePhaseSource", "RLBranch", "RCNode", "Element", "ELEMENT_TYPES",
            "register_element_type", "Load", "Bridge", "DCLink", "DCCapacitor", "DCCurrentSource",
            "DCVoltageSource", "make_dclink", "ADC", "MeasurementPorts", "ComputationDelay", "SwitchingSequence",
-           "CarrierComparison", "SynchronousCarrier", "ZOH", "StepAveragedCarrier", "make_modulator"]
+           "CarrierComparison", "SynchronousCarrier", "ZOH", "TimeStepAveragedCarrier", "make_modulator"]

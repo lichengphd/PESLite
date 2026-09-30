@@ -61,6 +61,10 @@ units:                     # converters, one entry each
       # sync: asynchronous # asynchronous | synchronous (carrier locked to the controller angle)
       # carrier_phase: 0.0 # carrier position at t = 0, in periods
 
+    # averaging: {enable: 0, over: pwm_period}  # bridge model: 0 switching; 1 averaging
+    #                     # over each pwm_period (no carrier) or each solver time_step (fixed solver)
+    #                     # --averaging sets enable 1 for every unit
+
     control:
       type: gfl            # default wiring: gfl | gfm | custom (explicit connections and outputs)
       loops:               # each loop runs every `period` (s) on its own clock
@@ -135,7 +139,6 @@ events:                    # what happens during the run, by name; written only 
 
 simulation:                # how the model is simulated
   t_end: 3.0
-  # bridge: switching      # switching | averaged | step_averaged
   solver:
     dt: 12.5e-6            # fixed: maximum step
     # type: fixed          # fixed | adaptive

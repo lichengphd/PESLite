@@ -62,7 +62,8 @@ class Unit:
 
         # ------------------------------------------------------------ control
         self.ctrl = ctrl if ctrl is not None else make_controller(cfg, sc)
-        self.pwm = PWM(T_s, modulator if modulator is not None else make_modulator(cfg.pwm, cfg.base.f0, sim),
+        self.pwm = PWM(T_s, modulator if modulator is not None else
+                       make_modulator(cfg.pwm, cfg.base.f0, cfg.averaging, sim),
                        delay if delay is not None else ComputationDelay(cfg.delay.steps))
         self.zoh = f"{name}.q"                   # model label of the bridge's held switching state
 
