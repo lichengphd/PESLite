@@ -61,7 +61,7 @@ class Loop:
     It provides ``initial_outputs()`` and ``update(t, inputs) -> outputs``; its named states are the
     attributes in ``state_names`` unless it overrides ``get_state`` / ``set_state``.
     ``cfg``: the loop's parameters; ``unit``: the unit's parameters; ``scenario``: the unit's
-    prescribed time functions (start-up ramp, setpoint and gain steps).
+    connection state and ramp over time.
     """
 
     type: ClassVar[str]
@@ -175,9 +175,6 @@ class SRFPLL(Loop):
 
     def update(self, t, inputs):
         frame = self.theta
-        kp = self.scenario.pll_kp(t)
-        if kp is not None:
-            self.kp = kp
         v = inputs["v"] * _into(frame)
         u_g = self.u_g
         if u_g is None:                                    # rated
@@ -281,7 +278,7 @@ class DCVoltageLoop(Loop):
     """PI dc-voltage loop returning ``id_ref = ff + kp*e + ki*int(e)`` clamped to ``[floor, limit]``.
 
     ``e = u_dc - vdc_ref`` in dc pu; ``id_ref`` in ac current pu (positive = export); the
-    feed-forward ``id0_export_pu`` follows the start-up ramp. ``frozen`` (set while tripped) zeroes
+    feed-forward ``id0_export_pu`` follows the connection ramp. ``frozen`` (set while tripped) zeroes
     the output and holds the integrator. Named states: ``integral`` (pu*s) and, with conditional
     anti-windup, ``clamped``.
     """
@@ -324,7 +321,7 @@ class DCVoltageLoop(Loop):
 
     def update(self, t, inputs):
         self.n_updates += 1
-        ff = self.scenario.startup(t) * self.cfg.id0_export_pu
+        ff = self.scenario.ramp_value(t) * self.cfg.id0_export_pu
         self.error = inputs["u_dc"] - inputs["vdc_ref"]
         if self.frozen:
             self.raw = 0.0
@@ -390,7 +387,7 @@ class SyncLaw(Loop):
     A law implements ``step(T, p, q, v_mag, v_dc, p_ref, q_ref, v_ref, i_dq)``, which advances
     ``theta``, ``omega`` and ``v_mag`` by one period ``T``; its inputs are in pu (the voltage
     magnitude on the ac base, ``v_dc`` on the dc base) and ``i_dq`` is the current in the law's frame.
-    The power setpoint follows the start-up ramp and the setpoints their steps.
+    The active-power setpoint follows the connection ramp.
     """
 
     role = "sync"

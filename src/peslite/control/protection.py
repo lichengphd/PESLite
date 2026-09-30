@@ -1,6 +1,6 @@
 """Protection of a converter unit: over-current, ac-voltage, frequency and dc-voltage trips and a ROCOF alarm.
 
-Trips are enabled from ``arm_time`` (s); timed criteria must hold for ``hold`` (s).
+Trips are enabled while ``armed(t)``; timed criteria must hold for ``hold`` (s).
 Named states: ``tripped`` and the hold timers.
 """
 
@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from ..solver.model import gather, scatter
 from .blocks import HoldTimer, MovingWindow
@@ -42,8 +42,8 @@ class ProtectionStats:
 class Protection:
     """Trip and alarm decisions of one unit from its ``protection`` parameters; ``T``: its sampling period (s)."""
 
-    def __init__(self, cfg: Any, T: float, arm_time: float) -> None:
-        self.cfg, self.T, self.arm_time = cfg, T, arm_time
+    def __init__(self, cfg: Any, T: float, armed: Callable[[float], bool]) -> None:
+        self.cfg, self.T, self.armed = cfg, T, armed
         self.trip: TripEvent | None = None
         self.stats = ProtectionStats()
         self._timers = {"hold_uv": HoldTimer(T), "hold_ov": HoldTimer(T), "hold_freq": HoldTimer(T),
@@ -86,7 +86,7 @@ class Protection:
                 self.stats.i_alarm_first_t = t
                 self._raise("OVERCURRENT")
             self.stats.i_alarm_steps += 1
-            if not self.tripped and t >= self.arm_time:
+            if not self.tripped and self.armed(t):
                 self._do_trip(t, "overcurrent", f"|i|={peak_pu:.4f} pu > {overcurrent.limit_pu} pu")
                 return True
         return False
@@ -108,7 +108,7 @@ class Protection:
         ``vac_pu`` ac voltage magnitude (pu), ``freq_dev_hz`` frequency deviation (Hz),
         ``vdc_err_pu`` dc-voltage error (pu).
         """
-        cfg, stats, armed = self.cfg, self.stats, t >= self.arm_time
+        cfg, stats, armed = self.cfg, self.stats, self.armed(t)
         if not self.tripped:
             old = self._rocof.push(freq_dev_hz)
             if old is not None:

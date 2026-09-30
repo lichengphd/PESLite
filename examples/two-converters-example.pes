@@ -30,9 +30,6 @@ sources:
     bus: pcc
     x_pu: 0.4
     r_pu: 0.04
-    events:
-      freq_step_t: 0.75
-      freq_step_hz: -0.2
 units:
   vsc_m:
     bus: bus1
@@ -78,13 +75,6 @@ units:
       steps: 1
     protection:
       overcurrent: {enable: 1, limit_pu: 1.5}
-    events:
-      startup:
-        start: 0.05
-        duration: 0.3
-      setpoint:
-        t: 0.5
-        p_ref_pu: 0.3
     s_base: 2000000.0
   vsc_l:
     bus: bus2
@@ -134,11 +124,12 @@ units:
       frequency: {enable: 0}
       dc_voltage: {enable: 0}
       rocof: {enable: 1, limit: 1.0, window: 0.1}
-    events:
-      startup:
-        start: 0.05
-        duration: 0.3
     s_base: 1000000.0
+events:
+  connect_vsc_m: {type: connect, target: vsc_m, t: 0.05, ramp: 0.3}
+  connect_vsc_l: {type: connect, target: vsc_l, t: 0.05, ramp: 0.3}
+  p_step: {type: set, t: 0.5, set: {units.vsc_m.control.references.p_ref_pu: 0.3}}
+  grid_f: {type: set, t: 0.75, set: {sources.grid.f: 49.8}}
 simulation:
   t_end: 1.0
   bridge: switching

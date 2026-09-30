@@ -31,10 +31,10 @@ class Unit:
         self.name = name
         self.cfg = cfg
         self.bus = bus
-        self.scenario = sc = UnitScenario(cfg)
+        self.scenario = sc = UnitScenario(cfg.events)
 
         # ------------------------------------------------------------ power
-        self.dclink = make_dclink(cfg.dclink, ramp=sc.startup)
+        self.dclink = make_dclink(cfg.dclink, ramp=sc.ramp_value)
         self.bridge = Bridge()
         self.branch_f = RLBranch(cfg.ac_filter.l_f, cfg.ac_filter.r_f)
         self.breakers = [self.branch_f, self.dclink]

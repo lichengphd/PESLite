@@ -92,3 +92,19 @@
 - `meta` contains optional text-only `title` and `description` fields.
 - `peslite.dumps` returns and `peslite.dump` writes a complete resolved simulation file.
   Run results contain this file as `simulation.pes`, and `peslite FILE --resolved` prints it.
+
+### Unified event model (#2)
+
+- Source and unit-specific event blocks are replaced by one top-level `events` mapping. Built-in
+  event types are `connect`, `disconnect` and `set`; an event which acts on one object names it
+  with `target`.
+- Event types can be registered with `peslite.register_event_type`. A custom event owns its frozen
+  parameter dataclass and an `apply(event, system, t)` method, and is parsed and validated like a
+  built-in event.
+- Names are unique across buses, branches, sources and units. Event targets, times and each
+  target's connect/disconnect sequence are checked while the simulation file is loaded.
+- `Scenario`, `UnitScenario` and `SourceScenario` describe connection ramps and source parameters
+  over time. Each unit carries its targeted events in time order.
+- A `set` event may change only declared runtime paths. Events are applied in time and file order
+  to the values left by preceding events; the complete parameter tree is rebuilt and validated
+  after every event. `Params.changes` exposes the resulting parameters and canonical SI paths.

@@ -19,10 +19,8 @@ sources:                   # emf behind an impedance, attached to a bus
     x_pu: 0.4
     r_pu: 0.04
     # v_pu: 1.0            # emf magnitude (default 1)
-    # events:              # t < 0 disables an event
-    #   freq_step_t: -1.0    # s; with freq_step_hz
-    #   phase_jump_t: -1.0   # s; with phase_jump_rad
-    #   voltage_step_t: -1.0 # s; with voltage_step (V)
+    # f: 50.0              # Hz; default: base.f0
+    # angle: 0.0           # rad; offset from the nominal source angle
 
 units:                     # converters; one entry per converter
   vsc:
@@ -40,7 +38,7 @@ units:                     # converters; one entry per converter
         r_esr_pu: 0.001
       source:
         type: current      # current | voltage | none
-        i_pu: 0.9          # into the link; scaled by the start-up ramp
+        i_pu: 0.9          # into the link; scaled by the connection ramp
         k_pu: 0.0          # current-source droop: k_pu * (1 - u_C_pu)
         # voltage source: v_pu (emf, default 1), r_pu (series R, default 0)
 
@@ -90,10 +88,11 @@ units:                     # converters; one entry per converter
       hold: 0.02
       rocof: {enable: 1, limit: 1.0, window: 0.1}
 
-    events:
-      startup: {start: 0.2, duration: 1.0}
-      # setpoint: {t: -1.0, p_ref_pu: ..., q_ref_pu: ..., v_ref_pu: ...}   # grid-forming setpoints
-      # pll_gain: {t: -1.0, kp_after_pu: ...}
+events:
+  connect_vsc: {type: connect, target: vsc, t: 0.2, ramp: 1.0}
+  # p_step: {type: set, t: 2.0, set: {units.vsc.control.references.p_ref_pu: 0.8}}
+  # grid_f: {type: set, t: 4.0, set: {sources.grid.f: 49.8}}
+  # disconnect_vsc: {type: disconnect, target: vsc, t: 5.0}
 
 simulation:
   t_end: 3.0

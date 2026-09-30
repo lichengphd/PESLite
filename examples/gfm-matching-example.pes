@@ -11,9 +11,6 @@ sources:
     bus: pcc
     x_pu: 0.4
     r_pu: 0.04
-    events:
-      freq_step_t: 4.0
-      freq_step_hz: -0.2
 units:
   vsc:
     bus: pcc
@@ -57,10 +54,9 @@ units:
       steps: 1
     protection:
       overcurrent: {enable: 1, limit_pu: 1.5}
-    events:
-      startup:
-        start: 0.2
-        duration: 1.0
+events:
+  connect_vsc: {type: connect, target: vsc, t: 0.2, ramp: 1.0}
+  grid_f: {type: set, t: 4.0, set: {sources.grid.f: 49.8}}
 simulation:
   t_end: 6.0
   bridge: averaged

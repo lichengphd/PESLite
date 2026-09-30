@@ -20,12 +20,10 @@ __all__ = ["System"]
 class _Source:
     """Voltage source (emf) behind a series R-L branch."""
 
-    def __init__(self, name: str, cfg, base, bus) -> None:
+    def __init__(self, name: str, cfg, base, bus, steps=()) -> None:
         self.name, self.cfg, self.bus = name, cfg, bus
-        self.scenario = sc = SourceScenario(cfg)
-        self.emf = ThreePhaseSource(base.w0, cfg.v,
-                                    phi=sc.angle if sc.has_angle else None,
-                                    magnitude=sc.magnitude if sc.has_voltage_step else None)
+        self.scenario = sc = SourceScenario(cfg, base.f0, steps)
+        self.emf = ThreePhaseSource(base.w0, cfg.v, phi=sc.angle, magnitude=sc.magnitude)
         self.branch = RLBranch(cfg.l, cfg.r)
 
     def subsystems(self) -> dict[str, Any]:
@@ -70,7 +68,9 @@ class System:
                       for name, cfg in p.buses.items()}
         self.branches = {name: RLBranch(cfg.l, cfg.r)
                          for name, cfg in p.branches.items()}
-        self.sources = {name: _Source(name, cfg, base, self.buses[cfg.bus])
+        self.sources = {name: _Source(name, cfg, base, self.buses[cfg.bus], [
+                            (change.t, change.params.sources[name]) for change in p.changes
+                            if set(change.touches(f"sources.{name}.")) & {"v", "f", "angle"}])
                         for name, cfg in p.sources.items()}
         self.units: dict[str, Unit] = {}
         for name, cfg in p.units.items():

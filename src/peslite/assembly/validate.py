@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 from ..solver.integrators import ADAPTIVE_METHODS, FIXED_METHODS
 from ..solver.model import ConfigError
 from ..solver.multirate import parse_step
+from .events import NAMED, SWITCHABLE, SWITCHING
 
 if TYPE_CHECKING:
     from .params import Params
@@ -171,7 +172,7 @@ def _network(p: Params) -> None:
     if not p.units:
         raise ConfigError("units: a system needs at least one converter")
     seen: dict[str, str] = {}
-    for kind in ("buses", "branches", "sources", "units"):
+    for kind in NAMED:
         for name in getattr(p, kind):
             if name in seen:
                 raise ConfigError(f"{kind}.{name}: the name is already used by {seen[name]}; element "
@@ -193,6 +194,10 @@ def _network(p: Params) -> None:
             raise ConfigError(f"branches.{name}.l must be > 0")
     for name, src in p.sources.items():
         _bus_of(f"sources.{name}.bus", src.bus)
+        if src.f is not None and (not math.isfinite(src.f) or src.f <= 0.0):
+            raise ConfigError(f"sources.{name}.f must be finite and positive, got {src.f}")
+        if not math.isfinite(src.angle):
+            raise ConfigError(f"sources.{name}.angle must be finite")
         if src.l <= 0.0:
             raise ConfigError(f"sources.{name}.l must be > 0: a source is an emf behind an impedance")
     for name, u in p.units.items():
@@ -223,6 +228,36 @@ def _solver(s, bridge: str) -> None:
             raise ConfigError(f"{where}: {exc}") from None
         if method is not None and method not in FIXED_METHODS + ADAPTIVE_METHODS:
             raise ConfigError(f"{where}.method: {method!r} is not one of {FIXED_METHODS + ADAPTIVE_METHODS}")
+
+
+def _events(p: Params) -> None:
+    """Check event targets, times, and each target's connect/disconnect sequence."""
+    switched: dict[str, tuple[str, bool]] = {}
+    at: dict[tuple[str, float], str] = {}
+    for name, event in sorted(p.events.items(), key=lambda item: item[1].t):
+        where = f"events.{name}"
+        for key, value in vars(event).items():
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ConfigError(f"{where}.{key} must be finite")
+        target = getattr(event, "target", None)
+        section = p.section_of(target) if isinstance(target, str) else None
+        if target is not None and section is None:
+            known = sorted(name for named in NAMED for name in getattr(p, named))
+            raise ConfigError(f"{where}.target: unknown name {target!r}; known: {known}")
+        if event.type not in SWITCHING:
+            continue
+        if section not in SWITCHABLE:
+            raise ConfigError(f"{where}.target: {target!r} is a bus, which has no breaker; {event.type} "
+                              f"switches a unit, source or branch")
+        on = event.type == "connect"
+        previous = switched.get(target)
+        if previous is not None and previous[1] == on:
+            raise ConfigError(f"{where}: {target!r} is already {event.type}ed by events.{previous[0]}")
+        if (target, event.t) in at:
+            raise ConfigError(f"{where}: {target!r} is also switched at t = {event.t} "
+                              f"by events.{at[(target, event.t)]}")
+        at[(target, event.t)] = name
+        switched[target] = (name, on)
 
 
 def _initial(p: Params) -> None:
@@ -257,5 +292,6 @@ def validate(p: Params) -> Params:
             raise ConfigError(f"units.{name}.pwm.sync = 'synchronous' needs simulation.bridge = "
                               f"'switching' (got {p.simulation.bridge!r}): an averaged bridge has no carrier")
     _solver(p.simulation.solver, p.simulation.bridge)
+    _events(p)
     _initial(p)
     return p

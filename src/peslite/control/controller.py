@@ -383,8 +383,8 @@ class UniteType:
     """Configurable controller of one unit: its loop network, protection and output stage.
 
     ``cfg``: the unit's parameters; ``cfg.control.type``: ``"gfl"``, ``"gfm"`` or ``"custom"`` (no
-    default wiring). ``scenario``: the unit's prescribed time functions (start-up ramp, setpoint and
-    gain steps). ``pwm_method``, ``limiter``: see :class:`~peslite.control.modulation.OutputStage`.
+    default wiring). ``scenario``: the unit's connection state and ramp over time.
+    ``pwm_method``, ``limiter``: see :class:`~peslite.control.modulation.OutputStage`.
     ``update()`` advances the due loops; ``__call__`` is the PWM publication.
     """
 
@@ -398,7 +398,7 @@ class UniteType:
         self.v_base, self.i_base, self.w0 = cfg.base.v_phase_peak, cfg.base.i_phase_peak, cfg.base.w0
         self.v_dc_base = cfg.dc_base.v
         self.vdc_ref_pu = cfg.control.references.vdc_ref_pu
-        self.protection = Protection(cfg.protection, self.T_s, scenario.arm_time)
+        self.protection = Protection(cfg.protection, self.T_s, scenario.armed)
         self.stage = OutputStage(cfg, complex(cfg.base.v_phase_peak), pwm_method=pwm_method, limiter=limiter)
         self.theta, self.omega = self.initial_sync()
         self.u_cmd = 1.0 + 0j

@@ -14,7 +14,7 @@ from peslite.solver.model import ConfigError
 
 CONTROL = Path(peslite.control.__file__).parent
 QUIET = {"simulation.progress_every": 0.0, "simulation.solver.linearisations": 0}
-FAST = {"units.vsc.events.startup.start": 0.0, "units.vsc.events.startup.duration": 0.01}
+FAST = {"events.connect_vsc.t": 0.0, "events.connect_vsc.ramp": 0.01}
 
 
 @register_loop_type

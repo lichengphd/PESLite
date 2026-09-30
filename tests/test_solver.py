@@ -11,7 +11,7 @@ from peslite.solver import AdaptiveSolver, DormandPrince45, FixedStepSolver, Mul
 from peslite.solver.multirate import parse_step
 
 QUIET = {"simulation.progress_every": 0.0, "simulation.solver.linearisations": 0}
-FAST = {"units.vsc.events.startup.start": 0.0, "units.vsc.events.startup.duration": 0.01}
+FAST = {"events.connect_vsc.t": 0.0, "events.connect_vsc.ramp": 0.01}
 SOLVER = Path(peslite.solver.__file__).parent
 
 

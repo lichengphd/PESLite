@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import csv
 import dataclasses
+import functools
 import json
 import math
 from collections.abc import Mapping as _Mapping
@@ -25,16 +26,17 @@ from typing import Any, Optional, Union, get_args, get_origin, get_type_hints
 
 from ..control.loops import LOOP_TYPES
 from ..solver.model import ConfigError
+from .events import EVENT_TYPES, NAMED, events_for
 from .validate import validate
 
 __all__ = [
     "ConfigError", "load", "dump", "dumps", "read_tree", "read_initial", "from_dict", "to_dict",
     "BaseValues", "DCBase",
-    "BusParams", "BranchParams", "SourceParams", "SourceEventParams",
+    "BusParams", "BranchParams", "SourceParams",
     "ACFilterParams", "DCLinkParams", "DCCapacitorParams", "DCSourceParams", "PWMParams", "MeasurementParams",
     "ReferenceParams", "ControlParams", "DelayParams", "OvercurrentParams", "VoltageLimitParams",
     "FrequencyLimitParams", "DCVoltageLimitParams", "RocofParams", "ProtectionParams",
-    "StartupParams", "SetpointStepParams", "PLLGainStepParams", "UnitEventParams", "UnitParams",
+    "UnitParams", "RUNTIME", "Change", "runtime_changeable", "set_changes",
     "SolverParams", "SimulationParams", "InitialParams", "OutputParams", "MetaParams", "Params",
 ]
 
@@ -188,15 +190,13 @@ class BusParams:
 class BranchParams:
     """Series R-L branch between two buses; current positive from ``from_bus`` to ``to_bus``.
 
-    ``l`` in H, ``r`` in ohm; pu inputs use the system base. ``breaker``: protection may open it.
+    ``l`` in H, ``r`` in ohm; pu inputs use the system base. Connect/disconnect events switch it.
     """
 
     from_bus: str
     to_bus: str
     l: float
     r: float = 0.0
-    breaker: bool = False
-
     _quantities = {"l": "inductance", "r": "resistance"}
     _input_aliases = {"x_pu": "l_pu"}
 
@@ -205,34 +205,20 @@ class BranchParams:
 class SourceParams:
     """Three-phase emf behind a series R-L impedance, connected to ``bus``.
 
-    ``l`` in H, ``r`` in ohm, ``v`` in phase-peak V (default 1 pu); pu inputs use the system base.
+    ``l`` in H, ``r`` in ohm, ``v`` in phase-peak V (default 1 pu), ``f`` in Hz (default
+    ``base.f0``), and ``angle`` in rad; pu inputs use the system base.
     """
 
     bus: str
     l: float
     r: float = 0.0
     v: float = 0.0  # emf magnitude, phase-peak V
-    events: "SourceEventParams" = field(default_factory=lambda: SourceEventParams())
+    f: Optional[float] = None
+    angle: float = 0.0
 
     _quantities = {"l": "inductance", "r": "resistance", "v": "voltage"}
     _input_aliases = {"x_pu": "l_pu"}
     _defaults_pu = {"v": 1.0}
-
-
-@dataclass(frozen=True)
-class SourceEventParams:
-    """Events applied to one source; times in s, ``t < 0`` disables a step."""
-
-    freq_step_t: float = -1.0
-    freq_step_hz: float = 0.0
-    phase_jump_t: float = -1.0
-    phase_jump_rad: float = 0.0
-    voltage_step_t: float = -1.0
-    voltage_step: float = 0.0  # phase-peak emf magnitude after the step, V
-
-    _quantities = {"voltage_step": "voltage"}
-    _defaults_pu = {"voltage_step": 1.0}
-
 
 # ------------------------------------------------------------------ a converter unit
 
@@ -426,43 +412,8 @@ class ProtectionParams:
 
 
 @dataclass(frozen=True)
-class StartupParams:
-    start: float = 0.0
-    duration: float = 0.0  # s; ramp of the DC source and of id0
-
-
-@dataclass(frozen=True)
-class SetpointStepParams:
-    """Step of a controller setpoint (GFM ``p_ref`` / ``q_ref`` / ``v_ref``)."""
-
-    t: float = -1.0
-    p_ref_pu: Optional[float] = None
-    q_ref_pu: Optional[float] = None
-    v_ref_pu: Optional[float] = None
-
-    _quantities = {"p_ref_pu": "power", "q_ref_pu": "power", "v_ref_pu": "voltage"}
-
-
-@dataclass(frozen=True)
-class PLLGainStepParams:
-    t: float = -1.0
-    kp_after_pu: float = 0.0
-
-    _quantities = {"kp_after_pu": "1/voltage"}
-
-
-@dataclass(frozen=True)
-class UnitEventParams:
-    """Events applied to one converter unit."""
-
-    startup: StartupParams = field(default_factory=StartupParams)
-    setpoint: SetpointStepParams = field(default_factory=SetpointStepParams)
-    pll_gain: PLLGainStepParams = field(default_factory=PLLGainStepParams)
-
-
-@dataclass(frozen=True)
 class UnitParams:
-    """One converter unit: rating, plant components, control, protection and events.
+    """One converter unit: rating, plant components, control and protection.
 
     ``bus``: terminal bus. Plant fields are stored in SI; controller parameters are
     pu on the unit's rating ``s_base`` (VA) and DC base (``dclink.vdc_ref``).
@@ -477,9 +428,9 @@ class UnitParams:
     s_base: Optional[float] = None  # rating (VA); default: the system base
     measurement: MeasurementParams = field(default_factory=MeasurementParams)
     protection: ProtectionParams = field(default_factory=ProtectionParams)
-    events: UnitEventParams = field(default_factory=UnitEventParams)
     base: BaseValues = field(init=False, default=None)  # set by resolved()
     derived_defaults: frozenset = field(init=False, default=frozenset(), compare=False)
+    events: tuple = field(init=False, default=(), compare=False)
 
     @staticmethod
     def _bases(data: dict, base: BaseValues, where: str) -> tuple[BaseValues, dict[str, float]]:
@@ -496,8 +447,8 @@ class UnitParams:
             raise ConfigError(f"{where}.dclink.vdc_ref must be finite and positive")
         return base, base.parameter_scales(vdc_ref)
 
-    def resolved(self, system_base: BaseValues) -> UnitParams:
-        """Return a copy with its base and dependent defaults resolved."""
+    def resolved(self, system_base: BaseValues, events: tuple = ()) -> UnitParams:
+        """Return a copy with its base, target events and dependent defaults resolved."""
         derived = set()
         pwm = self.pwm
         if pwm.update_period is None:
@@ -516,6 +467,7 @@ class UnitParams:
             self.s_base, system_base.v_ll_rms, system_base.f0)
         object.__setattr__(unit, "base", base)
         object.__setattr__(unit, "derived_defaults", frozenset(derived))
+        object.__setattr__(unit, "events", tuple(events))
         return unit
 
     @property
@@ -613,6 +565,7 @@ class Params:
     simulation: SimulationParams
     sources: dict[str, SourceParams] = field(default_factory=dict)
     branches: dict[str, BranchParams] = field(default_factory=dict)
+    events: dict[str, Any] = field(default_factory=dict, metadata={"entries": "event"})
     meta: MetaParams = field(default_factory=MetaParams)
 
     def unit(self, name: Optional[str] = None) -> UnitParams:
@@ -631,6 +584,15 @@ class Params:
         """All named elements (buses, branches, sources, units) in assembly order."""
         return {**self.buses, **self.branches, **self.sources, **self.units}
 
+    def section_of(self, name: str) -> Optional[str]:
+        """Return the named section containing ``name``, or ``None``."""
+        return next((section for section in NAMED if name in getattr(self, section)), None)
+
+    @functools.cached_property
+    def changes(self) -> tuple["Change", ...]:
+        """The checked parameter state after each ``set`` event, in event order."""
+        return set_changes(self)
+
     @staticmethod
     def _bases(data: dict, base: Any, where: str) -> tuple[Any, Optional[dict[str, float]]]:
         """The system base and its pu scales, for the network (``None`` without a base: reported as missing)."""
@@ -646,6 +608,8 @@ class Params:
         free = ("simulation.initial.states.", "simulation.solver.subsystems.")  # dotted keys themselves
         for path, value in path_values.items():
             head = next((h for h in free if path.startswith(h)), None)
+            if head is None and path.startswith("events.") and ".set." in path:
+                head = path[:path.index(".set.") + 5]
             if head is not None:  # remainder is one key
                 node = d
                 for k in head.rstrip(".").split("."):
@@ -673,10 +637,13 @@ class Params:
 # ------------------------------------------------------------------ construction from mappings
 
 def from_dict(data: dict) -> Params:
-    """Build, check and resolve a :class:`Params` tree from a mapping (the input is not modified)."""
+    """Build, validate and resolve parameters, including every successive ``set`` event."""
     p = _build(Params, _normalize(data), "", None, None)
     validate(p)
-    return replace(p, units={name: unit.resolved(p.base) for name, unit in p.units.items()})
+    p = replace(p, units={name: unit.resolved(p.base, events_for(p.events, name))
+                          for name, unit in p.units.items()})
+    p.changes
+    return p
 
 
 def to_dict(p: Any, derived: bool = False) -> dict:
@@ -710,15 +677,15 @@ def _numeric_string(value: Any) -> Any:
     return value
 
 
-def _flatten_states(states: Any, prefix: str = "") -> dict:
-    """Flatten nested state mappings to dotted keys; lists are kept as values."""
-    if not isinstance(states, dict):
-        raise ConfigError(f"simulation.initial.states{'.' + prefix if prefix else ''}: expected a mapping")
+def flat_paths(values: Any, where: str = "", prefix: str = "") -> dict:
+    """Flatten nested mappings to dotted paths; lists and scalars remain values."""
+    if not isinstance(values, dict):
+        raise ConfigError(f"{where}{'.' + prefix if prefix else ''}: expected a mapping")
     out: dict = {}
-    for key, value in states.items():
+    for key, value in values.items():
         name = f"{prefix}.{key}" if prefix else str(key)
         if isinstance(value, dict):
-            out.update(_flatten_states(value, name))
+            out.update(flat_paths(value, where, name))
         else:
             out[name] = value
     return out
@@ -733,7 +700,12 @@ def _normalize(data: dict) -> dict:
     init = simulation.get("initial") if isinstance(simulation, dict) else None
     if isinstance(init, dict) and init.get("states") is not None:
         init["states"] = {key: _numeric_string(value)
-                          for key, value in _flatten_states(init["states"]).items()}
+                          for key, value in flat_paths(init["states"], "simulation.initial.states").items()}
+    events = data.get("events")
+    if isinstance(events, dict):
+        for name, event in events.items():
+            if isinstance(event, dict) and "set" in event:
+                event["set"] = flat_paths(event["set"], f"events.{name}.set")
     solver = simulation.get("solver") if isinstance(simulation, dict) else None
     subsystems = solver.get("subsystems") if isinstance(solver, dict) else None
     if isinstance(subsystems, dict):
@@ -754,18 +726,33 @@ def _is_optional(tp) -> tuple[bool, Any]:
     return False, tp
 
 
-def _loop_class(data: Any, path: str) -> type:
-    """The parameter class of a ``control.loops`` entry: that of its registered type."""
+_TYPED = {
+    "loop": (LOOP_TYPES, ""),
+    "event": (EVENT_TYPES, ". Register a custom event type with peslite.register_event_type before loading the file"),
+}
+
+
+def _typed_class(what: str, data: Any, path: str) -> type:
+    registry, hint = _TYPED[what]
     kind = data.get("type") if isinstance(data, dict) else None
-    if kind not in LOOP_TYPES:
-        raise ConfigError(f"{path}.type: unknown loop type {kind!r}; known: {sorted(LOOP_TYPES)}")
-    return LOOP_TYPES[kind].Params
+    if not isinstance(kind, str) or kind not in registry:
+        raise ConfigError(f"{path}.type: unknown {what} type {kind!r}; known: {sorted(registry)}{hint}")
+    return registry[kind].Params
 
 
-def _build_named(item_cls, data: Any, path: str, base: Any, scales: Optional[dict]) -> dict:
+def _target_scales(event: Any, parent: dict, base: Any) -> Optional[dict]:
+    """Use a target unit's pu bases for a custom event's electrical parameters."""
+    target = event.get("target") if isinstance(event, dict) else None
+    units = parent.get("units")
+    if not isinstance(target, str) or not isinstance(units, dict) or not isinstance(units.get(target), dict):
+        return None
+    return UnitParams._bases(units[target], base, f"units.{target}")[1]
+
+
+def _build_named(item_cls, data: Any, path: str, base: Any, scales: Optional[dict], parent: dict) -> dict:
     """Build a name -> entry mapping; names must be non-empty and contain no dots.
 
-    ``item_cls``: the class of the entries, ``"loop"`` for loop entries, or anything else for raw values.
+    ``item_cls`` is a dataclass, a raw type, or a registered typed entry (``loop``/``event``).
     """
     if not isinstance(data, dict):
         raise ConfigError(f"{path}: expected a mapping of names to entries, got {type(data).__name__}")
@@ -775,8 +762,11 @@ def _build_named(item_cls, data: Any, path: str, base: Any, scales: Optional[dic
         if not name or "." in name:
             raise ConfigError(f"{path}: {name!r} is not a usable name (non-empty, no '.')")
         where = f"{path}.{name}"
-        if item_cls == "loop":
-            out[name] = _build(_loop_class(item, where), item, where, base, scales)
+        if item_cls in _TYPED:
+            if is_dataclass(item):
+                item = to_dict(item)
+            here = (_target_scales(item, parent, base) if item_cls == "event" else None) or scales
+            out[name] = _build(_typed_class(item_cls, item, where), item, where, base, here)
         else:
             out[name] = _build(item_cls, item, where, base, scales) if is_dataclass(item_cls) else item
     return out
@@ -823,7 +813,8 @@ def _build(cls, data: Any, path: str, base: Any, scales: Optional[dict]):
             elif is_dataclass(inner) and isinstance(inner, type):
                 kwargs[f.name] = _build(inner, value, key, base, scales)
             elif get_origin(inner) in (dict, _Mapping):
-                kwargs[f.name] = _build_named(f.metadata.get("entries", get_args(inner)[1]), value, key, base, scales)
+                kwargs[f.name] = _build_named(f.metadata.get("entries", get_args(inner)[1]), value, key,
+                                              base, scales, data)
             elif inner is float:
                 if isinstance(value, str):  # YAML 1.1 reads "2.0e6" as a string
                     try:
@@ -868,6 +859,92 @@ def _build(cls, data: Any, path: str, base: Any, scales: Optional[dict]):
         if getattr(obj, name) not in choices:
             raise ConfigError(f"{path or cls.__name__}.{name}: {getattr(obj, name)!r} not in {choices}")
     return obj
+
+
+# ------------------------------------------------------------------ set events
+
+RUNTIME = (
+    "buses.*.c", "buses.*.r_d",
+    "branches.*.l", "branches.*.r",
+    "sources.*.v", "sources.*.f", "sources.*.angle", "sources.*.l", "sources.*.r",
+    "units.*.control.references.*",
+    "units.*.control.loops.*.** (not type, period)",
+    "units.*.protection.**",
+    "units.*.dclink.source.* (not type)",
+)
+
+
+@dataclass(frozen=True)
+class Change:
+    """Parameters after one ``set`` event and the stored SI paths changed by it."""
+
+    t: float
+    event: str
+    params: Any
+    paths: tuple[str, ...]
+
+    def touches(self, prefix: str) -> list[str]:
+        return [path[len(prefix):] for path in self.paths if path.startswith(prefix)]
+
+
+def runtime_changeable(path: str, p: Params) -> bool:
+    """Whether stored parameter ``path`` may be changed by a ``set`` event."""
+    section, _, rest = path.partition(".")
+    _name, _, rest = rest.partition(".")
+    keys = rest.split(".")
+    if section == "buses":
+        return keys in (["c"], ["r_d"])
+    if section == "branches":
+        return keys in (["l"], ["r"])
+    if section == "sources":
+        return len(keys) == 1 and keys[0] in ("v", "f", "angle", "l", "r")
+    if section == "units":
+        if keys[:2] == ["control", "references"]:
+            return len(keys) == 3
+        if keys[:2] == ["control", "loops"]:
+            return len(keys) >= 4 and keys[3] not in ("type", "period")
+        if keys[0] == "protection":
+            return True
+        return keys[:2] == ["dclink", "source"] and len(keys) == 3 and keys[2] != "type"
+    return False
+
+
+def set_changes(p: Params) -> tuple[Change, ...]:
+    """Apply and validate ``set`` events in time/file order and return their resulting parameters."""
+    events = [(event.t, index, name, event)
+              for index, (name, event) in enumerate(p.events.items()) if event.type == "set"]
+    if not events:
+        return ()
+    current = replace(p, events={})
+    flat = flat_paths(to_dict(current, derived=True))
+    changed_by: dict[tuple[float, str], str] = {}
+    out: list[Change] = []
+    for event_t, _index, name, event in sorted(events, key=lambda item: item[:2]):
+        where = f"events.{name}"
+        if not event.set:
+            raise ConfigError(f"{where}.set: nothing to change")
+        for path in event.set:
+            if path.split(".", 1)[0] not in NAMED:
+                raise ConfigError(f"{where}.set.{path}: cannot change during a run; a set event changes "
+                                  f"{', '.join(RUNTIME)}")
+        try:
+            after = current.replace(**event.set)
+        except ConfigError as exc:
+            raise ConfigError(f"{where}: after this event, {exc}") from None
+        new = flat_paths(to_dict(after, derived=True))
+        paths = tuple(path for path in new if new[path] != flat.get(path))
+        for path in paths:
+            if not runtime_changeable(path, after):
+                raise ConfigError(f"{where}: {path} cannot change during a run; a set event changes "
+                                  f"{', '.join(RUNTIME)}")
+            key = (event_t, path)
+            if key in changed_by:
+                raise ConfigError(f"{where}: {path} is also set at t = {event_t} "
+                                  f"by events.{changed_by[key]}")
+            changed_by[key] = name
+        out.append(Change(event_t, name, after, paths))
+        current, flat = after, new
+    return tuple(out)
 
 
 # ------------------------------------------------------------------ files
@@ -956,7 +1033,7 @@ def read_tree(path: str | Path) -> dict:
     return data
 
 
-_FILE_ORDER = ("base", "buses", "branches", "sources", "units", "simulation", "meta")
+_FILE_ORDER = ("base", "buses", "branches", "sources", "units", "events", "simulation", "meta")
 
 
 def _written_out(p: Params) -> dict:
@@ -971,6 +1048,9 @@ def _written_out(p: Params) -> dict:
         measurement = unit["measurement"]
         if measurement["window"] is None and "window" in (measurement["average"], measurement["u_dc"]):
             measurement["window"] = u.pwm.update_period
+    for name, source in d["sources"].items():
+        if source["f"] is None:
+            source["f"] = p.base.f0
     return _switches({key: d[key] for key in _FILE_ORDER})
 
 
