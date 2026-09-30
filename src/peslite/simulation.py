@@ -1,4 +1,4 @@
-"""Simulation event loop and command-line interface (run through ``peslite.py``).
+"""Simulation event loop and command-line interface (run through ``peslite``).
 
 Order at a coincident instant: over-current check, ADC samples, loop updates, PWM publication,
 window opening, switching instants, snapshot.
@@ -685,7 +685,7 @@ class SystemLoop:
 
 # --------------------------------------------------------- command-line entry
 
-_ROOT = Path(__file__).resolve().parent  # the repository folder
+_ROOT = Path(__file__).resolve().parent  # the installed package folder
 _EXAMPLE_CONFIGS = _ROOT / "configs"
 _RESULTS = Path.cwd() / "output"
 _CONFIG_SUFFIXES = (".yaml", ".yml", ".json")
@@ -735,10 +735,10 @@ def parse_override(text: str):
 def main(argv=None) -> int:
     """Run a converter configuration and save its states, summary and configured signals.
 
-    With no config argument, run the first YAML/JSON file in configs/ (sorted by filename).
+    With no config argument, run the first bundled example (sorted by filename).
     """
     ap = argparse.ArgumentParser(description=main.__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("config", nargs="?", help="configuration name or path; default: first file in configs by filename")
+    ap.add_argument("config", nargs="?", help="configuration name or path; default: first bundled example by filename")
     ap.add_argument("--set", action="append", default=[], type=parse_override, metavar="PATH=VALUE",
                     help="override a dotted parameter path (repeatable)")
     ap.add_argument("--initial", default=None, metavar="FILE",

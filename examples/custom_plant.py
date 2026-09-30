@@ -1,6 +1,7 @@
 """Run a case with an extra bus, a user synchronization law and a user solver.
 
-    python examples/custom_plant.py configs/gfm-psc.yaml
+    python examples/custom_plant.py
+    python examples/custom_plant.py path/to/case.yaml
 
 The law's time constant is read from ``meta.custom.psc_lag_tau_s`` in the configuration.
 """
@@ -13,7 +14,8 @@ from typing import Any, Mapping
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 
 import peslite  # noqa: E402
 from peslite.phs.protocols import SolverStep  # noqa: E402
@@ -78,7 +80,8 @@ class Midpoint:
 
 
 def main(argv=None) -> int:
-    config = argv[0] if argv else (sys.argv[1] if len(sys.argv) > 1 else "configs/gfm-psc.yaml")
+    default = ROOT / "src" / "peslite" / "configs" / "gfm-psc-example.yaml"
+    config = argv[0] if argv else (sys.argv[1] if len(sys.argv) > 1 else default)
     p = two_section_system(peslite.load(config, **{"simulation.t_end": 1.0, "simulation.progress_every": 0.0}))
     p = p.replace(**{"initial.states.plant.mid.u_C": "source"})  # the extra bus, pre-charged
     u = p.unit("vsc")

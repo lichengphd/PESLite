@@ -17,7 +17,7 @@ from .simulation import Simulation, main
 from .results import SimulationResult
 from .sensing import MeasurementPorts
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "assembly", "control", "firmware", "modulation", "params", "power", "protection",

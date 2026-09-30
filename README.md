@@ -24,38 +24,38 @@ Python 3.10 or newer.
 ## Quick start
 
 ```bash
-# run the first configuration in configs/ (sorted by name)
-python peslite.py
+# run the first bundled example (sorted by name)
+peslite
 
-# run a configuration by name or path; results go to output/<name>/
-python peslite.py gfl
-python peslite.py configs/gfm-psc.yaml --out output/psc
+# run a bundled example by name; results go to output/<name>/
+peslite gfl-example
+peslite gfm-psc-example --out output/psc
 
-# Run your own configuration
+# run your own configuration
 peslite case.yaml
-peslite ./configs/my-converter.yaml
+peslite ./cases/my-converter.yaml
 
 # A suffix may be omitted
 peslite case
 
-# Bundled examples are also available by name
-peslite gfl
-peslite gfm-psc
-peslite gfm-droop
+# bundled examples use the -example suffix
+peslite gfl-example
+peslite gfm-psc-example
+peslite gfm-droop-example
 
 # override any parameter by its dotted path
-python peslite.py gfl --set simulation.t_end=1 --set units.vsc.delay.steps=1
-python peslite.py gfl --set simulation.solver.type=adaptive --set simulation.solver.method=DP45
-python peslite.py gfm-droop --set simulation.bridge=switching
+peslite gfl-example --set simulation.t_end=1 --set units.vsc.delay.steps=1
+peslite gfl-example --set simulation.solver.type=adaptive --set simulation.solver.method=DP45
+peslite gfm-droop-example --set simulation.bridge=switching
 
 # continue a run from its last saved state (or from time T with --initial-time T)
-python peslite.py gfl --out output/a
-python peslite.py gfl --initial output/a/states.csv --out output/b
+peslite gfl-example --out output/a
+peslite gfl-example --initial output/a/states.csv --out output/b
 
 # inspect a configuration
-python peslite.py gfl --list-states     # state names (the states.csv columns)
-python peslite.py gfl --ph-report       # port-Hamiltonian structure of the circuit
-python peslite.py --help
+peslite gfl-example --list-states     # state names (the states.csv columns)
+peslite gfl-example --ph-report       # port-Hamiltonian structure of the circuit
+peslite --help
 ```
 
 From Python (in this folder, or anywhere after `pip install -e .`):
@@ -63,7 +63,7 @@ From Python (in this folder, or anywhere after `pip install -e .`):
 ```python
 import peslite
 
-p = peslite.load("configs/gfl.yaml", **{"simulation.t_end": 1.0})
+p = peslite.load("case.yaml", **{"simulation.t_end": 1.0})
 r = peslite.Simulation(p).run()
 
 r.states["plant.vsc.dclink.u_C"]   # a state over time
@@ -78,13 +78,13 @@ r.save("output/run")               # states.csv, summary.json, params.yaml
 
 | File | Content |
 |---|---|
-| `configs/gfl.yaml` | Grid-following converter; every key is annotated |
-| `configs/gfm-psc.yaml` | Grid-forming, power-synchronization control |
-| `configs/gfm-droop.yaml` | Grid-forming, droop with virtual admittance and current loop |
-| `configs/gfm-vsg.yaml` | Grid-forming, virtual synchronous generator |
-| `configs/gfm-dvoc.yaml` | Grid-forming, dispatchable virtual oscillator control |
-| `configs/gfm-matching.yaml` | Grid-forming, matching control |
-| `configs/two-converters.yaml` | A grid-forming and a grid-following unit on one grid |
+| `gfl-example` | Grid-following converter; every key is annotated |
+| `gfm-psc-example` | Grid-forming, power-synchronization control |
+| `gfm-droop-example` | Grid-forming, droop with virtual admittance and current loop |
+| `gfm-vsg-example` | Grid-forming, virtual synchronous generator |
+| `gfm-dvoc-example` | Grid-forming, dispatchable virtual oscillator control |
+| `gfm-matching-example` | Grid-forming, matching control |
+| `two-converters-example` | A grid-forming and a grid-following unit on one grid |
 
 ## Frequently used settings
 
@@ -131,24 +131,23 @@ See `examples/custom_plant.py` (custom network section, synchronization law and 
 
 ## Layout
 
-The repository folder is the `peslite` package.
-
 ```
-peslite.py      command line
-simulation.py   simulation loop
-__init__.py     package exports
-phs/            circuit model, energy accounting, solvers
-params/         parameter schema, validation, file I/O
-power/          sources, lines, buses, bridge, dc link
-control/        PLL, current and dc-voltage loops, grid-forming laws, control graph
-firmware/       pu conversion, limiter, delay, transforms
-modulation/     PWM methods and modulators
-sensing/        ADC sampling
-protection/     relay
-results/        recording and result files
-assembly/       converter unit, system assembly
-configs/        example configurations
-examples/       usage examples
+pyproject.toml
+src/peslite/          installable package
+  simulation.py       simulation loop and command line
+  __init__.py         package exports
+  phs/                circuit model, energy accounting, solvers
+  params/             parameter schema, validation, file I/O
+  power/              sources, lines, buses, bridge, dc link
+  control/            converter control
+  firmware/           pu conversion, limiter, delay, transforms
+  modulation/         PWM methods and modulators
+  sensing/            ADC sampling
+  protection/         relay
+  results/            recording and result files
+  assembly/           converter unit and system assembly
+  configs/            bundled *-example simulation files
+examples/             usage scripts
 ```
 
 ## License

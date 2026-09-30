@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "peslite"
-version = "0.1.0"
+version = "0.1.1"
 description = "Power-electronics simulation with an internal port-Hamiltonian solver kernel (peslite.phs): connected subsystem models, energy accounting, fixed/adaptive/multirate integration and converter control."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,23 +23,8 @@ Homepage = "https://github.com/lonaparte/PESLite"
 Repository = "https://github.com/lonaparte/PESLite"
 Issues = "https://github.com/lonaparte/PESLite/issues"
 
-[tool.setuptools]
-# The repository folder is the package itself.
-package-dir = {"peslite" = "."}
-packages = [
-    "peslite",
-    "peslite.assembly",
-    "peslite.control",
-    "peslite.firmware",
-    "peslite.modulation",
-    "peslite.params",
-    "peslite.phs",
-    "peslite.phs.solvers",
-    "peslite.power",
-    "peslite.protection",
-    "peslite.results",
-    "peslite.sensing",
-]
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.setuptools.package-data]
 peslite = [

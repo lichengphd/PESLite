@@ -1,6 +1,6 @@
 """Run one case with each solver variant in ``VARIANTS`` and several computation delays, and print a comparison.
 
-    python examples/compare_solvers.py configs/gfl.yaml --t-end 0.5
+    python examples/compare_solvers.py src/peslite/configs/gfl-example.yaml --t-end 0.5
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import peslite  # noqa: E402
 
