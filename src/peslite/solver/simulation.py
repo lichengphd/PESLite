@@ -327,6 +327,9 @@ class Simulation:
                 if not isinstance(obj, proto):
                     raise TypeError(f"{unit.name}: {type(obj).__name__} does not satisfy the "
                                     f"{proto.__name__} protocol")
+        check_events = getattr(self.system, "check_events", None)
+        if check_events is not None:
+            check_events(p)
         if not isinstance(self.solver, Solver):
             raise TypeError(f"{type(self.solver).__name__} does not satisfy the Solver protocol")
         self.result: SimulationResult | None = None
@@ -480,7 +483,7 @@ class Simulation:
         # the run ends at the earliest period boundary at or after t_end
         t_final = min(math.ceil((t_end - _EPS) / T) * T for T in periods)
         # trips already handled, by unit (a trip loaded with the initial states is handled at the first sample)
-        tripped = {u.name: bool(getattr(u.ctrl, "tripped", False)) or u.breaker_open for u in units}
+        tripped = {u.name: bool(getattr(u.ctrl, "tripped", False)) or u.tripped for u in units}
         for unit in units:
             pwm = unit.pwm
             pwm.k = int(round(t_start / pwm.period))

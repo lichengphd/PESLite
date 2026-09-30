@@ -12,6 +12,7 @@ from dataclasses import fields, is_dataclass
 
 from typing import TYPE_CHECKING
 
+from ..components.network import element_buses
 from ..solver.integrators import ADAPTIVE_METHODS, FIXED_METHODS
 from ..solver.model import ConfigError
 from ..solver.multirate import parse_step
@@ -176,7 +177,7 @@ def _network(p: Params) -> None:
         for name in getattr(p, kind):
             if name in seen:
                 raise ConfigError(f"{kind}.{name}: the name is already used by {seen[name]}; element "
-                                  f"names are unique across buses, branches, sources and units")
+                                  f"names are unique across buses, branches, sources, units and elements")
             seen[name] = f"{kind}.{name}"
     for name, bus in p.buses.items():
         if bus.c <= 0.0:
@@ -202,6 +203,12 @@ def _network(p: Params) -> None:
             raise ConfigError(f"sources.{name}.l must be > 0: a source is an emf behind an impedance")
     for name, u in p.units.items():
         _bus_of(f"units.{name}.bus", u.bus)
+    for name, element in p.elements.items():
+        for key, bus in element_buses(element).items():
+            _bus_of(f"elements.{name}.{key}", bus)
+        for key, value in vars(element).items():
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ConfigError(f"elements.{name}.{key} must be finite")
 
 
 def _solver(s, bridge: str) -> None:
@@ -248,7 +255,7 @@ def _events(p: Params) -> None:
             continue
         if section not in SWITCHABLE:
             raise ConfigError(f"{where}.target: {target!r} is a bus, which has no breaker; {event.type} "
-                              f"switches a unit, source or branch")
+                              f"switches a unit, source, branch or element")
         on = event.type == "connect"
         previous = switched.get(target)
         if previous is not None and previous[1] == on:

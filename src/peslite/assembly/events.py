@@ -22,8 +22,8 @@ __all__ = [
     "Scenario", "UnitScenario", "SourceScenario",
 ]
 
-NAMED = ("buses", "branches", "sources", "units")
-SWITCHABLE = ("branches", "sources", "units")
+NAMED = ("buses", "branches", "sources", "units", "elements")
+SWITCHABLE = ("branches", "sources", "units", "elements")
 SWITCHING = ("connect", "disconnect")
 
 

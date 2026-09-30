@@ -59,7 +59,8 @@ class Loop:
     :data:`ROLES`, or ``None``: wired only by ``control.connections``). With ``outputs_from_state``
     its held outputs are set from its states (``initial_outputs()``) when states are loaded.
     It provides ``initial_outputs()`` and ``update(t, inputs) -> outputs``; its named states are the
-    attributes in ``state_names`` unless it overrides ``get_state`` / ``set_state``.
+    attributes in ``state_names`` unless it overrides ``get_state`` / ``set_state``. A loop rebuilt
+    after retuning continues from those states and from attributes listed in ``carried``.
     ``cfg``: the loop's parameters; ``unit``: the unit's parameters; ``scenario``: the unit's
     connection state and ramp over time.
     """
@@ -72,6 +73,7 @@ class Loop:
     role: ClassVar[Optional[str]] = None
     outputs_from_state: ClassVar[bool] = False  # held outputs = initial_outputs() after loading states
     state_names: tuple[str, ...] = ()
+    carried: ClassVar[tuple[str, ...]] = ()
 
     def __init__(self, cfg: Any, unit: Any, scenario: Any) -> None:
         self.cfg, self.unit, self.scenario = cfg, unit, scenario
@@ -87,6 +89,11 @@ class Loop:
 
     def set_state(self, values: Mapping[str, Any]) -> None:
         assign(self, values, self.state_names)
+
+    def retuned(self, old: "Loop") -> None:
+        """Take non-state runtime attributes from the loop instance being replaced."""
+        for name in self.carried:
+            setattr(self, name, getattr(old, name))
 
 
 LOOP_TYPES: dict[str, type] = {}
@@ -217,6 +224,7 @@ class CurrentLoop(Loop):
     inputs = {"id_ref": CURRENT, "iq_ref": CURRENT, "v": V_AB, "i": I_AB, "frame": ANGLE, "omega": FREQUENCY,
               "extra": V_DQ}
     outputs = {"u_dq": V_DQ, "extra": V_DQ}
+    carried = ("frozen",)
 
     def __init__(self, cfg, unit, scenario):
         super().__init__(cfg, unit, scenario)
@@ -229,6 +237,7 @@ class CurrentLoop(Loop):
         self.integral = self._prev_integral = 0j
         self._last: tuple[complex, complex, complex, float] | None = None
         self.extra = 0j
+        self.frozen = False
 
     def initial_outputs(self):
         return {"u_dq": 0j, "extra": 0j}
@@ -237,9 +246,12 @@ class CurrentLoop(Loop):
         rot = _into(inputs["frame"])
         self.extra = inputs["extra"]
         i, u_ff, omega = inputs["i"] * rot, inputs["v"] * rot, inputs["omega"]
-        e = complex(inputs["id_ref"], inputs["iq_ref"]) - i
         self._prev_integral = self.integral
-        self.integral = self.integral + self.T * e
+        if self.frozen:
+            e = 0j
+        else:
+            e = complex(inputs["id_ref"], inputs["iq_ref"]) - i
+            self.integral = self.integral + self.T * e
         self._last = (e, i, u_ff, omega)
         return {"u_dq": self.command(e, i, u_ff, omega) + self.extra, "extra": self.extra}
 
@@ -302,6 +314,7 @@ class DCVoltageLoop(Loop):
     role = "dc_voltage"
     inputs = {"u_dc": DC_VOLTAGE, "vdc_ref": DC_VOLTAGE}
     outputs = {"id_ref": CURRENT}
+    carried = ("frozen", "n_updates", "n_clamped", "n_reverse", "first_clamp_t")
 
     def __init__(self, cfg, unit, scenario):
         super().__init__(cfg, unit, scenario)

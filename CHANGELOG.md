@@ -108,3 +108,15 @@
 - A `set` event may change only declared runtime paths. Events are applied in time and file order
   to the values left by preceding events; the complete parameter tree is rebuilt and validated
   after every event. `Params.changes` exposes the resulting parameters and canonical SI paths.
+
+### Event-capable components (#2)
+
+- Network branches, sources, buses, converter units and DC sources expose connection or retuning
+  operations. `System.switch()` and `System.apply()` route checked events to the affected parts and
+  refresh their energy declarations after parameter changes.
+- Control-reference changes take effect at the next controller update. A changed loop is rebuilt
+  from its new parameters while retaining its named state and runtime counters; protection settings
+  can be retuned without replacing the controller.
+- The new top-level `elements` mapping contains typed circuit elements. `load` is the built-in
+  series R-L load to ground; custom types register with `peslite.register_element_type` and declare
+  their own parameter dataclass, buses, subsystems and optional event operations.

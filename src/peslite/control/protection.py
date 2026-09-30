@@ -48,9 +48,19 @@ class Protection:
         self.stats = ProtectionStats()
         self._timers = {"hold_uv": HoldTimer(T), "hold_ov": HoldTimer(T), "hold_freq": HoldTimer(T),
                         "hold_vdc": HoldTimer(T)}
-        n = max(1, int(cfg.rocof.window / T + 0.5))
+        self._window(cfg.rocof.window)
+
+    def _window(self, window: float) -> None:
+        """Start an empty ROCOF window with the requested duration."""
+        n = max(1, int(window / self.T + 0.5))
         self._rocof = MovingWindow(n)
-        self._rocof_window = n * T
+        self._rocof_window = n * self.T
+
+    def retune(self, cfg: Any) -> None:
+        """Apply new protection settings; a changed ROCOF window starts empty."""
+        if cfg.rocof.window != self.cfg.rocof.window:
+            self._window(cfg.rocof.window)
+        self.cfg = cfg
 
     @property
     def tripped(self) -> bool:

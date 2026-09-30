@@ -23,6 +23,7 @@ class Unit:
 
     ``ctrl``, ``modulator``, ``delay``: replacements of the parts built from the section. The unit
     samples with ``adc``, controls with ``ctrl`` and switches its bridge through ``pwm``.
+    Events connect or disconnect its filter and DC source and may retune runtime parameters.
     """
 
     def __init__(self, name: str, cfg: UnitParams, sim: SimulationParams, bus: Any,
@@ -34,11 +35,14 @@ class Unit:
         self.scenario = sc = UnitScenario(cfg.events)
 
         # ------------------------------------------------------------ power
-        self.dclink = make_dclink(cfg.dclink, ramp=sc.ramp_value)
+        self.dclink = make_dclink(cfg.dclink)
+        t0 = sim.initial.t
+        since, ramp = sc.since(t0)
+        self.dclink.connect(sc.connected(t0), since, ramp if t0 < since + ramp else 0.0)
         self.bridge = Bridge()
         self.branch_f = RLBranch(cfg.ac_filter.l_f, cfg.ac_filter.r_f)
         self.breakers = [self.branch_f, self.dclink]
-        self.breaker_open = False
+        self.tripped = False
 
         # ------------------------------------------------------------ ADC
         # instantaneous samples or window means; the window holds only the averaged channels
@@ -93,19 +97,36 @@ class Unit:
 
     # ---------------------------------------------------------------- states
     def get_state(self) -> dict[str, Any]:
-        return {"breaker_open": self.breaker_open}
+        return {"tripped": self.tripped}
 
     def set_state(self, values: Mapping[str, Any]) -> None:
-        if values.get("breaker_open", False) and not self.breaker_open:
+        if values.get("tripped", False) and not self.tripped:
             self.trip()
 
     # ---------------------------------------------------------------- the run
+    def connect(self, on: bool, t: float, ramp: float = 0.0) -> None:
+        """Connect or disconnect the filter branch and DC source at ``t``."""
+        if on and not self.tripped:
+            self.branch_f.close_breaker()
+        elif not on:
+            self.branch_f.open_breaker()
+        self.dclink.connect(on, t, ramp)
+
+    def retune(self, cfg: UnitParams, paths: list[str], t: float) -> None:
+        """Apply runtime-changeable DC-source, control and protection parameters."""
+        if any(path.startswith("dclink.source.") for path in paths):
+            source = cfg.dclink.source
+            self.dclink.retune_source(source.i, source.k, source.v, source.r)
+        rest = [path for path in paths if not path.startswith("dclink.")]
+        if rest:
+            self.ctrl.retune(cfg, rest, t)
+
     def trip(self) -> None:
         """Open this unit's breakers (filter branch and dc source); other units keep running.
 
         The caller must repack the solver state vector afterwards.
         """
-        self.breaker_open = True
+        self.tripped = True
         for breaker in self.breakers:
             breaker.open_breaker()
 

@@ -1,11 +1,11 @@
-"""The parameters of a simulation file: their classes, the pu bases, and their construction from a mapping.
+"""Simulation-file parameters, pu bases, typed construction and runtime ``set`` changes.
 
 Electrical inputs without suffix are SI values; ``_pu`` names are per unit. Plant quantities are
 stored in SI, controller quantities in pu. A field listed in a class's ``_quantities`` may be given
 in SI or pu. :func:`from_dict` builds the checked :class:`Params` from a mapping in one pass: it
 converts each section's inputs on the bases in force there (the system base, or a unit's own), checks
-fields, types and choices, and builds the loops with the parameters of their registered types (a
-loop type declares its own, :class:`peslite.control.loops.Loop`); :func:`to_dict` converts back.
+fields, types and choices, and builds registered loop, element and event parameter types;
+:func:`to_dict` converts back.
 
 pu bases, AC: Vb = sqrt(2/3)*v_ll_rms (phase peak), Ib = S/(1.5*Vb), Zb = Vb/Ib, w0 = 2*pi*f0;
 DC: Vdc = vdc_ref, Idc = S/Vdc, Zdc = Vdc**2/S. L base = Z/w0, C base = 1/(w0*Z).
@@ -24,6 +24,7 @@ from dataclasses import dataclass, field, fields, is_dataclass, replace
 from pathlib import Path
 from typing import Any, Optional, Union, get_args, get_origin, get_type_hints
 
+from ..components.network import ELEMENT_TYPES, element_buses
 from ..control.loops import LOOP_TYPES
 from ..solver.model import ConfigError
 from .events import EVENT_TYPES, NAMED, events_for
@@ -555,8 +556,8 @@ class MetaParams:
 class Params:
     """Complete configuration: system base, network elements, units and run settings.
 
-    ``buses``, ``branches``, ``sources`` and ``units`` map names to elements; names
-    are unique across all four and prefix the state names.
+    ``buses``, ``branches``, ``sources``, ``units`` and ``elements`` map names to entries;
+    their names are unique together and prefix state names.
     """
 
     base: BaseValues  # system base, used for network pu inputs
@@ -565,6 +566,7 @@ class Params:
     simulation: SimulationParams
     sources: dict[str, SourceParams] = field(default_factory=dict)
     branches: dict[str, BranchParams] = field(default_factory=dict)
+    elements: dict[str, Any] = field(default_factory=dict, metadata={"entries": "element"})
     events: dict[str, Any] = field(default_factory=dict, metadata={"entries": "event"})
     meta: MetaParams = field(default_factory=MetaParams)
 
@@ -578,11 +580,6 @@ class Params:
         if name not in self.units:
             raise ConfigError(f"unknown unit {name!r}; known: {sorted(self.units)}")
         return self.units[name]
-
-    @property
-    def elements(self) -> dict[str, Any]:
-        """All named elements (buses, branches, sources, units) in assembly order."""
-        return {**self.buses, **self.branches, **self.sources, **self.units}
 
     def section_of(self, name: str) -> Optional[str]:
         """Return the named section containing ``name``, or ``None``."""
@@ -728,6 +725,8 @@ def _is_optional(tp) -> tuple[bool, Any]:
 
 _TYPED = {
     "loop": (LOOP_TYPES, ""),
+    "element": (ELEMENT_TYPES, ". Register a custom element type with "
+                               "peslite.register_element_type before loading the file"),
     "event": (EVENT_TYPES, ". Register a custom event type with peslite.register_event_type before loading the file"),
 }
 
@@ -871,6 +870,7 @@ RUNTIME = (
     "units.*.control.loops.*.** (not type, period)",
     "units.*.protection.**",
     "units.*.dclink.source.* (not type)",
+    "elements.*.* (not type, bus)",
 )
 
 
@@ -890,7 +890,7 @@ class Change:
 def runtime_changeable(path: str, p: Params) -> bool:
     """Whether stored parameter ``path`` may be changed by a ``set`` event."""
     section, _, rest = path.partition(".")
-    _name, _, rest = rest.partition(".")
+    name, _, rest = rest.partition(".")
     keys = rest.split(".")
     if section == "buses":
         return keys in (["c"], ["r_d"])
@@ -906,6 +906,10 @@ def runtime_changeable(path: str, p: Params) -> bool:
         if keys[0] == "protection":
             return True
         return keys[:2] == ["dclink", "source"] and len(keys) == 3 and keys[2] != "type"
+    if section == "elements":
+        element = p.elements.get(name)
+        return (element is not None and len(keys) == 1 and keys[0] != "type"
+                and keys[0] not in element_buses(element))
     return False
 
 
@@ -1033,7 +1037,7 @@ def read_tree(path: str | Path) -> dict:
     return data
 
 
-_FILE_ORDER = ("base", "buses", "branches", "sources", "units", "events", "simulation", "meta")
+_FILE_ORDER = ("base", "buses", "branches", "sources", "units", "elements", "events", "simulation", "meta")
 
 
 def _written_out(p: Params) -> dict:
