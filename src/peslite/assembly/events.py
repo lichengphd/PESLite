@@ -31,8 +31,8 @@ class Event:
     """Base class of a registered event type.
 
     A type supplies ``type``, a frozen ``Params`` dataclass containing at least ``type`` and ``t``,
-    and ``apply(event, system, t)``. The run will call ``apply`` at the event time once event-time
-    scheduling is connected to the solver.
+    and ``apply(event, system, t)``. The run calls ``apply`` at the exact event time, after settling
+    the preceding integration interval and before starting the next one.
     """
 
     type: ClassVar[str]

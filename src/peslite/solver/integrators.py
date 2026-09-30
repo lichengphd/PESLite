@@ -34,7 +34,14 @@ class SolverStep:
 
 @runtime_checkable
 class Solver(Protocol):
-    """Integrate ``y' = f(t, y)`` from ``t0`` to ``t1`` and return ``SolverStep``."""
+    """Integrate ``y' = f(t, y)`` from ``t0`` to ``t1`` and return ``SolverStep``.
+
+    A solver which defers part of the integration may additionally provide
+    ``settle(t, y) -> y``. The simulation calls it immediately before the model
+    changes at an event. A solver which caches model parameters may provide
+    ``parameters_changed()``; it is called after ``set`` events. Both hooks are
+    optional and are discovered with :func:`getattr`.
+    """
 
     def __call__(self, f: RHS, t0: float, t1: float, y0: NDArray[np.float64]) -> SolverStep: ...
 
