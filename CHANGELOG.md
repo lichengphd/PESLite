@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.1.3
+
+### Per-unit bridge models (#3)
+
+- The bridge model is selected independently for each converter. A unit uses exact switching by
+  default; `units.<u>.averaging: {enable: 1, over: pwm_period}` averages over each PWM period, and
+  `over: time_step` averages the carrier comparison over each fixed solver step.
+- `--averaging` enables averaging for every unit for one run and takes precedence over `--set` of
+  its `enable` switch. When it changes a model, the default result directory gains the
+  `-averaging` suffix. Different units in the same system may use different models.
+- Time-step averaging requires a fixed-step solver and an asynchronous carrier. Carrier phase and
+  synchronisation settings are ignored by PWM-period averaging. `StepAveragedCarrier` is renamed
+  to `TimeStepAveragedCarrier`.
+
+### Progress lines and watched quantities (#3)
+
+- `simulation.progress: {enable, period, watch}` replaces `simulation.progress_every`.
+  `--progress SECONDS` enables the lines; repeatable `--watch NAME` arguments, including
+  comma-separated names, replace the file's watch list.
+- Watched names may be state-table columns, plant/controller result columns, state aliases, or a
+  complex state without `.re`/`.im` to report its magnitude. The `plant.` prefix is optional in
+  watch expressions. Unknown names report the known set at the first progress line, and observing
+  values does not change the simulation trajectory.
+
+### Packaging and verification
+
+- Project version is 0.1.3. The root `examples/` directory remains data-only, keeps the
+  `*-example.pes` names and is included in the wheel. The PEP 639 `AGPL-3.0-only` metadata is
+  unchanged.
+- Added Issue #3 acceptance coverage for every bundled file under all three bridge models,
+  mixed-model systems, CLI precedence and output paths, solver/PWM compatibility, progress values,
+  aliases, complex magnitudes and run invariance.
+
 ## 0.1.2
 
 ### Issue #2 simulation-file and event model

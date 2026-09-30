@@ -15,7 +15,7 @@ from .assembly import (Params, SourceScenario, System, Unit, UnitScenario, dump,
                        register_event_type)
 from .solver.simulation import Simulation, SimulationResult, main
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 __all__ = [
     "solver", "control", "components", "assembly",

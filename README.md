@@ -6,7 +6,8 @@ Time-domain simulation of power-electronic converters in Python.
   simulation files, with run-time changes described as events.
 - Grid-following (PLL, current loop, dc-voltage loop) and grid-forming control
   (PSC, droop, VSG, dVOC, matching), each loop on its own clock.
-- Switching (ideal switches, exact switching instants), averaged and step-averaged bridges.
+- Switching bridges (ideal switches at exact instants) and bridges averaged over the PWM period
+  or solver step, selected independently for each converter.
 - Fixed-step, adaptive (SciPy or built-in DP45) and multirate integration.
 - ADC sampling (instantaneous or window average), computation delay, PWM, protection.
 - Energy accounting of the power circuit and restart from any saved state.
@@ -47,7 +48,11 @@ peslite gfm-droop-example
 # override any parameter by its dotted path
 peslite gfl-example --set simulation.t_end=1 --set units.vsc.delay.steps=1
 peslite gfl-example --set simulation.solver.type=adaptive --set simulation.solver.method=DP45
-peslite gfm-droop-example --set simulation.bridge=switching
+peslite gfm-droop-example --set units.vsc.averaging.enable=0
+
+# average every converter for this run; print progress with selected quantities
+peslite gfl-example --averaging
+peslite gfl-example --progress 0.1 --watch vsc.vdc_pu --watch vsc.i_c
 
 # continue a run from its last saved state (or from time T with --initial-time T)
 peslite gfl-example --out output/a
@@ -107,6 +112,31 @@ a converter that trips remains disconnected.
 The built-in `load` element is a series R-L load from a bus to ground. It can be connected,
 disconnected or retuned by events; a small impedance can be used to model a fault.
 
+## Bridge models
+
+Each converter uses a switching bridge unless its `averaging` section is enabled. This permits a
+system to mix switching and averaging converters:
+
+```yaml
+units:
+  vsc:
+    averaging: {enable: 1, over: pwm_period}  # pwm_period | time_step
+```
+
+| Setting | Model |
+|---|---|
+| `enable: 0` | ideal switches at the exact carrier-comparison instants |
+| `enable: 1, over: pwm_period` | duty ratios held as continuous bridge values over each PWM period; no carrier ripple |
+| `enable: 1, over: time_step` | carrier on-fraction averaged over each fixed solver step |
+
+`--averaging` enables averaging for every converter for one run without editing the file, while
+preserving each converter's configured `over` value. It takes precedence over an `enable: 0`
+command-line override. If the option changes at least one model, the default result directory is
+`output/<name>-averaging`.
+
+Time-step averaging requires a fixed-step solver and an asynchronous carrier. With PWM-period
+averaging there is no carrier, so carrier phase and synchronisation settings have no effect.
+
 ## Example configurations
 
 | File | Content |
@@ -124,12 +154,13 @@ disconnected or retuned by events; a small impedance can be used to model a faul
 | Path | Values |
 |---|---|
 | `simulation.t_end` | end time, s |
-| `simulation.bridge` | `switching` \| `averaged` \| `step_averaged` |
 | `simulation.solver.type` / `.method` | `fixed`: `euler` \| `heun` \| `rk4`; `adaptive`: `RK45` \| `DOP853` \| `Radau` \| `BDF` \| `LSODA` \| `DP45` |
 | `simulation.solver.dt` | maximum fixed step, s |
 | `simulation.solver.subsystems` | own steps per subsystem, e.g. `{vsc.dclink: 10, pcc: 0.1}` |
 | `simulation.output.period` | snapshot interval, s |
 | `simulation.energy_check` | `warn` \| `strict` \| `off` |
+| `simulation.progress` | `{enable: 1, period: 0.1, watch: [...]}`; CLI: `--progress`, `--watch` |
+| `units.<u>.averaging` | `{enable: 1, over: pwm_period \| time_step}`; CLI: `--averaging` |
 | `units.<u>.control.type` | `gfl` \| `gfm` \| `custom` |
 | `units.<u>.control.loops.<loop>.period` | loop period, s |
 | `units.<u>.measurement.average` | `instantaneous` \| `window` (with `window`) |
@@ -151,6 +182,22 @@ Output names use the same unit convention as input parameters: an SI value has n
 while a per-unit value ends in `_pu`. Controller columns are named `ctrl.<unit>.<signal>`. In the
 summary, switches such as `tripped` are 0 or 1, events that did not occur are `null`, and alarms,
 port-Hamiltonian defaults and energy problems are lists.
+
+`--progress SECONDS` prints simulated time and wall time at the configured interval.
+`--watch NAME` appends a value to each line and may be repeated or given comma-separated names.
+A watched name may be a `states.csv` column, a `plant.csv`/controller column, a state alias, or a
+complex state without `.re`/`.im` to print its magnitude. Converters with the same signal use their
+unit prefix, for example `vsc_m.vdc_pu` and `vsc_l.vdc_pu`. For physical-plant states the `plant.`
+domain prefix is optional in watch expressions: `vsc_m.i_c` and `plant.vsc_m.i_c` identify the same
+state. Existing public result columns take precedence for a short name. For example:
+
+```bash
+peslite gfl-example --progress 0.1 \
+  --watch vsc.vdc_pu \
+  --watch vsc.i_c,vsc.u_dc
+```
+
+An unknown name is reported at the first progress line together with the available names.
 
 ## Custom parts
 

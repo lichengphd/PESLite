@@ -69,8 +69,22 @@ def test_watch_values_match_result_columns_and_states(gfl, monkeypatch):
     state = complex(result.states["plant.pcc.u_C.re"][index],
                     result.states["plant.pcc.u_C.im"][index])
     assert values["plant.pcc.u_C"] == pytest.approx(abs(state))
+    assert values["pcc.u_C"] == pytest.approx(abs(state))
     assert values["plant.pcc.u_C.re"] == pytest.approx(state.real)
+    assert values["pcc.u_C.re"] == pytest.approx(state.real)
     assert values["plant.vsc.u_dc"] == result.states["plant.vsc.dclink.u_C"][index]
+    assert values["vsc.u_dc"] == pytest.approx(values["plant.vsc.u_dc"])
+
+
+def test_plant_prefix_is_optional_for_watched_state_names(gfl):
+    params = gfl(**{"simulation.progress.enable": 1,
+                    "simulation.progress.period": 1e-3})
+    simulation = peslite.Simulation(params)
+    with redirect_stdout(io.StringIO()):
+        simulation.run()
+    values = simulation.watch_values(0.002, {})
+    assert values["vsc.i_c"] == pytest.approx(values["plant.vsc.i_c"])
+    assert values["vsc.dclink.u_C"] == pytest.approx(values["plant.vsc.dclink.u_C"])
 
 
 def test_watching_does_not_change_the_run(gfl):

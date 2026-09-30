@@ -42,8 +42,8 @@ def test_command_line_finds_bundled_pes_files():
 
 def test_release_version_is_0_1_2():
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    assert '\nversion = "0.1.2"\n' in pyproject
-    assert peslite.__version__ == "0.1.2"
+    assert '\nversion = "0.1.3"\n' in pyproject
+    assert peslite.__version__ == "0.1.3"
 
 
 def test_wheel_data_comes_from_the_root_examples_directory():

@@ -452,8 +452,16 @@ class Simulation:
         for alias, name in getattr(system, "state_aliases", {}).items():
             if f"plant.{name}" in state:
                 state[f"plant.{alias}"] = state[f"plant.{name}"]
-        values.update({key: abs(value) for key, value in state.items() if isinstance(value, complex)})
-        values.update(flatten(state))
+        complex_values = {key: abs(value) for key, value in state.items()
+                          if isinstance(value, complex)}
+        flat_values = flatten(state)
+        values.update(complex_values)
+        values.update(flat_values)
+        # For watch expressions, physical-plant states also have a device-first shorthand.
+        # Public plant/controller result columns keep precedence if the shorthand already exists.
+        for key, value in {**complex_values, **flat_values}.items():
+            if key.startswith("plant."):
+                values.setdefault(key[len("plant."):], value)
         return values
 
     def state_names(self) -> list[str]:
