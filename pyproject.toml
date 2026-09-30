@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "peslite"
 version = "0.1.1"
-description = "Power-electronics simulation with an internal port-Hamiltonian solver kernel (peslite.solver): connected subsystem models, energy accounting, fixed/adaptive/multirate integration and converter control."
+description = "Power-electronics simulation on a port-Hamiltonian solver kernel: connected subsystem models, energy accounting, fixed/adaptive/multirate integration and converter control."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "AGPL-3.0"}
@@ -19,7 +19,7 @@ dependencies = [
 test = ["pytest>=7"]
 
 [project.scripts]
-peslite = "peslite.simulation:main"
+peslite = "peslite.solver.simulation:main"
 
 [project.urls]
 Homepage = "https://github.com/lonaparte/PESLite"
@@ -29,12 +29,8 @@ Issues = "https://github.com/lonaparte/PESLite/issues"
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[tool.setuptools.package-data]
-peslite = [
-    "configs/*.yaml",
-    "configs/*.yml",
-    "configs/*.json",
-]
+[tool.setuptools.data-files]
+"share/peslite/examples" = ["examples/*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

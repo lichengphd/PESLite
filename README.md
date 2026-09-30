@@ -145,34 +145,44 @@ The registered name can then be used at
 also be built with `UniteType(cfg, scenario, pwm_method=..., limiter=...)`.
 Other replaceable parts are `<unit>.modulator`, `<unit>.delay`, `solver`,
 and extra circuit elements through `System(p, elements=[...])`.
-See `examples/custom_plant.py` (custom network section, registered loop type and solver) and
-`examples/compare_solvers.py`.
 
 ## Layout
 
 ```
 pyproject.toml
-src/peslite/          installable package
-  simulation.py       simulation loop and command line
-  __init__.py         package exports
-  solver/             circuit model, energy accounting, fixed/adaptive/multirate solvers
-  params/             parameter schema, validation, file I/O
-  control/            converter controller
-    loops.py            loop types, their parameter dataclasses, ports and updates
-    controller.py       loop graph, controller interface, GFL/GFM wiring, UniteType
-    modulation.py       voltage command to duty ratios, limiting and anti-windup
-    protection.py       trip and alarm criteria
-    blocks.py           transforms, filters and timers
-  components/         power circuit and converter hardware
-    network.py          sources, R-L branches and R-C nodes
-    converter.py        bridge and DC-link components
-    adc.py              sampling, averaging windows and oversampling
-    pwm.py              PWM publications, computation delay, carriers and modulators
-  results/            recording and result files
-  assembly/           converter unit and system assembly
-  configs/            bundled *-example simulation files
-examples/             usage scripts
+src/peslite/            the package: __init__.py and four code parts
+  components/           what the system is made of
+    network.py            three-phase source, R-L branch, bus (R-C node)
+    converter.py          bridge, dc link (capacitor, current or voltage source)
+    adc.py                sampling of a converter's measurements, averaging window, oversampling
+    pwm.py                PWM peripheral: publications, computation delay, carrier, modulators
+  control/              the converter's controller
+    loops.py              what each loop type computes: its parameters, ports and update
+    controller.py         controller interface, loop network, GFL/GFM wiring, UniteType
+    protection.py         trip and alarm criteria
+    modulation.py         output stage: voltage command to duty ratios, limiter, anti-windup
+    blocks.py             transforms, filters and timers
+  assembly/             a system built from a simulation file
+    params.py             parameter classes, pu bases, construction, file reading and writing
+    validate.py           checks across the file's sections
+    events.py             time functions of events
+    unit.py               a converter unit: power stage, ADC, controller, PWM
+    system.py             the network and its units as one model
+  solver/               the numerical kernel and the run
+    model.py              subsystems, their connections and named states
+    energy.py             energy declarations, power balance, port-Hamiltonian report
+    integrators.py        solver interface and single-rate integrators
+    multirate.py          multirate integration and make_solver
+    splitbound.py         error estimate of a multirate split
+    simulation.py         run, records, result files and command line
+tests/                  development test suite (python -m pytest); not included in the wheel
+examples/               bundled *-example YAML files; no Python files
 ```
+
+The controller depends only on the solver kernel; components depend on the controller interface;
+assembly builds a system from both; `solver.simulation` runs the assembled system. The YAML files
+under the root `examples/` directory are wheel data, so the named `*-example` cases remain available
+after installing only the wheel.
 
 ## License
 

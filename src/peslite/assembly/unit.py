@@ -13,7 +13,7 @@ from ..components.network import RLBranch
 from ..components.pwm import PWM, ComputationDelay, Delay, Modulator, make_modulator
 from ..control.controller import Controller, make_controller
 from .events import UnitScenario
-from ..params import SimulationParams, UnitParams
+from .params import SimulationParams, UnitParams
 
 __all__ = ["Unit"]
 

@@ -1,5 +1,5 @@
 meta:
-  custom:                 # free-form; read by examples/custom_plant.py
+  custom:                 # free-form user metadata; ignored by the core package
     psc_lag_tau_s: 0.02
 base:
   s_base: 2000000.0

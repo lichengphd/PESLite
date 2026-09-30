@@ -1,6 +1,7 @@
-"""Cross-field checks of a constructed parameter tree (read-only).
+"""Checks across the sections of a constructed parameter tree (read-only).
 
-Covers topology, DC link, control, timing, solver settings and initial values.
+Covers topology, dc link, control, timing, solver settings and initial values; the construction
+(:func:`peslite.assembly.params.from_dict`) has checked each field on its own.
 """
 
 from __future__ import annotations
@@ -8,10 +9,14 @@ from __future__ import annotations
 import math
 import warnings
 
-from ..solver.model import ConfigError
-from ..solver.integrators import ADAPTIVE_METHODS, FIXED_METHODS
+from typing import TYPE_CHECKING
 
-from .schema import Params
+from ..solver.integrators import ADAPTIVE_METHODS, FIXED_METHODS
+from ..solver.model import ConfigError
+from ..solver.multirate import parse_step
+
+if TYPE_CHECKING:
+    from .params import Params
 
 __all__ = ["validate"]
 
@@ -182,19 +187,12 @@ def _solver(s, bridge: str) -> None:
         where = f"simulation.solver.subsystems.{name}"
         if s.type != "fixed":
             raise ConfigError(f"{where}: subsystems on their own step need the fixed-step solver")
-        step, method = value, None
-        if isinstance(value, dict):
-            unknown = set(value) - {"step", "method"}
-            if unknown or "step" not in value:
-                raise ConfigError(f"{where}: expected {{step, method}} (step required), got {sorted(value)}")
-            step, method = value["step"], value.get("method")
-        if (isinstance(step, bool) or not isinstance(step, (int, float))
-                or not math.isfinite(step) or step <= 0):
-            raise ConfigError(f"{where}.step: expected a positive number (relative to dt), got {step!r}")
-        if step >= 1 and abs(step - round(step)) > 1e-9:
-            raise ConfigError(f"{where}.step: a step longer than dt must be an integer multiple, got {step}")
-        if step < 1 and abs(1 / step - round(1 / step)) > 1e-9:
-            raise ConfigError(f"{where}.step: a step shorter than dt must be 1/N with N an integer, got {step}")
+        if isinstance(value, dict) and (set(value) - {"step", "method"} or "step" not in value):
+            raise ConfigError(f"{where}: expected {{step, method}} (step required), got {sorted(value)}")
+        try:
+            _ratio, method = parse_step(value)
+        except ValueError as exc:
+            raise ConfigError(f"{where}: {exc}") from None
         if method is not None and method not in FIXED_METHODS + ADAPTIVE_METHODS:
             raise ConfigError(f"{where}.method: {method!r} is not one of {FIXED_METHODS + ADAPTIVE_METHODS}")
 

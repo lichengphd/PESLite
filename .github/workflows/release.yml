@@ -133,14 +133,13 @@ jobs:
       - name: Verify packaged example configuration
         run: |
           python - <<'PY'
-          from importlib.resources import files
+          from peslite.solver.simulation import _config_path
 
-          path = files("peslite").joinpath("configs/gfl-example.yaml")
-
+          path = _config_path("gfl-example")
           print("gfl-example.yaml:", path)
 
           if not path.is_file():
-              raise SystemExit("configs/gfl-example.yaml is missing from the installed wheel")
+              raise SystemExit("gfl-example.yaml is missing from the installed wheel")
 
           print("Packaged config OK")
           PY

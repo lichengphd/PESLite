@@ -1,36 +1,41 @@
-"""Simulation event loop and command-line interface (run through ``peslite``).
+"""The run of a simulation: the system and solver built from its parameters, the initial states, the
+event loop, and the command line (the ``peslite`` command).
 
-Order at a coincident instant: over-current check, ADC samples, loop updates, PWM publication,
-window opening, switching instants, snapshot.
+Between events the solver integrates the model; the events are each unit's ADC samples, loop updates,
+PWM publications, averaging-window openings and switching instants, and the snapshots. Order at a
+coincident instant: over-current check, ADC samples, loop updates, PWM publication, window opening,
+switching instants, snapshot.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import dataclasses
+import json
 import math
-import sys
 import time
 import warnings
+from dataclasses import dataclass, field
+from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 import numpy as np
 
-from .solver.integrators import Solver
-from .solver.multirate import make_solver
-from .solver.splitbound import split_error_bound
-from .solver.model import expand_aliases, flatten, gather, resolve, scatter
-from .params import ConfigError, Params, load
-from .components.pwm import Delay, Modulator
-from .control import Controller
-from .results import Recorder, SimulationResult
-from .control.blocks import abc2complex, complex2abc
+from ..assembly.params import Params, dump, load
+from ..assembly.system import System
+from ..assembly.unit import Unit
+from ..components.pwm import Delay, Modulator
+from ..control.blocks import abc2complex, complex2abc
+from ..control.controller import Controller
+from .integrators import Solver
+from .model import ConfigError, expand_aliases, flatten, gather, resolve, scatter
+from .multirate import make_solver
+from .splitbound import split_error_bound
 
-from .assembly.system import System
-from .assembly.unit import Unit
-
-__all__ = ["Simulation", "main"]
+__all__ = ["Simulation", "SimulationResult", "Recorder", "main", "read_csv", "align", "window_ptp",
+           "pointwise_errors"]
 
 
 _EPS = 1e-10  # seconds; intervals shorter than this are not integrated separately
@@ -40,6 +45,228 @@ def _finite(y: np.ndarray) -> bool:
     """Return True when every entry of ``y`` is finite."""
     return all(map(math.isfinite, y.tolist()))
 
+
+# ------------------------------------------------------------------ what a run produces
+
+@dataclass
+class SimulationResult:
+    params: Params
+    t: np.ndarray
+    plant: dict[str, np.ndarray]
+    control: dict[str, np.ndarray]
+    states: dict[str, np.ndarray] = field(default_factory=dict)
+    energy: dict[str, np.ndarray] = field(default_factory=dict)
+    summary: dict[str, Any] = field(default_factory=dict)
+    wall_time: float = 0.0
+    n_rhs: int = 0
+
+    @property
+    def tripped(self) -> bool:
+        return bool(self.summary.get("tripped", 0.0))
+
+    def columns(self) -> dict[str, np.ndarray]:
+        """Return flat real columns: plant quantities in SI and controller logs in pu.
+
+        Names: ``<bus>.v_a``, ``<unit>.i_conv_a``, ``<branch>.i_a``, ``<source>.i_a``, ``<source>.angle``,
+        ``<unit>.u_dc``/``<unit>.i_dc`` (V/A) and the controllers' logged signals.
+        """
+        cols: dict[str, np.ndarray] = {"t": self.t}
+        for key, vec in self.plant.items():
+            head, _, what = key.rpartition(".")
+            if what in ("u_g", "i_c", "i", "u") and len(vec) and np.iscomplexobj(vec):
+                stem = {"u_g": "v", "i_c": "i_conv", "i": "i", "u": "v"}[what]
+                abc = np.array([complex2abc(z) for z in vec])
+                for k, ph in enumerate("abc"):
+                    cols[f"{head}.{stem}_{ph}"] = abc[:, k]
+        for name in self.params.units:
+            if f"{name}.u_dc" in self.plant:
+                cols[f"{name}.u_dc"] = self.plant[f"{name}.u_dc"]
+            if f"{name}.i_dc" in self.plant:
+                cols[f"{name}.i_dc"] = self.plant[f"{name}.i_dc"]
+        for name in self.params.sources:
+            if f"{name}.angle" in self.plant:
+                cols[f"{name}.angle"] = self.plant[f"{name}.angle"]
+        for key, arr in self.plant.items():
+            if key.startswith("ctrl_"):
+                cols[key[5:]] = arr
+        return cols
+
+    def to_csv(self, path: str | Path) -> None:
+        _write(path, self.columns())
+
+    def control_to_csv(self, path: str | Path) -> None:
+        """Write one control-log CSV per unit, ``<path stem>.<unit>.csv``; return the paths."""
+        path = Path(path)
+        written = []
+        for name in self.params.units:
+            head = f"{name}."
+            cols = {"t": self.control[f"{name}.t"]} if f"{name}.t" in self.control else {}
+            cols.update({k[len(head):]: v for k, v in self.control.items()
+                         if k.startswith(head) and k != f"{name}.t"})
+            if len(cols) > 1:
+                out = path.with_name(f"{path.stem}.{name}{path.suffix}")
+                _write(out, cols)
+                written.append(out)
+        return written
+
+    # ------------------------------------------------------------ states
+    def final_states(self) -> dict[str, float]:
+        """Return the last row of the state table (``t`` included)."""
+        return {k: float(v[-1]) for k, v in self.states.items()}
+
+    def states_to_csv(self, path: str | Path) -> None:
+        """Write the state table at full precision, so a row read back reproduces the state exactly."""
+        keys = list(self.states)
+        with Path(path).open("w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(keys)
+            columns = [self.states[k].tolist() for k in keys]
+            for row in zip(*columns):
+                w.writerow([repr(v) for v in row])
+
+    def energy_to_csv(self, path: str | Path) -> None:
+        keys = list(self.energy)
+        with Path(path).open("w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(keys)
+            for row in zip(*(self.energy[k] for k in keys)):
+                w.writerow([f"{v:.10g}" for v in row])
+
+    def save(self, out_dir: str | Path, info: dict[str, Any] | None = None) -> list[Path]:
+        """Write the configured output files into ``out_dir`` and return their paths.
+
+        info: extra entries for ``summary.json``.
+        """
+        out = Path(out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        written = []
+        if self.params.output.states:
+            self.states_to_csv(out / "states.csv")
+            written.append(out / "states.csv")
+        if self.params.output.signals:
+            self.to_csv(out / "plant.csv")
+            written += [out / "plant.csv"] + self.control_to_csv(out / "control.csv")
+        if self.params.output.energy and self.energy:
+            self.energy_to_csv(out / "energy.csv")
+            written.append(out / "energy.csv")
+        summary = {**(info or {}), "wall_time_s": self.wall_time, "n_rhs": self.n_rhs, **self.summary}
+        (out / "summary.json").write_text(json.dumps(summary, indent=2, default=float), encoding="utf-8")
+        dump(self.params, out / "params.yaml")
+        written += [out / "summary.json", out / "params.yaml"]
+        return written
+
+def _write(path: str | Path, cols: dict) -> None:
+    keys = list(cols)
+    with Path(path).open("w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(keys)
+        for row in zip(*(cols[k] for k in keys)):
+            w.writerow([f"{v:.10g}" for v in row])
+
+
+class Recorder:
+    """Collects snapshots during a run. ``keep_states=False`` keeps only the last state row."""
+
+    def __init__(self, keep_states: bool = True) -> None:
+        self.t: list[float] = []
+        self.plant: dict[str, list] = {}
+        self.ctrl_t: dict[str, list[float]] = {}   # one time grid per unit
+        self.ctrl: dict[str, list] = {}
+        self.last_ctrl_log: dict[str, dict[str, float]] = {}
+        self.keep_states = keep_states
+        self.state_keys: list[str] | None = None
+        self.state_t: list[float] = []
+        self.state_rows: list[list[float]] = []
+        self.energy_t: list[float] = []
+        self.energy_rows: dict[str, list] = {}
+
+    def energy_row(self, t: float, columns: dict[str, float]) -> None:
+        self.energy_t.append(t)
+        for k, v in columns.items():
+            self.energy_rows.setdefault(k, []).append(v)
+
+    def state_row(self, t: float, row: dict[str, float]) -> None:
+        if self.state_keys is None:
+            self.state_keys = list(row)
+        elif len(row) != len(self.state_keys):
+            raise RuntimeError("the set of named states changed during the run")
+        if not self.keep_states:
+            self.state_t.clear()
+            self.state_rows.clear()
+        self.state_t.append(t)
+        self.state_rows.append(list(row.values()))
+
+    def plant_snapshot(self, t: float, signals: dict[str, Any]) -> None:
+        n_before = len(self.t)
+        self.t.append(t)
+        for k, v in signals.items():
+            self.plant.setdefault(k, []).append(v)
+        for unit, log in self.last_ctrl_log.items():
+            for k, v in log.items():
+                key = f"ctrl_{unit}.{k}"
+                if key not in self.plant:  # controller signal appearing after the first snapshots
+                    self.plant[key] = [math.nan] * n_before
+                self.plant[key].append(v)
+
+    def control_sample(self, unit: str, t: float, log: dict[str, float]) -> None:
+        """Record one controller's log at one of its sampling instants."""
+        self.ctrl_t.setdefault(unit, []).append(t)
+        for k, v in log.items():
+            self.ctrl.setdefault(f"{unit}.{k}", []).append(v)
+
+    def arrays(self) -> tuple[np.ndarray, dict[str, np.ndarray], dict[str, np.ndarray], dict[str, np.ndarray]]:
+        plant = {k: np.asarray(v) for k, v in self.plant.items()}
+        ctrl = {f"{unit}.t": np.asarray(times) for unit, times in self.ctrl_t.items()}
+        ctrl.update({k: np.asarray(v) for k, v in self.ctrl.items()})
+        states: dict[str, np.ndarray] = {"t": np.asarray(self.state_t, dtype=float)}
+        if self.state_keys:
+            table = np.asarray(self.state_rows, dtype=float).reshape(len(self.state_rows), len(self.state_keys))
+            states.update({k: table[:, j] for j, k in enumerate(self.state_keys)})
+        energy: dict[str, np.ndarray] = {}
+        if self.energy_t:
+            energy = {"t": np.asarray(self.energy_t, dtype=float)}
+            energy.update({k: np.asarray(v, dtype=float) for k, v in self.energy_rows.items()})
+        return np.asarray(self.t), plant, ctrl, states, energy
+
+
+# ------------------------------------------------------------------ reading results back
+
+def read_csv(path: str | Path, skip_header: int = 0) -> np.ndarray:
+    """Read a CSV file with a header row into a structured array, keeping column names verbatim (dots included)."""
+    return np.genfromtxt(path, delimiter=",", names=True, skip_header=skip_header, deletechars="")
+
+
+def align(a: np.ndarray, b: np.ndarray, period: float) -> tuple[np.ndarray, np.ndarray]:
+    """Rows of ``a`` and ``b`` whose times fall on the same multiple of ``period``."""
+    ia = np.round(a["t"] / period).astype(int)
+    ib = np.round(b["t"] / period).astype(int)
+    _common, ka, kb = np.intersect1d(ia, ib, return_indices=True)
+    return a[ka], b[kb]
+
+
+def window_ptp(d: np.ndarray, t0: float, t1: float, key: str) -> float:
+    """Peak-to-peak of ``d[key]`` on ``[t0, t1)`` (NaN with fewer than 11 samples)."""
+    m = (d["t"] >= t0) & (d["t"] < t1)
+    return float(np.ptp(d[key][m])) if m.sum() > 10 else float("nan")
+
+
+def pointwise_errors(a: np.ndarray, b: np.ndarray, keys: Iterable[str],
+                     scale: Optional[Mapping[str, float]] = None) -> dict[str, dict[str, float]]:
+    """Max and RMS of ``|a[k] - b[k]| / scale[k]`` for aligned arrays, per key present in both."""
+    scale = scale or {}
+    out = {}
+    for key in keys:
+        if key not in a.dtype.names or key not in b.dtype.names:
+            continue
+        s = scale.get(key, 1.0)
+        x, y = a[key] / s, b[key] / s
+        e = np.abs(x - y)
+        out[key] = {"max": float(e.max()), "rms": float(np.sqrt(np.mean(e * e))),
+                    "t_max": float(a["t"][int(e.argmax())]), "rms_ref": float(np.sqrt(np.mean(y * y)))}
+    return out
+
+
+# ------------------------------------------------------------------ the run
 
 class Simulation:
     """Assemble the system and solver from parameters and run the event loop once."""
@@ -111,12 +338,8 @@ class Simulation:
 
     def unit(self, name: Optional[str] = None) -> Unit:
         """Return the named unit, or the only unit when ``name`` is omitted."""
-        if name is None:
-            if len(self.system.units) != 1:
-                raise ConfigError(f"this system has {len(self.system.units)} units "
-                                  f"{sorted(self.system.units)}: name the one you mean")
-            name = next(iter(self.system.units))
-        return self.system.units[name]
+        self.p.unit(name)  # checks the name
+        return self.system.units[name if name is not None else next(iter(self.p.units))]
 
     def _ratings(self):
         """Return a function giving the rated (effort, flow) of a storage, or ``None``."""
@@ -141,12 +364,10 @@ class Simulation:
         model = getattr(self.system, "model", None)
         if model is None or not hasattr(model, "ph_report"):
             return
-        groups = None
         solver = self.solver
-        if hasattr(solver, "inner_names") and hasattr(solver, "outer_names"):
-            assignment = {n: "inner" for n in solver.inner_names}
-            assignment.update({n: "outer" for n in solver.outer_names})
-            groups = model.groups(assignment) if assignment else None
+        groups = getattr(solver, "groups", None)
+        if groups is not None and len(groups) < 2:  # not split
+            groups = None
         hold = None
         if hasattr(solver, "window") and hasattr(solver, "dt"):
             hold = {"step": solver.dt, "window": solver.window}
@@ -615,8 +836,25 @@ class SystemLoop:
 
 # --------------------------------------------------------- command-line entry
 
-_ROOT = Path(__file__).resolve().parent  # the installed package folder
-_EXAMPLE_CONFIGS = _ROOT / "configs"
+def _example_configs_dir() -> Path:
+    """Return the root examples directory, from a checkout or an installed wheel."""
+    source = Path(__file__).resolve().parents[3] / "examples"
+    if source.is_dir():
+        return source
+    try:
+        dist = distribution("peslite")
+    except PackageNotFoundError:
+        return source
+    for entry in dist.files or ():
+        parts = entry.parts
+        if len(parts) >= 3 and tuple(parts[-3:-1]) == ("peslite", "examples"):
+            candidate = Path(dist.locate_file(entry)).resolve().parent
+            if candidate.is_dir():
+                return candidate
+    return source
+
+
+_EXAMPLE_CONFIGS = _example_configs_dir()
 _RESULTS = Path.cwd() / "output"
 _CONFIG_SUFFIXES = (".yaml", ".yml", ".json")
 
@@ -665,7 +903,7 @@ def parse_override(text: str):
 def main(argv=None) -> int:
     """Run a converter configuration and save its states, summary and configured signals.
 
-    With no config argument, run the first bundled example (sorted by filename).
+    With no config argument, run the first bundled YAML/JSON example (sorted by filename).
     """
     ap = argparse.ArgumentParser(description=main.__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("config", nargs="?", help="configuration name or path; default: first bundled example by filename")

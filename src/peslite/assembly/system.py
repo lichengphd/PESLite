@@ -11,7 +11,7 @@ from ..components.network import RCNode, RLBranch, ThreePhaseSource
 from ..solver.model import Model
 from ..solver.model import gather
 from .events import SourceScenario
-from ..params import Params
+from .params import Params
 from .unit import Unit
 
 __all__ = ["System"]

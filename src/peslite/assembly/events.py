@@ -9,7 +9,7 @@ import math
 from typing import Optional
 
 from ..control.blocks import smoothstep
-from ..params import SourceParams, UnitParams
+from .params import SourceParams, UnitParams
 
 __all__ = ["SourceScenario", "UnitScenario"]
 

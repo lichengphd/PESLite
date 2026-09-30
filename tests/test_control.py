@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 import peslite
-from conftest import CONFIGS
+from conftest import EXAMPLES
 from peslite.control import LOOP_TYPES, Loop, Measurement, SyncLaw, register_loop_type
 from peslite.solver.model import ConfigError
 
@@ -37,7 +37,7 @@ class _FixedFrequency(SyncLaw):
 
 def test_registered_loop_owns_its_schema_and_uses_default_role_wiring():
     p = peslite.load(
-        CONFIGS / "gfm-psc-example.yaml",
+        EXAMPLES / "gfm-psc-example.yaml",
         **QUIET,
         **FAST,
         **{"simulation.t_end": 0.01},
@@ -69,7 +69,7 @@ def test_loop_registration_and_loop_owned_validation():
         register_loop_type(LOOP_TYPES["psc"])
     with pytest.raises(ConfigError, match="loops.va.x_v_pu must be positive"):
         peslite.load(
-            CONFIGS / "gfm-droop-example.yaml",
+            EXAMPLES / "gfm-droop-example.yaml",
             **{"units.vsc.control.loops.va.x_v_pu": 0.0},
         )
 
