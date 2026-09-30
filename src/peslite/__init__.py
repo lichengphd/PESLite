@@ -7,8 +7,8 @@ from .solver import AdaptiveSolver, DormandPrince45, FixedStepSolver, Model, Mul
 
 from . import (solver, assembly, control, firmware, modulation, params, power, protection, results,
                sensing)
-from .assembly import (UniteType, ConverterFirmware, System, Unit,
-                       SourceScenario, UnitScenario, make_controller)
+from .control import OutputStage, UniteType, make_controller
+from .assembly import System, Unit, SourceScenario, UnitScenario
 from .firmware import ComputationDelay
 from .modulation import ZOH, CarrierComparison, SampledCarrier, StepAveragedCarrier, make_modulator
 from .params import Params, load
@@ -23,7 +23,7 @@ __all__ = [
     "results", "sensing", "simulation", "solver",
     "Params", "load", "System", "Unit", "MeasurementPorts", "Model", "SourceScenario", "UnitScenario",
     "Simulation", "SimulationResult", "UniteType", "main",
-    "make_controller", "make_modulator", "make_solver", "ConverterFirmware",
+    "make_controller", "make_modulator", "make_solver", "OutputStage",
     "ComputationDelay", "CarrierComparison", "ZOH", "StepAveragedCarrier", "SampledCarrier",
     "FixedStepSolver", "AdaptiveSolver", "DormandPrince45", "MultirateSolver",
     "__version__",

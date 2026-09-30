@@ -22,9 +22,10 @@ from .solver.multirate import make_solver
 from .solver.splitbound import split_error_bound
 from .solver.model import expand_aliases, flatten, gather, resolve, scatter
 from .params import ConfigError, Params, load
-from .assembly.protocols import Controller, Delay, Modulator
+from .control import Controller
+from .assembly.protocols import Delay, Modulator
 from .results import Recorder, SimulationResult
-from .firmware.transforms import abc2complex, complex2abc
+from .control.blocks import abc2complex, complex2abc
 
 from .assembly.system import System
 from .assembly.unit import Unit

@@ -78,16 +78,12 @@ def _control(c, dclink, where: str) -> None:
     for name, cfg in c.loops.items():
         if name in {"measurement", "references", "held", "clock", "command", "prot"}:
             raise ConfigError(f"{where}.loops.{name}: reserved loop name")
-        T = cfg.period
+        T = cfg.period  # None where the loop type allows it: runs on upstream updates
         if T is not None and (not math.isfinite(T) or T <= 0):
             raise ConfigError(f"{where}.loops.{name}.period must be finite and positive")
-        if T is None and cfg.type != "virtual_impedance":
-            raise ConfigError(f"{where}.loops.{name}.period is required")
         for key, value in vars(cfg).items():
             if isinstance(value, (int, float)) and not math.isfinite(value):
                 raise ConfigError(f"{where}.loops.{name}.{key} must be finite")
-        if cfg.type == "virtual_admittance" and cfg.x_v_pu <= 0:
-            raise ConfigError(f"{where}.loops.{name}.x_v_pu must be positive")
         if cfg.type == "matching" and dclink.capacitor is None:
             raise ConfigError(f"{where}: matching control needs dclink.capacitor")
         if cfg.type == "matching" and cfg.k_theta_pu is None and c.references.vdc_ref_pu <= 0:

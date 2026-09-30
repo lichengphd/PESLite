@@ -7,8 +7,8 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from ..assembly.protocols import Measurement
-from ..firmware.transforms import complex2abc
+from ..control import Measurement
+from ..control.blocks import complex2abc
 from .window import SamplingWindow
 
 __all__ = ["MeasurementPorts", "Sampler"]

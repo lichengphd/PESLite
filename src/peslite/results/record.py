@@ -15,7 +15,7 @@ from typing import Any
 
 import numpy as np
 
-from ..firmware.transforms import complex2abc
+from ..control.blocks import complex2abc
 from ..params import Params, dump
 
 __all__ = ["SimulationResult", "Recorder"]

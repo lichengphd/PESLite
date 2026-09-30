@@ -8,7 +8,7 @@ from __future__ import annotations
 import math
 from typing import Optional
 
-from ..firmware.blocks import smoothstep
+from ..control.blocks import smoothstep
 from ..params import SourceParams, UnitParams
 
 __all__ = ["SourceScenario", "UnitScenario"]

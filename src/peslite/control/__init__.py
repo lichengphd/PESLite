@@ -1,19 +1,19 @@
-"""Control algorithms and the signal graph that connects them.
+"""The controller of a converter unit.
 
-Provides the SRF-PLL, grid-forming laws, dq current loop, dc-voltage loop, power
-feedback and voltage-reference shaping. Signals are pu; time s, angles rad, frequencies rad/s.
+``loops``: what each loop type computes; ``controller``: the controller as one block (its
+interface, the loop network that connects and runs the loops, the gfl/gfm wiring,
+:class:`UniteType`); ``protection``: the trip and alarm criteria; ``modulation``: the output stage,
+from the voltage command to duty ratios; ``blocks``: transforms, filters and timers they are built of.
+Signals are pu; time s, angles rad, frequencies rad/s. The controller depends on nothing but the
+solver's kernel: the hardware adapts to its interface (:class:`Measurement`, :class:`ControlOutput`).
 """
 
-from .current import CurrentController
-from .dc_voltage import DCVoltageController
-from .pll import SRFPLL
-from .power import PowerCalculator
-from .shaping import ActiveDamping, VirtualAdmittance, VirtualImpedance
-from .sync import DVOC, PSC, VSG, Droop, Matching, make_law
-from .loops import LoopDefinition, SignalType, register_loop_type
-from .graph import ControlGraph, default_wiring
+from .loops import LOOP_TYPES, Loop, SignalType, SyncLaw, register_loop_type
+from .protection import Protection
+from .modulation import ModulationLimiter, OutputStage
+from .controller import (ControlGraph, ControlMeasurement, ControlOutput, Controller, Measurement, UniteType,
+                         default_wiring, make_controller)
 
-__all__ = ["SRFPLL", "CurrentController", "DCVoltageController", "PowerCalculator",
-           "VirtualImpedance", "VirtualAdmittance", "ActiveDamping",
-           "PSC", "Droop", "VSG", "DVOC", "Matching", "make_law",
-           "LoopDefinition", "SignalType", "register_loop_type", "ControlGraph", "default_wiring"]
+__all__ = ["Loop", "SyncLaw", "SignalType", "LOOP_TYPES", "register_loop_type", "ControlGraph", "default_wiring",
+           "Protection", "ModulationLimiter", "OutputStage", "Measurement", "ControlMeasurement", "ControlOutput",
+           "Controller", "UniteType", "make_controller"]

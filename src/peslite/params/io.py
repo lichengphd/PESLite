@@ -14,7 +14,7 @@ from ..solver.model import ConfigError
 
 from .base import BaseValues, convert_quantities
 from .schema import Params, BusParams, BranchParams, SourceParams, DCSourceParams, UnitParams, build, to_dict
-from .loops import LOOP_SCHEMAS, DelayLoopParams, build_loop
+from .loops import loop_params, build_loop
 from .validate import validate
 
 __all__ = ["load", "dump", "read_initial", "from_dict", "to_dict"]
@@ -84,10 +84,6 @@ def _section(data, cls, scales, where):
         data = to_dict(data)
     if not isinstance(data, dict):
         return data  # type error reported by build()
-    if cls is DelayLoopParams:
-        data = {key: value for key, value in data.items() if value is not None}
-        if not cls._signal_quantities(data) and "initial_pu" in data:
-            raise ConfigError(f"{where}.initial_pu: angle/frequency delays use initial in rad or rad/s")
     data = convert_quantities(data, cls, scales, where)
     if cls is DCSourceParams and data.get("type") == "voltage" and "v" not in data:
         data["v"] = scales["dc_voltage"]
@@ -142,9 +138,10 @@ def _convert_input_tree(data):
                 for loop_name, loop in control["loops"].items():
                     if is_dataclass(loop):
                         loop = to_dict(loop)
-                    cls = LOOP_SCHEMAS.get(loop.get("type")) if isinstance(loop, dict) else None
-                    loops[loop_name] = (_section(loop, cls, scales, f"units.{name}.control.loops.{loop_name}")
-                                        if cls is not None else loop)
+                    where = f"units.{name}.control.loops.{loop_name}"
+                    kind = loop.get("type") if isinstance(loop, dict) else None
+                    cls = loop_params(kind, where)
+                    loops[loop_name] = _section(loop, cls, scales, where)
                 control["loops"] = loops
             units[name] = cfg
         data["units"] = units

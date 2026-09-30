@@ -115,18 +115,37 @@ r.save("output/run")               # states.csv, summary.json, params.yaml
 
 ## Custom parts
 
-```python
-# replace one control loop's algorithm
-ctrl = peslite.UniteType(p.unit("vsc"), loop_overrides={"pll": MyPLL()})
-sim = peslite.Simulation(p, instances={"vsc.ctrl": ctrl})
+A control loop type is one class: it owns its parameter dataclass, typed ports,
+role in the default wiring, update and named state. Register the class before
+loading a configuration that names its type:
 
-# or pass a factory, so the part can be rebuilt
-sim = peslite.Simulation(p, parts={"vsc.ctrl": lambda cfg: peslite.UniteType(cfg)})
+```python
+from dataclasses import dataclass
+from peslite.control import SyncLaw, register_loop_type
+
+@register_loop_type
+class MyLaw(SyncLaw):
+    @dataclass(frozen=True, kw_only=True)
+    class Params:
+        period: float
+        k_p_pu: float
+        type: str = "my_law"
+
+    type = "my_law"
+
+    def step(self, T, p_pu, q_pu, v_mag_pu, v_dc_pu,
+             p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
+        self.omega = self.w0 + self.cfg.k_p_pu * (p_ref_pu - p_pu)
+        self.theta += T * self.omega
+        self.v_mag = v_ref_pu
 ```
 
-Other replaceable parts: `pwm_method=` and `limiter=` of `UniteType`, `<unit>.modulator`,
-`<unit>.delay`, `solver`, and extra circuit elements through `System(p, elements=[...])`.
-See `examples/custom_plant.py` (custom network section, synchronization law and solver) and
+The registered name can then be used at
+`units.<u>.control.loops.<loop>.type`. A custom controller output stage can
+also be built with `UniteType(cfg, scenario, pwm_method=..., limiter=...)`.
+Other replaceable parts are `<unit>.modulator`, `<unit>.delay`, `solver`,
+and extra circuit elements through `System(p, elements=[...])`.
+See `examples/custom_plant.py` (custom network section, registered loop type and solver) and
 `examples/compare_solvers.py`.
 
 ## Layout
@@ -139,11 +158,16 @@ src/peslite/          installable package
   solver/             circuit model, energy accounting, fixed/adaptive/multirate solvers
   params/             parameter schema, validation, file I/O
   power/              sources, lines, buses, bridge, dc link
-  control/            converter control
-  firmware/           pu conversion, limiter, delay, transforms
-  modulation/         PWM methods and modulators
+  control/            converter controller
+    loops.py            loop types, their parameter dataclasses, ports and updates
+    controller.py       loop graph, controller interface, GFL/GFM wiring, UniteType
+    modulation.py       voltage command to duty ratios, limiting and anti-windup
+    protection.py       trip and alarm criteria
+    blocks.py           transforms, filters and timers
+  firmware/           computation delay and temporary compatibility imports
+  modulation/         bridge-side carrier and modulators
   sensing/            ADC sampling
-  protection/         relay
+  protection/         temporary compatibility import for control.protection
   results/            recording and result files
   assembly/           converter unit and system assembly
   configs/            bundled *-example simulation files

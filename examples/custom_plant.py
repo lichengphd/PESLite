@@ -1,7 +1,6 @@
-"""Run a case with an extra bus, a user synchronization law and a user solver.
+"""Run a case with an extra bus, a synchronization law of a registered loop type and a user solver.
 
     python examples/custom_plant.py
-    python examples/custom_plant.py path/to/case.yaml
 
 The law's time constant is read from ``meta.custom.psc_lag_tau_s`` in the configuration.
 """
@@ -9,18 +8,16 @@ The law's time constant is read from ``meta.custom.psc_lag_tau_s`` in the config
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))  # without installing
 
 import peslite  # noqa: E402
+from peslite.control import SyncLaw, register_loop_type  # noqa: E402
 from peslite.solver import SolverStep  # noqa: E402
-from peslite.assembly import UniteType  # noqa: E402
-from peslite.assembly.protocols import SyncOutput  # noqa: E402
 
 
 def two_section_system(p: peslite.Params) -> peslite.Params:
@@ -40,26 +37,35 @@ def two_section_system(p: peslite.Params) -> peslite.Params:
     })
 
 
-class LaggedPSC:
-    """User synchronization law: PSC with a first-order lag ``tau`` (s) on the power feedback."""
+@register_loop_type
+class LaggedPSC(SyncLaw):
+    """Loop type ``lagged_psc``: PSC with a first-order lag ``tau`` (s) on the power feedback.
 
-    def __init__(self, k_p: float, tau: float, w0: float) -> None:
-        self.k_p, self.tau, self.w0 = k_p, tau, w0
-        self.theta, self.omega, self.p_f = 0.0, w0, 0.0
+    As a synchronization law (a :class:`~peslite.control.SyncLaw`) the default ``gfm`` wiring
+    connects it like the built-in ones. Named states: ``theta`` (rad), ``p_f`` (pu).
+    """
 
-    def update(self, T, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu, q_ref_pu, v_ref_pu, i_dq=0j) -> SyncOutput:
-        self.p_f += T / self.tau * (p_pu - self.p_f)
-        self.omega = self.w0 + self.k_p * (p_ref_pu - self.p_f)
+    @dataclass(frozen=True, kw_only=True)
+    class Params:
+        period: float
+        k_p_pu: float  # rad/s per pu power
+        tau: float  # s
+        type: str = "lagged_psc"
+
+        _quantities = {"k_p_pu": "1/power"}
+
+    type = "lagged_psc"
+    state_names = ("theta", "p_f")
+
+    def __init__(self, cfg, unit, scenario) -> None:
+        super().__init__(cfg, unit, scenario)
+        self.p_f = 0.0
+
+    def step(self, T, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu, q_ref_pu, v_ref_pu, i_dq) -> None:
+        self.p_f += T / self.cfg.tau * (p_pu - self.p_f)
+        self.omega = self.w0 + self.cfg.k_p_pu * (p_ref_pu - self.p_f)
         self.theta += T * self.omega
-        return SyncOutput(self.theta, self.omega, v_ref_pu, {"p_filtered_pu": self.p_f})
-
-    # named states
-    def get_state(self) -> dict[str, Any]:
-        return {"theta": self.theta, "p_f": self.p_f}
-
-    def set_state(self, values: Mapping[str, Any]) -> None:
-        for key, value in values.items():
-            setattr(self, key, float(value))
+        self.v_mag = v_ref_pu
 
 
 class Midpoint:
@@ -80,17 +86,18 @@ class Midpoint:
 
 
 def main(argv=None) -> int:
-    default = ROOT / "src" / "peslite" / "configs" / "gfm-psc-example.yaml"
+    default = (Path(__file__).resolve().parents[1] / "src" / "peslite" / "configs"
+               / "gfm-psc-example.yaml")
     config = argv[0] if argv else (sys.argv[1] if len(sys.argv) > 1 else default)
     p = two_section_system(peslite.load(config, **{"simulation.t_end": 1.0, "simulation.progress_every": 0.0}))
-    p = p.replace(**{"initial.states.plant.mid.u_C": "source"})  # the extra bus, pre-charged
+    sync = p.unit("vsc").control.loops["sync"]
+    p = p.replace(**{
+        "initial.states.plant.mid.u_C": "source",  # the extra bus, pre-charged
+        "units.vsc.control.loops.sync": {"type": "lagged_psc", "period": sync.period, "k_p_pu": sync.k_p_pu,
+                                         "tau": p.meta["custom"]["psc_lag_tau_s"]},
+    })
     u = p.unit("vsc")
-    tau = p.meta["custom"]["psc_lag_tau_s"]
-    sim = peslite.Simulation(
-        p,
-        parts={"vsc.ctrl": lambda cfg: UniteType(cfg, loop_overrides={
-            "sync": LaggedPSC(cfg.control.loops["sync"].k_p_pu, tau, cfg.base.w0)})},
-        solver=Midpoint(p.simulation.solver.dt))
+    sim = peslite.Simulation(p, solver=Midpoint(p.simulation.solver.dt))
     print("states:", ", ".join(sim.state_names()))
     r = sim.run()
     print(f"two-section system, lagged PSC, midpoint solver: wall {r.wall_time:.1f} s, "
