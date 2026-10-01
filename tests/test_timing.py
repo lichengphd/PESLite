@@ -67,9 +67,12 @@ def test_timing_defaults_follow_the_carrier(gfl):
     ({"units.vsc.ctrl.loops.dvc.period": 7.5e-5}, "not a multiple of ctrl.period"),
     ({"units.vsc.meas.period": 2e-5}, "does not divide ctrl.period"),
     ({"units.vsc.meas.period": 1e-4}, "longer than ctrl.period"),
-    ({"units.vsc.meas.average": "window", "units.vsc.meas.window": 1e-4},
+    ({"units.vsc.meas.average": "window"}, "expected a list of channels"),
+    ({"units.vsc.meas.average": ["u_g", "unknown"]}, "unknown channel"),
+    ({"units.vsc.meas.average": ["u_g", "u_g"]}, "must not be repeated"),
+    ({"units.vsc.meas.average": ["u_g", "i_c"], "units.vsc.meas.window": 1e-4},
      "longer than ctrl.period"),
-    ({"units.vsc.meas.average": "window", "units.vsc.meas.period": 2.5e-5},
+    ({"units.vsc.meas.average": ["u_g", "i_c"], "units.vsc.meas.period": 2.5e-5},
      "cannot be combined"),
     ({"units.vsc.pwm.update": "triple"}, "update"),
     ({"units.vsc.delay.steps": 1}, "unknown key"),
@@ -192,7 +195,7 @@ def test_duty_registers_are_states_and_loop_clocks_are_not(gfl):
      0.003005),  # computation is in progress
     ({"units.vsc.pwm.carrier_phase": 0.3, "units.vsc.bridge.model": "switching"},
      0.003010),  # between timer points
-    ({"units.vsc.meas.average": "window", "units.vsc.meas.u_dc": "window",
+    ({"units.vsc.meas.average": ["u_g", "i_c", "u_dc"],
       "units.vsc.meas.window": 2.5e-5, "units.vsc.bridge.model": "switching"},
      0.003025),  # an ADC window is open
 ])
@@ -236,7 +239,7 @@ def test_an_oversampled_continuation_starts_at_an_interrupt(gfl):
 
 
 def test_a_window_open_before_a_new_run_uses_the_start_values(gfl, tmp_path):
-    over = {"units.vsc.meas.average": "window", "units.vsc.meas.u_dc": "window",
+    over = {"units.vsc.meas.average": ["u_g", "i_c", "u_dc"],
             "simulation.output.signals": 1}
     shifted = peslite.Simulation(gfl(**over, **{"units.vsc.pwm.carrier_phase": 0.3})).run(
         out_dir=tmp_path / "shifted")

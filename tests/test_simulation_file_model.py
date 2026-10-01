@@ -101,7 +101,7 @@ def test_dependent_defaults_follow_replace_and_stay_fixed_when_explicit():
     assert u.ctrl.period == pytest.approx(1e-4)
     assert all(loop.period == pytest.approx(1e-4) for loop in u.ctrl.loops.values())
     assert u.ctrl.references.omega == pytest.approx(120 * math.pi)
-    assert u.meas.period is None and u.meas.window is None
+    assert u.meas.period is None and u.meas.window is None and u.meas.average == []
 
     fixed = p.replace(**{"units.vsc.ctrl.period": 5e-5})
     fixed = fixed.replace(**{"units.vsc.pwm.f_sw": 10_000.0})
@@ -109,11 +109,13 @@ def test_dependent_defaults_follow_replace_and_stay_fixed_when_explicit():
 
     rebased = p.replace(**{"base.s_base": 1e6})
     assert rebased.unit("vsc").base.s_base == 1e6
-    averaged = p.replace(**{"units.vsc.meas.average": "window",
+    averaged = p.replace(**{"units.vsc.meas.average": ["u_g", "i_c"],
                             "units.vsc.pwm.f_sw": 10_000.0})
     written = yaml.safe_load(dumps(averaged))
     assert written["units"]["vsc"]["meas"]["period"] == pytest.approx(1e-4)
     assert written["units"]["vsc"]["meas"]["window"] == pytest.approx(1e-4)
+    assert written["units"]["vsc"]["meas"]["average"] == ["u_g", "i_c"]
+    assert "u_dc" not in written["units"]["vsc"]["meas"]
 
 
 def test_to_dict_preserves_following_defaults_but_dumps_resolves_them():

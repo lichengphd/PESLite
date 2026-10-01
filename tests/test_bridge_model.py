@@ -200,6 +200,7 @@ def test_ideal_averaging_has_its_own_states_and_no_pwm_states(gfl):
     names = set(simulation.state_names())
     assert {f"vsc.bridge.d_{phase}" for phase in "abc"} <= names
     assert {f"vsc.bridge.history.0.d_{phase}" for phase in "abc"} <= names
+    assert {"vsc.bridge.on", "vsc.bridge.history.0.on"} <= names
     assert not any(name.startswith("vsc.pwm.") for name in names)
 
 

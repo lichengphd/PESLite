@@ -633,6 +633,15 @@ class Model:
         self._plan = tuple(operations[i] for i in order)
         self._plan_owners = tuple(owners[i] for i in order)
         self._plan_dependencies = tuple(tuple(position[d] for d in sorted(dependencies[i])) for i in order)
+        # Minimal output plan reached by a held-input change.  States, time and ordinary
+        # parameters are unchanged in this path, so unrelated subsystem outputs need no refresh.
+        zoh_owners = {id(sub) for sub, _field in self.zoh_connections}
+        affected: set[int] = set()
+        for i, (owner, _sources) in enumerate(self._plan_owners):
+            if id(owner) in zoh_owners or any(dependency in affected
+                                              for dependency in self._plan_dependencies[i]):
+                affected.add(i)
+        self._zoh_plan = tuple(sorted(affected))
         # staged subsystems appear once per output call
         aliases = [s for s in self.subsystems if id(s) in legacy and legacy[id(s)] is None]
         self.output_order = aliases + [owner for (kind, _), (owner, _) in zip(self._plan, self._plan_owners)
@@ -689,12 +698,14 @@ class Model:
             return [f"def {signature}:"] + ["    " + line for line in body or ["pass"]]
 
         source = "\n".join(function("_load(v)", load) + function("_outputs(t)", plan)
+                           + function("_zoh_outputs(t)", [plan[i] for i in self._zoh_plan])
                            + function("rhs_list(t, v)", load + plan + derive + [f"return [{', '.join(packed)}]"])) + "\n"
         filename = f"<peslite model {id(self):#x}>"
         exec(compile(source, filename, "exec"), env)
         linecache.cache[filename] = (len(source), None, source.splitlines(True), filename)
         self.compiled_source = source
-        self._load, self._outputs, self.rhs_list = env["_load"], env["_outputs"], env["rhs_list"]
+        self._load, self._outputs, self._zoh_outputs, self.rhs_list = (
+            env["_load"], env["_outputs"], env["_zoh_outputs"], env["rhs_list"])
 
     # -------------------------------------------------------------- groups
     def groups(self, assignment: Mapping[str, str], system: str = "system") -> dict[str, GroupPlan]:
@@ -856,6 +867,10 @@ class Model:
     def rhs(self, t: float, y: NDArray[np.float64]) -> NDArray[np.float64]:
         """Return ``dy/dt`` at time ``t`` (s) for the flat real state vector ``y``."""
         return np.array(self.rhs_list(t, y.tolist()))
+
+    def sync_zoh(self, t: float) -> None:
+        """Refresh only outputs reached by held inputs after a full sync at the same instant."""
+        self._zoh_outputs(t)
 
     def sync(self, t: float, y: NDArray[np.float64]) -> None:
         """Load ``y`` into the subsystems and refresh all outputs (for sampling/logging)."""

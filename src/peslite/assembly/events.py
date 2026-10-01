@@ -13,13 +13,12 @@ from bisect import bisect_right
 from dataclasses import dataclass, field, is_dataclass
 from typing import Any, Callable, ClassVar, Iterable, Mapping, Optional
 
-from ..control.blocks import smoothstep
 from ..solver.model import ConfigError
 
 __all__ = [
     "NAMED", "SWITCHABLE", "SWITCHING", "Event", "EVENT_TYPES", "register_event_type",
     "Connect", "Disconnect", "Set", "events_for", "switching_schedule", "connected_at",
-    "Scenario", "UnitScenario", "SourceScenario",
+    "Scenario", "SourceScenario",
 ]
 
 NAMED = ("buses", "branches", "sources", "units", "elements")
@@ -150,42 +149,36 @@ def connected_at(steps: list[tuple[float, bool]], t: float) -> bool:
 
 
 class Scenario:
-    """Connection state and ramp of one target over time."""
+    """Read-only connection commands for one target over absolute simulation time.
+
+    It does not advance ramps or own component state; Unit turns the selected command into physical
+    connection and controller start-up actions.
+    """
 
     def __init__(self, events: Iterable[Any] = ()) -> None:
         events = sorted(events, key=lambda event: event.t)
-        self._steps = [(event.t, event.type == "connect") for event in events if event.type in SWITCHING]
-        self._connections = [(event.t, event.ramp) for event in events if event.type == "connect"]
+        self._commands = tuple((event.t, event.type == "connect",
+                                event.ramp if event.type == "connect" else 0.0)
+                               for event in events if event.type in SWITCHING)
+
+    def at(self, t: float) -> tuple[bool, float, float]:
+        """Return ``(connected, last_connect_time, ramp)`` in force at ``t``."""
+        connected = not self._commands[0][1] if self._commands else True
+        since, ramp = -math.inf, 0.0
+        for event_t, on, requested_ramp in self._commands:
+            if event_t > t + 1e-10:
+                break
+            connected = on
+            if on:
+                since, ramp = event_t, requested_ramp
+        return connected, since, ramp
 
     def connected(self, t: float) -> bool:
-        return connected_at(self._steps, t)
+        return self.at(t)[0]
 
     def since(self, t: float) -> tuple[float, float]:
         """Return the time and ramp of the connection in force at ``t``."""
-        return max(((start, ramp) for start, ramp in self._connections if start <= t + 1e-10),
-                   default=(-math.inf, 0.0))
-
-    def ramp_value(self, t: float) -> float:
-        """Return 0 while disconnected, otherwise the current connection's smooth ramp in [0, 1]."""
-        if not self.connected(t):
-            return 0.0
-        start, ramp = self.since(t)
-        if ramp <= 0.0 or t >= start + ramp:
-            return 1.0
-        return smoothstep((t - start) / ramp)
-
-    def armed(self, t: float) -> bool:
-        """Whether protection is armed: connected and past the connection ramp."""
-        start, ramp = self.since(t)
-        return self.connected(t) and t >= start + ramp
-
-
-class UnitScenario(Scenario):
-    """A converter unit's connection scenario and ramped active-power reference."""
-
-    def setpoints(self, t: float, p_ref: float, q_ref: float, v_ref: float) -> tuple[float, float, float]:
-        return self.ramp_value(t) * p_ref, q_ref, v_ref
-
+        return self.at(t)[1:]
 
 class SourceScenario:
     """A source's magnitude, frequency and angle between successive parameter changes."""

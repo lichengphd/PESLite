@@ -19,9 +19,11 @@ import time
 import warnings
 from collections import deque
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Iterable, Mapping, Optional
 
 import numpy as np
@@ -405,10 +407,11 @@ class Simulation:
             self.solver = make_solver(p.simulation.solver, model=self.system.model,
                                       ratings=self._ratings())
         for unit in self.system.units.values():
-            checks = [(unit.ctrl, Controller)]
-            if unit.bridge.modulator is not None:
-                checks.append((unit.bridge.modulator, Modulator))
-            for obj, proto in checks:
+            parts = [(unit.ctrl, Controller)]
+            modulator = getattr(unit.bridge, "modulator", None)
+            if modulator is not None:
+                parts.append((modulator, Modulator))
+            for obj, proto in parts:
                 if not isinstance(obj, proto):
                     raise TypeError(f"{unit.name}: {type(obj).__name__} does not satisfy the "
                                     f"{proto.__name__} protocol")
@@ -421,7 +424,6 @@ class Simulation:
                                   f"{type(self.system).__name__} has none")
         if not isinstance(self.solver, Solver):
             raise TypeError(f"{type(self.solver).__name__} does not satisfy the Solver protocol")
-        self._start_duty()
         self._states = StateRegistry(self._state_parts())
         self.result: SimulationResult | None = None
         self.energy_problems: list[str] = []
@@ -518,11 +520,6 @@ class Simulation:
         parts.append(("solver", self.solver))
         return parts
 
-    def _start_duty(self) -> None:
-        """Fill every PWM register or averaging delay line with its start-up duty ratios."""
-        for unit in self.system.units.values():
-            unit.bridge.reset(np.asarray(unit.ctrl.initial_duty(), dtype=float))
-
     def watch_values(self, t: float,
                      ctrl_logs: Mapping[str, Mapping[str, float]]) -> dict[str, float]:
         """Return values addressable by ``simulation.progress.watch`` at time ``t``.
@@ -552,7 +549,6 @@ class Simulation:
         aliases = dict(getattr(system, "state_aliases", {}))
         presets_of = getattr(system, "state_presets", None)
         presets = presets_of(t0) if presets_of is not None else {}
-        self._start_duty()  # so that the PWM registers or averaging delay histories have states
         template = self._states.read()
         try:
             given = expand_aliases(self.p.simulation.initial.states, aliases)
@@ -580,29 +576,24 @@ class Simulation:
         for event_t, _, what in self._actions():
             if event_t <= t0 + _EPS and getattr(what, "type", None) not in SWITCHING:
                 self._act(what, event_t)
-        y = system.model.get_initial_values()
-        # 2. start-up modulation matching each unit's terminal voltage at t0, or the given duty ratios
-        system.model.sync(t0, y)
-        for name, unit in system.units.items():
-            align = getattr(unit.ctrl, "align_startup", None)
-            if align is not None:
-                align(unit.ports.u_g(), unit.ports.u_dc())
-            unit.bridge.reset(np.asarray(unit.ctrl.initial_duty(), dtype=float))
-            self._states.load(values, [f"{name}.{unit.bridge.state_prefix}"])
-        # 3. controllers, measurement windows, solver
+        # 2. each unit's host command as at the start
+        for unit in system.units.values():
+            unit.start(t0)
+        # 3. controllers, PWM registers, measurement windows and solver
         self._continued = set()
         self._windows_given = set()
         for name, unit in system.units.items():
-            self._states.load(values, [f"{name}.ctrl"])
-            if any(key.startswith((f"{name}.ctrl.", f"{name}.{unit.bridge.state_prefix}."))
-                   for key in values):
+            bridge_prefix = f"{name}.{unit.bridge.state_prefix}"
+            self._states.load(values, [f"{name}.ctrl", bridge_prefix])
+            if any(key.startswith((f"{name}.ctrl.", bridge_prefix + ".")) for key in values):
                 self._continued.add(name)
             if unit.adc.averaging:
                 self._states.load(values, [f"{name}.meas"])
                 if any(key.startswith(f"{name}.meas.") for key in values):
                     self._windows_given.add(name)
+            unit.states_loaded()
         self._states.load(values, ["solver"])
-        return y
+        return system.model.get_initial_values()
 
     # ------------------------------------------------------------ the loop
     def run(self, t_end: float | None = None, *, out_dir: str | Path | None = "output/run",
@@ -633,36 +624,14 @@ class Simulation:
         wall0 = time.time()
 
         units = list(system.units.values())
-        switching_units = [unit for unit in units if unit.bridge.has_switching_events]
-        window_units = [unit for unit in units if unit.adc.averaging]
-        oversampling_units = [unit for unit in units if unit.adc.samples > 1]
-        fast_checks = [
-            (unit, getattr(unit.ctrl, "fast_check_space_vector", None),
-             getattr(unit.ctrl, "fast_check", None))
-            for unit in units
-        ]
         t_start = p.simulation.initial.t
         if t_end <= t_start + _EPS:
             raise ValueError(f"t_end = {t_end} must be after the start time {t_start}")
         t_final = t_end
-        # trips already handled, by unit (a trip loaded with the initial states is handled at the first sample)
-        tripped = {u.name: bool(getattr(u.ctrl, "tripped", False)) or u.tripped for u in units}
         y = self._apply_initial(t_start)
         if parameters_changed is not None:
             parameters_changed()
-        for unit in units:
-            sync = unit.ctrl.initial_sync() if hasattr(unit.ctrl, "initial_sync") else (None, None)
-            q = unit.bridge.start(t_start, sync, unit.name in self._continued)
-            mdl.set_zoh_input(unit.zoh, q)
-        # The loaded actuator state determines the bridge at the exact start time. Seed every ADC
-        # from that side of the held-input change, then reconstruct its timer/window position.
-        mdl.sync(t_start, y)
-        for unit in units:
-            unit.adc.seed()
-            bridge = unit.bridge
-            unit.adc.start(t_start, bridge.interrupt(bridge.k - 1), bridge.t_interrupt,
-                           held=unit.name not in self._windows_given)
-            unit.adc.latest = unit.adc.measure(t_start)
+        windowed = [unit for unit in units if unit.windowed]
         ctrl_names = {
             unit.name: getattr(unit.ctrl, "log_names", lambda: ())() for unit in units
         }
@@ -688,13 +657,26 @@ class Simulation:
         coarse_reported = False
         stopped = False
         adc_inputs_changed = False
+        synced_at: float | None = None
+        zoh_changed = False
+
+        def sync_if_needed(t_now: float) -> None:
+            """Bring plant outputs to ``t_now``, refreshing only held-input descendants when possible."""
+            nonlocal synced_at, zoh_changed
+            if synced_at != t_now:
+                mdl.sync(t_now, y)
+                synced_at = t_now
+            elif zoh_changed:
+                mdl.sync_zoh(t_now)
+            zoh_changed = False
+
         def snapshot(t_now: float, final: bool = False) -> None:
             nonlocal snapshot_index
             audit_due = energy_on and (snapshot_index % phs_check_step == 0 or final)
             snapshot_index += 1
             try:
                 with np.errstate(over="raise"):
-                    mdl.sync(t_now, y)
+                    sync_if_needed(t_now)
                     signals = system.signals(t_now) if rec.keep_signals else {}
                     rec.plant_snapshot(t_now, signals)
                     if rec.keep_states or final:
@@ -711,7 +693,7 @@ class Simulation:
 
         def watched(t_now: float) -> str:
             """Format the quantities appended to a progress line."""
-            mdl.sync(t_now, y)
+            sync_if_needed(t_now)
             values = self.watch_values(t_now, rec.last_ctrl_log)
             unknown = [name for name in watch if name not in values]
             if unknown:
@@ -726,7 +708,8 @@ class Simulation:
 
         def advance(t_a: float, t_b: float, event: bool = False) -> bool:
             """Integrate over ``[t_a, t_b]``; ``event`` means the model changes at ``t_b``."""
-            nonlocal y, t_local, stop_reason, coarse_reported
+            nonlocal y, t_local, stop_reason, coarse_reported, synced_at
+            synced_at = None
             try:
                 y = integrate(t_a, t_b, y, event)
             except (OverflowError, FloatingPointError):
@@ -735,10 +718,12 @@ class Simulation:
                 return True
             t_local = t_b
             finite = _finite(y)
-            if window_units and finite:
-                mdl.sync(t_b, y)
-                for unit in window_units:
-                    unit.adc.accumulate(t_b - t_a)
+            if windowed and finite:
+                sync_if_needed(t_b)
+                for unit in windowed:
+                    unit.accumulate(t_b - t_a)
+            elif finite:
+                mdl.set_states(y)
             if not finite:
                 stop_reason = f"diverged: non-finite states at t = {t_b:.6g} s"
                 return True
@@ -756,65 +741,52 @@ class Simulation:
             return False
 
         def settle_now() -> None:
-            """Finish deferred integration with the current model before it changes now."""
+            """Finish deferred integration with the plant as it is, before it changes now."""
             nonlocal y
             if settle is not None:
                 y = settle(t_local, y)
-            mdl.set_states(y)
+                mdl.set_states(y)
 
-        def do_trip(unit: Unit) -> None:
-            nonlocal y, adc_inputs_changed
-            tripped[unit.name] = True
+        # The plant operations exposed to a Unit.  The run loop owns the continuous-state vector;
+        # a unit can only request current outputs, change one held input, or make a discontinuous
+        # plant change inside the context manager.
+        def hold(label: str, value: Any) -> None:
+            nonlocal zoh_changed
+            mdl.set_zoh_input(label, value)
+            zoh_changed = True
+
+        @contextmanager
+        def change() -> Iterator[None]:
+            nonlocal y, adc_inputs_changed, synced_at
             settle_now()
-            unit.trip()
+            yield
             y = mdl.get_initial_values()
             adc_inputs_changed = True
+            synced_at = None
 
-        def interrupt(unit: Unit, t_k: float):
-            """Sample and run a controller; return its output and whether its trip stops the run."""
-            mdl.sync(t_k, y)
-            out = unit.ctrl(t_k, unit.adc.sample(t_k))
-            if out.log is not None:
-                rec.last_ctrl_log[unit.name] = out.log
-                if unit.bridge.k % ctrl_every == 0:
-                    rec.ctrl_sample(unit.name, t_k, out.log)
-            new_trip = out.tripped and not tripped[unit.name]
-            if new_trip:
-                do_trip(unit)
-            return out, new_trip and stop_on_trip
+        plant = SimpleNamespace(outputs=sync_if_needed, hold=hold, change=change)
 
-        def set_bridge_input(unit: Unit, q: complex) -> None:
-            """Apply one bridge modulation value."""
-            nonlocal adc_inputs_changed
-            mdl.set_zoh_input(unit.zoh, q)
-            adc_inputs_changed = True
-
-        def set_bridge_inputs(unit: Unit, values: list[complex]) -> None:
-            """Apply bridge modulation values in event order."""
-            nonlocal adc_inputs_changed
-            for q in values:
-                mdl.set_zoh_input(unit.zoh, q)
-                adc_inputs_changed = True
+        def window_edge(t_now: float, changed: bool) -> None:
+            """Restart ADC integrals from the values on the new side of a plant/input jump."""
+            if windowed and (changed or zoh_changed):
+                sync_if_needed(t_now)
+                for unit in windowed:
+                    unit.restart_windows()
 
         # ---------------------------------------------------------------- the event grid
+        for unit in units:
+            unit.begin(t_start, plant, unit.name in self._continued,
+                       unit.name in self._windows_given)
         while True:
             adc_inputs_changed = False
             t_log = n_log * log_period
-            t_stop = t_log if t_log < t_final - _EPS else t_final  # the earliest event of all
+            t_stop = t_log
             for unit in units:
-                bridge, adc = unit.bridge, unit.adc
-                t_c = bridge.t_interrupt
-                t_stop = min(t_stop, t_c if t_c < t_final - _EPS else t_final,
-                             bridge.t_load)
-            for unit in window_units:
-                t_stop = min(t_stop, unit.adc.t_window(unit.bridge.t_interrupt))
-            for unit in oversampling_units:
-                bridge = unit.bridge
-                t_stop = min(t_stop, unit.adc.t_sample(bridge.interrupt(bridge.k - 1)))
-            for unit in switching_units:
-                t_stop = min(t_stop, unit.bridge.next_switch)
+                t_stop = min(t_stop, unit.next_time())
             if actions:
                 t_stop = min(t_stop, actions[0][0])
+            if t_stop > t_final - _EPS:
+                t_stop = t_final
             event_due = bool(actions and actions[0][0] <= t_stop + _EPS)
             advancing = t_stop > t_local + _EPS
             if advancing and advance(t_local, t_stop, event_due):
@@ -833,96 +805,42 @@ class Simulation:
                     parameters_changed()
                 y = mdl.get_initial_values()
                 adc_inputs_changed = True
-            # 0. over-current check of units whose switching interval ends here
-            for unit, vector_check, phase_check in fast_checks:
-                edge = unit.bridge.next_edge
-                if (abs(edge - t_stop) < _EPS and (vector_check is not None or phase_check is not None)
-                        and not tripped[unit.name]):
-                    mdl.set_states(y)
-                    trip = (vector_check(t_local, unit.adc.current_space_vector())
-                            if vector_check is not None
-                            else phase_check(t_local, unit.adc.phase_currents()))
-                    if trip:
-                        do_trip(unit)
-                        if stop_on_trip:
-                            stopped = True
+                synced_at = None
+            # Every unit protects first, then every unit samples, then every unit actuates.  This
+            # makes coincident multi-unit events independent of the units' dictionary order.
+            for unit in units:
+                if unit.protect(t_stop, plant) and stop_on_trip:
+                    stopped = True
             if stopped:
                 snapshot(t_local, final=True)
                 break
-            # ADC samples due here, before any loop update
-            for unit in oversampling_units:
-                bridge = unit.bridge
-                if abs(unit.adc.t_sample(bridge.interrupt(bridge.k - 1)) - t_stop) < _EPS:
-                    mdl.sync(t_local, y)
-                    unit.adc.peek(t_local)
-            # 1. control interrupts due here
-            deferred = []
-            if t_stop < t_final - _EPS:
-                for unit in units:
-                    if abs(unit.bridge.t_interrupt - t_stop) < _EPS:
-                        out, stop = interrupt(unit, t_stop)
-                        if unit.bridge.write(t_stop, out.d_abc, out.theta, out.omega):
-                            deferred.append(unit.bridge)
-                        if stop:
-                            stopped = True
+            for unit in units:
+                done = unit.sense(t_stop, plant)
+                if done is not None:
+                    k, out = done
+                    if out.log is not None:
+                        rec.last_ctrl_log[unit.name] = out.log
+                        if k % ctrl_every == 0:
+                            rec.ctrl_sample(unit.name, t_stop, out.log)
+            for unit in units:
+                if unit.actuate(t_stop, plant) and stop_on_trip:
+                    stopped = True
             if stopped:
-                for bridge in deferred:
-                    bridge.finish_control()
                 snapshot(t_local, final=True)
                 break
-            # 1a. held-input updates due here, after coincident interrupts: a PWM register load or
-            # the single delayed update of an ideal averaged source
-            if t_stop < t_final - _EPS:
-                for unit in units:
-                    if abs(unit.bridge.t_load - t_stop) < _EPS:
-                        set_bridge_input(unit, unit.bridge.load(t_stop))
-            # A nonzero computation starts after any coincident load has consumed the old shadow.
-            for bridge in deferred:
-                bridge.finish_control()
-            # 1b. an averaging window shorter than the PWM update period opens here
-            for unit in window_units:
-                if abs(unit.adc.t_window(unit.bridge.t_interrupt) - t_stop) < _EPS:
-                    mdl.sync(t_local, y)
-                    unit.adc.open()
-            # 2. switching instants due here
-            for unit in switching_units:
-                if abs(unit.bridge.next_switch - t_stop) < _EPS:
-                    set_bridge_inputs(unit, unit.bridge.switches(t_stop))
-            # An averaging interval after a plant or held-input jump starts from the value on the
-            # new side.  Its integral/opening states do not change at the zero-duration edge.
-            if window_units and adc_inputs_changed:
-                mdl.sync(t_local, y)
-                for unit in window_units:
-                    unit.adc.seed()
-            # 3. snapshots
-            if abs(t_log - t_stop) < _EPS and t_stop < t_final - _EPS:
+            window_edge(t_local, adc_inputs_changed)
+            if t_stop >= t_final - _EPS:
+                snapshot(t_local, final=True)
+                break
+            if abs(t_log - t_stop) < _EPS:
                 snapshot(t_local)
                 n_log += 1
-            if t_stop >= t_final - _EPS:
-                break
             if t_local >= next_report:
                 suffix = watched(t_local) if watch else ""
                 print(f"  t = {t_local:8.4f} s   wall {time.time() - wall0:8.1f} s{suffix}",
                       flush=True)
                 next_report += progress_every
 
-        if not stopped:
-            # Complete all unit actions due at the final instant. A saved row represents the
-            # state after that instant, exactly as the same row in a longer run does.
-            deferred = []
-            for unit in units:
-                if abs(unit.bridge.t_interrupt - t_local) < _EPS:
-                    out, _stop = interrupt(unit, t_local)
-                    if unit.bridge.write(t_local, out.d_abc, out.theta, out.omega):
-                        deferred.append(unit.bridge)
-            for unit in units:
-                if abs(unit.bridge.t_load - t_local) < _EPS:
-                    set_bridge_input(unit, unit.bridge.load(t_local))
-            for bridge in deferred:
-                bridge.finish_control()
-            for unit in switching_units:
-                if abs(unit.bridge.next_switch - t_local) < _EPS:
-                    set_bridge_inputs(unit, unit.bridge.switches(t_local))
         if rec.last_t is None or rec.last_t < t_local - _EPS:
             snapshot(t_local, final=True)
         if stop_reason:
@@ -930,9 +848,8 @@ class Simulation:
         records = rec.finish()
         summary: dict[str, Any] = {}
         for name, unit in system.units.items():
-            if hasattr(unit.ctrl, "summary"):
-                summary.update({f"{name}.{k}": v for k, v in unit.ctrl.summary().items()})
-        summary["tripped"] = int(any(tripped.values()))
+            summary.update({f"{name}.{k}": v for k, v in unit.summary().items()})
+        summary["tripped"] = int(any(unit.tripped for unit in units))
         summary["t_start"] = t_start
         summary["t_stop"] = rec.last_t if rec.last_t is not None else t_start
         if stop_reason:
@@ -955,9 +872,10 @@ class Simulation:
             if self._rebuildable:
                 loop = SystemLoop(self)
                 if loop.period is None:  # no common control period
-                    summary["split_bound"] = (f"the converters' control periods {loop.periods} have no "
-                                              f"common multiple within 64 updates, so the loop has no "
-                                              f"period to linearise: no bound")
+                    summary["split_bound"] = (f"the converters' periods {loop.periods} (control, PWM "
+                                              f"loads, carriers and loops) have no common multiple within "
+                                              f"64 of the longest, so the loop has no period to linearise: "
+                                              f"no bound")
                 else:
                     summary.update(split_error_bound(
                         solver, loop, records.t, records.states, p.simulation.solver.linearisations,
@@ -1005,12 +923,15 @@ class SystemLoop:
 
         self._cls = Simulation
         self._factories = dict(sim._factories)
-        self.periods = [float(u.bridge.period) for u in sim.units.values()]
-        for u in sim.units.values():
-            self.periods.extend(T for T in getattr(u.ctrl, "periods", {}).values() if T)
+        self.periods = sorted({period for unit in sim.units.values() for period in unit.periods})
         self.period = macro_period(self.periods)
         self.w0 = 2.0 * math.pi * sim.p.base.f0
-        self._flags = set(sim._states.boolean_names)
+        flags = set(sim._states.boolean_names)
+        self._flags = {name for name in flags
+                       if name.rpartition(".")[2] in ("tripped", "fault")}
+        self._modes = (flags - self._flags) | {
+            name for name in sim._states.names if ".startup." in name
+        }
         self._plant_columns = set(sim._states.read_flat(["", *sim.units]))
         rated = sim.solver.rated_effort
         self._rated = ({lab: float(r) for lab, r in zip(sim.system.model.state_labels(), rated)}
@@ -1037,6 +958,9 @@ class SystemLoop:
                 continue  # solver bookkeeping, not a loop state
             if c in self._flags:
                 cols.append(("frozen", [c], 1.0))
+                used.add(c)
+            elif c in self._modes:
+                cols.append(("mode", [c], 1.0))
                 used.add(c)
             elif c.endswith(".re") and c[:-3] + ".im" in names:
                 base = c[:-3]

@@ -48,9 +48,12 @@ class PWM:
     """Carrier timer, PWM duty registers and switching schedule.
 
     Interrupts occur every ``period`` from ``offset``. Compare registers load every
-    ``load_period``. An interrupt writes the new duty ratios to the shadow registers; they become
-    loadable after ``computation`` seconds. A load before then keeps the active registers unchanged.
+    ``load_period``. An interrupt writes duty ratios and the PWM enable to the shadow registers;
+    a load copies them to the active registers only after ``computation`` seconds. The enable is
+    carried through exactly the same register path as the duty ratios.
     """
+
+    _NAMES = ("d_a", "d_b", "d_c", "on")
 
     def __init__(self, period: float, load_period: float, offset: float, computation: float,
                  carrier_period: float, modulator: Modulator) -> None:
@@ -61,8 +64,7 @@ class PWM:
         self.modulator = modulator
         self.k = self.j = 0
         self.t_interrupt, self.t_load = self.interrupt(0), self.load_time(0)
-        zero = np.zeros(3)
-        self.active, self.shadow = zero.copy(), zero.copy()
+        self.active, self.shadow = np.zeros(4), np.zeros(4)
         self.sync: tuple[float | None, float | None] = (None, None)
         self.t_sync = 0.0
         self.schedule: list[tuple[float, complex]] = []
@@ -85,15 +87,27 @@ class PWM:
         T = self.period if period is None else period
         return int(math.floor((t - self.offset + TIME_EPS) / T)) + 1
 
+    def count(self, t_a: float, t_b: float) -> int:
+        """Number of control interrupts in ``[t_a, t_b]``, including both ends."""
+        first = math.ceil((t_a - self.offset - TIME_EPS) / self.period)
+        return max(0, self.after(t_b) - first)
+
     def describe(self) -> str:
         double = self.load_period < 0.75 * self.carrier_period
         return (f"control {1e-3 / self.period:g} kHz, computation {self.computation * 1e6:g} us, "
                 f"{'double' if double else 'single'} update")
 
-    def reset(self, d_abc: NDArray[np.float64]) -> None:
-        """Put the same initial duty ratios in the active and shadow registers."""
-        d = np.array(d_abc, dtype=float, copy=True)
-        self.active, self.shadow = d.copy(), d.copy()
+    @staticmethod
+    def _word(d_abc: NDArray[np.float64], on: bool) -> NDArray[np.float64]:
+        word = np.empty(4, dtype=float)
+        word[:3] = np.asarray(d_abc, dtype=float).ravel()
+        word[3] = 1.0 if on else 0.0
+        return word
+
+    def reset(self, d_abc: NDArray[np.float64], on: bool = False) -> None:
+        """Put duty ratios and enable in both register banks; the default is blocked."""
+        word = self._word(d_abc, on)
+        self.active, self.shadow = word.copy(), word.copy()
 
     def tick(self, t: float, theta: float | None = None, omega: float | None = None) -> None:
         """Advance the control-interrupt timer and its synchronous-carrier reference."""
@@ -101,15 +115,26 @@ class PWM:
         self.k += 1
         self.t_interrupt = self.interrupt(self.k)
 
-    def write_shadow(self, d_abc: NDArray[np.float64]) -> None:
-        """Write the computed duty ratios to the shadow registers."""
-        self.shadow = np.array(d_abc, dtype=float, copy=True)
+    def write_shadow(self, d_abc: NDArray[np.float64], on: bool = True) -> None:
+        """Write duty ratios and enable directly to an immediately eligible shadow register."""
+        self.shadow = self._word(d_abc, on)
 
-    def write(self, t: float, d_abc: NDArray[np.float64], theta: float | None = None,
+    def write(self, t: float, d_abc: NDArray[np.float64], on: bool = True,
+              theta: float | None = None,
               omega: float | None = None) -> None:
-        """Advance an interrupt and write its computed duty ratios to shadow."""
+        """Advance an interrupt and write its computed duty ratios and enable to shadow."""
         self.tick(t, theta, omega)
-        self.write_shadow(d_abc)
+        self.shadow = self._word(d_abc, on)
+
+    @property
+    def duty(self) -> NDArray[np.float64]:
+        """Duty ratios in the active compare registers."""
+        return self.active[:3].copy()
+
+    @property
+    def on(self) -> bool:
+        """PWM enable in the active compare registers."""
+        return bool(self.active[3])
 
     def start(self, t: float, sync: tuple[float | None, float | None], continued: bool) -> complex:
         """Resume the timer and switching sequence at ``t`` after named states were loaded."""
@@ -117,7 +142,7 @@ class PWM:
         self.t_interrupt, self.t_load = self.interrupt(self.k), self.load_time(self.j)
         last = self.interrupt(self.k - 1)
         self.sync, self.t_sync = sync, min(last, t)
-        q = self._switching(self.load_time(self.j - 1), self.active, t)
+        q = self._switching(self.load_time(self.j - 1), self.active[:3], t)
         if not continued:
             self.t_sync = t
         return q
@@ -126,10 +151,10 @@ class PWM:
         """Load shadow into active registers and schedule switching until the next load."""
         completed = self.interrupt(self.k - 1) + self.computation
         if completed <= t + TIME_EPS:
-            # write_shadow() replaces its array, so the loaded register can safely take ownership
-            # of the previous shadow value without allocating another three-element copy.
+            # Writes replace the shadow word, so the active bank can take ownership without a
+            # copy. Named-state writes detach the banks before mutating either one in place.
             self.active = self.shadow
-        q = self._switching(t, self.active, t)
+        q = self._switching(t, self.active[:3], t)
         self.j += 1
         self.t_load = self.load_time(self.j)
         return q
@@ -165,6 +190,10 @@ class PWM:
         """Next switching or held-input edge relevant to fast protection."""
         return min(self.next_switch, self.load_end)
 
+    def edge(self, t: float) -> bool:
+        """Whether the old switching or held-input interval ends at ``t``."""
+        return abs(self.next_switch - t) < TIME_EPS or abs(self.load_end - t) < TIME_EPS
+
     def switches(self, t: float) -> list[complex]:
         """Return switching states due at ``t`` in order."""
         due = []
@@ -174,9 +203,9 @@ class PWM:
         return due
 
     def get_state(self) -> dict[str, Any]:
-        out = {f"d_{ph}": float(self.active[k]) for k, ph in enumerate("abc")}
-        out.update({f"shadow.d_{ph}": float(self.shadow[k]) for k, ph in enumerate("abc")})
-        return out
+        return {f"{head}{name}": (bool(word[k]) if name == "on" else float(word[k]))
+                for head, word in (("", self.active), ("shadow.", self.shadow))
+                for k, name in enumerate(self._NAMES)}
 
     def set_state(self, values: Mapping[str, Any]) -> None:
         names = set(self.get_state())
@@ -189,9 +218,9 @@ class PWM:
             self.active = self.active.copy()
         for key, value in values.items():
             head, _, name = key.rpartition(".")
-            k = "abc".index(name[-1])
+            k = self._NAMES.index(name)
             target = {"": self.active, "shadow": self.shadow}[head]
-            target[k] = float(value)
+            target[k] = (1.0 if value else 0.0) if name == "on" else float(value)
 
 
 # ------------------------------------------------------------------ the triangular carrier
