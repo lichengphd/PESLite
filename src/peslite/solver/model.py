@@ -16,7 +16,7 @@ import linecache
 import re
 from collections import Counter, deque
 from dataclasses import dataclass
-from typing import Any, ClassVar, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Any, ClassVar, Iterable, Mapping, Protocol, Sequence, runtime_checkable
 
 import numpy as np
 from numpy.typing import NDArray
@@ -24,7 +24,8 @@ from numpy.typing import NDArray
 from . import energy as _energy
 
 __all__ = ["ConfigError", "Bag", "Empty", "OutputStage", "Subsystem", "Model", "GroupPlan",
-           "Stateful", "join", "gather", "scatter", "flatten", "resolve", "expand_aliases", "assign"]
+           "Stateful", "StateRegistry", "join", "gather", "scatter", "flatten", "resolve",
+           "expand_aliases", "assign"]
 
 
 # ------------------------------------------------------------------ subsystems
@@ -98,6 +99,173 @@ class Stateful(Protocol):
     def get_state(self) -> dict[str, Any]: ...
 
     def set_state(self, values: Mapping[str, Any]) -> None: ...
+
+
+@dataclass(frozen=True)
+class _RegisteredState:
+    """One state whose public path and table columns were fixed during assembly."""
+
+    local_name: str
+    name: str
+    columns: tuple[str, ...]
+    kind: str
+
+
+@dataclass(frozen=True)
+class _RegisteredPart:
+    """One state owner and its fixed local schema."""
+
+    prefix: str
+    part: Any
+    states: tuple[_RegisteredState, ...]
+    local_names: frozenset[str]
+
+
+def _state_kind(value: Any) -> str:
+    if isinstance(value, complex):
+        return "complex"
+    if isinstance(value, bool):
+        return "bool"
+    return "real"
+
+
+class StateRegistry:
+    """The immutable state-name layout of one assembled simulation.
+
+    Part names and their local state names are read once while the registry is built.  Later reads
+    use that registered layout: a part may change state *values*, but it may not add, remove or
+    change the representation of states during a run.  This makes ownership and the columns of the
+    state table construction-time properties instead of consequences of repeated dictionary merges.
+    """
+
+    def __init__(self, parts: Mapping[str, Any] | Iterable[tuple[str, Any]]) -> None:
+        groups: list[_RegisteredPart] = []
+        names: dict[str, str] = {}
+        columns: dict[str, str] = {}
+        bools: set[str] = set()
+        prefixes: dict[str, str] = {}
+        items = parts.items() if isinstance(parts, Mapping) else parts
+        for prefix, part in items:
+            owner = type(part).__name__
+            if prefix in prefixes:
+                raise ConfigError(
+                    f"state prefix {prefix!r} is assigned to both {prefixes[prefix]!r} and {owner!r}"
+                )
+            prefixes[prefix] = owner
+            get = getattr(part, "get_state", None)
+            if get is None:
+                continue
+            values = get()
+            if not isinstance(values, Mapping):
+                raise TypeError(f"{type(part).__name__}.get_state() must return a mapping")
+            registered: list[_RegisteredState] = []
+            owner = prefix or type(part).__name__
+            for local_name, value in values.items():
+                if not isinstance(local_name, str):
+                    raise TypeError(
+                        f"{type(part).__name__}.get_state() returned non-string name {local_name!r}"
+                    )
+                name = join(prefix, local_name)
+                if name in names:
+                    raise ConfigError(
+                        f"state name {name!r} is produced by both {names[name]!r} and {owner!r}"
+                    )
+                kind = _state_kind(value)
+                state_columns = ((name + ".re", name + ".im") if kind == "complex" else (name,))
+                for column in state_columns:
+                    if column in columns:
+                        raise ConfigError(
+                            f"state-table column {column!r} is produced by both "
+                            f"{columns[column]!r} and {name!r}"
+                        )
+                    columns[column] = name
+                names[name] = owner
+                if kind == "bool":
+                    bools.add(name)
+                registered.append(_RegisteredState(local_name, name, state_columns, kind))
+            groups.append(_RegisteredPart(
+                prefix, part, tuple(registered), frozenset(state.local_name for state in registered)
+            ))
+        self._groups = tuple(groups)
+        self.names = tuple(names)
+        self.columns = tuple(columns)
+        self.boolean_names = frozenset(bools)
+
+    @staticmethod
+    def _values(group: _RegisteredPart) -> Mapping[str, Any]:
+        values = group.part.get_state()
+        if not isinstance(values, Mapping):
+            raise ConfigError(f"{type(group.part).__name__}.get_state() no longer returns a mapping")
+        actual = set(values)
+        if actual != group.local_names:
+            added = sorted(actual - group.local_names)
+            removed = sorted(group.local_names - actual)
+            owner = group.prefix or type(group.part).__name__
+            raise ConfigError(
+                f"state schema of {owner!r} changed after Simulation construction"
+                f" (added: {added}, removed: {removed})"
+            )
+        return values
+
+    def read(self, prefixes: Iterable[str] | None = None) -> dict[str, Any]:
+        """Read current values using the paths registered during assembly."""
+        selected = None if prefixes is None else set(prefixes)
+        out: dict[str, Any] = {}
+        for group in self._groups:
+            if selected is not None and group.prefix not in selected:
+                continue
+            values = self._values(group)
+            for state in group.states:
+                value = values[state.local_name]
+                if _state_kind(value) != state.kind:
+                    raise ConfigError(
+                        f"state {state.name!r} changed representation from {state.kind} "
+                        f"to {_state_kind(value)}"
+                    )
+                out[state.name] = value
+        return out
+
+    def read_flat(self, prefixes: Iterable[str] | None = None) -> dict[str, float]:
+        """Read the fixed real-valued state-table columns."""
+        selected = None if prefixes is None else set(prefixes)
+        out: dict[str, float] = {}
+        for group in self._groups:
+            if selected is not None and group.prefix not in selected:
+                continue
+            values = self._values(group)
+            for state in group.states:
+                value = values[state.local_name]
+                kind = _state_kind(value)
+                if kind != state.kind:
+                    raise ConfigError(
+                        f"state {state.name!r} changed representation from {state.kind} to {kind}"
+                    )
+                if kind == "complex":
+                    out[state.columns[0]] = value.real
+                    out[state.columns[1]] = value.imag
+                elif kind == "bool":
+                    out[state.columns[0]] = 1.0 if value else 0.0
+                else:
+                    out[state.columns[0]] = float(value)
+        return out
+
+    def load(self, values: Mapping[str, Any], prefixes: Iterable[str] | None = None) -> None:
+        """Load a subset of registered values into selected owners."""
+        if not values:
+            return
+        selected = None if prefixes is None else set(prefixes)
+        for group in self._groups:
+            if selected is not None and group.prefix not in selected:
+                continue
+            own = {state.local_name: values[state.name]
+                   for state in group.states if state.name in values}
+            if not own:
+                continue
+            set_state = getattr(group.part, "set_state", None)
+            if set_state is None:
+                owner = group.prefix or type(group.part).__name__
+                raise ConfigError(f"state owner {owner!r} does not support loading states")
+            set_state(own)
 
 
 def join(prefix: str, name: str) -> str:

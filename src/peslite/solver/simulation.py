@@ -33,7 +33,7 @@ from ..components.pwm import ComputationDelayProtocol, Modulator
 from ..control.blocks import abc2complex, complex2abc
 from ..control.controller import Controller
 from .integrators import Solver
-from .model import ConfigError, expand_aliases, flatten, gather, resolve, scatter
+from .model import ConfigError, StateRegistry, expand_aliases, flatten, resolve
 from .multirate import make_solver
 from .splitbound import split_error_bound
 
@@ -342,6 +342,8 @@ class Simulation:
                                   f"{type(self.system).__name__} has none")
         if not isinstance(self.solver, Solver):
             raise TypeError(f"{type(self.solver).__name__} does not satisfy the Solver protocol")
+        self._start_duty()
+        self._states = StateRegistry(self._state_parts())
         self.result: SimulationResult | None = None
         self.energy_problems: list[str] = []
         self.ph_report = None  # port-Hamiltonian structure report
@@ -421,15 +423,18 @@ class Simulation:
             warnings.warn("energy check: " + msg, stacklevel=3)
 
     # ------------------------------------------------------------ states
-    def _parts(self) -> dict[str, Any]:
-        """The parts that have named states, by their prefix in the state table, in its order."""
-        parts: dict[str, Any] = {"": self.system}
-        for name, unit in self.system.units.items():
-            parts[f"{name}.ctrl"] = unit.ctrl
-            parts[f"{name}.pwm"] = unit.pwm
-            if unit.adc.averaging:
-                parts[f"{name}.meas"] = unit.adc
-        parts["solver"] = self.solver
+    def _state_parts(self) -> list[tuple[str, Any]]:
+        """State owners by fixed state-table prefix, in state-table order."""
+        provide = getattr(self.system, "state_parts", None)
+        if provide is not None:
+            parts = list(provide())
+        else:  # custom systems written for the original aggregate Stateful interface
+            parts = [("", self.system)]
+            for name, unit in self.system.units.items():
+                parts.extend([(f"{name}.ctrl", unit.ctrl), (f"{name}.pwm", unit.pwm)])
+                if unit.adc.averaging:
+                    parts.append((f"{name}.meas", unit.adc))
+        parts.append(("solver", self.solver))
         return parts
 
     def _start_duty(self) -> None:
@@ -451,7 +456,7 @@ class Simulation:
                       for unit, log in ctrl_logs.items() for key, value in log.items()})
         row = SimulationResult(params=self.p, t=np.asarray([t]), plant=plant, control={}).columns()
         values = {key: float(value[0]) for key, value in row.items() if key != "t"}
-        state = gather(self._parts())
+        state = self._states.read()
         for alias, name in getattr(system, "state_aliases", {}).items():
             if name in state:
                 state[alias] = state[name]
@@ -464,9 +469,7 @@ class Simulation:
 
     def state_names(self) -> list[str]:
         """Return the state-table column names after ``t``, i.e. the valid ``initial.states`` keys."""
-        if self.result is None:
-            self._start_duty()
-        return list(flatten(gather(self._parts())))
+        return list(self._states.columns)
 
     def _apply_initial(self, t0: float) -> np.ndarray:
         """Load ``initial.states`` into the parts; return the solver vector."""
@@ -475,7 +478,7 @@ class Simulation:
         presets_of = getattr(system, "state_presets", None)
         presets = presets_of(t0) if presets_of is not None else {}
         self._start_duty()  # so that the duty ratios and shadow registers have their states
-        template = gather(self._parts())
+        template = self._states.read()
         try:
             given = expand_aliases(self.p.simulation.initial.states, aliases)
             if callable(presets):
@@ -494,7 +497,7 @@ class Simulation:
                 msg += f". Aliases: {', '.join(f'{a} -> {c}' for a, c in aliases.items())}"
             raise ConfigError(msg) from None
         # 1. power stage (unset states stay zero), events up to t0, then the solver vector
-        scatter({"": system}, values)
+        self._states.load(values, ["", *system.units])
         if hasattr(system, "switch"):
             for name, steps in switching_schedule(self.p.events).items():
                 if not connected_at(steps, t0):
@@ -512,13 +515,13 @@ class Simulation:
             unit.adc.seed()  # averaging window starts at t0
             unit.pwm.d = np.array(unit.ctrl.initial_duty(), dtype=float)
             unit.pwm.computation_delay.reset(unit.pwm.d)
-            scatter({f"{name}.pwm": unit.pwm}, values)
+            self._states.load(values, [f"{name}.pwm"])
         # 3. controllers, measurement windows, solver
         for name, unit in system.units.items():
-            scatter({f"{name}.ctrl": unit.ctrl}, values)
+            self._states.load(values, [f"{name}.ctrl"])
             if unit.adc.averaging:
-                scatter({f"{name}.meas": unit.adc}, values)
-        scatter({"solver": self.solver}, values)
+                self._states.load(values, [f"{name}.meas"])
+        self._states.load(values, ["solver"])
         return y
 
     # ------------------------------------------------------------ the loop
@@ -574,14 +577,12 @@ class Simulation:
         stop_reason = ""
         coarse_reported = False
         stopped = False
-        parts = self._parts()
-
         def snapshot(t_now: float) -> None:
             try:
                 with np.errstate(over="raise"):
                     mdl.sync(t_now, y)
                     rec.plant_snapshot(t_now, system.signals(t_now))
-                    rec.state_row(t_now, flatten(gather(parts)))
+                    rec.state_row(t_now, self._states.read_flat())
                     if energy_on and _finite(y):
                         rep = mdl.energy_balance(t_now, y)
                         rec.energy_row(t_now, rep.columns())
@@ -834,8 +835,8 @@ class SystemLoop:
             self.periods.extend(T for T in getattr(u.ctrl, "periods", {}).values() if T)
         self.period = macro_period(self.periods)
         self.w0 = 2.0 * math.pi * sim.p.base.f0
-        self._flags = {k for k, v in gather(sim._parts()).items() if isinstance(v, bool)}
-        self._plant_columns = set(flatten(gather({"": sim.system})))
+        self._flags = set(sim._states.boolean_names)
+        self._plant_columns = set(sim._states.read_flat(["", *sim.units]))
         rated = sim.solver.rated_effort
         self._rated = ({lab: float(r) for lab, r in zip(sim.system.model.state_labels(), rated)}
                        if rated is not None else {})

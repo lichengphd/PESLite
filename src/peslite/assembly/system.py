@@ -122,6 +122,13 @@ class System:
             self.state_aliases.update(unit.aliases())
 
     # ---------------------------------------------------------------- states
+    def state_parts(self) -> list[tuple[str, Any]]:
+        """Return the power model and unit state owners in state-table order."""
+        parts: list[tuple[str, Any]] = [("", self.model)]
+        for unit in self.units.values():
+            parts.extend(unit.state_parts())
+        return parts
+
     def get_state(self) -> dict[str, Any]:
         """Return every plant state (model and units) by name; model outputs must be synced first."""
         s: dict[str, Any] = self.model.get_state()

@@ -100,6 +100,14 @@ class Unit:
             out[f"{self.name}.u_dc"] = f"{self.name}.dclink.u_C"
         return out
 
+    def state_parts(self) -> list[tuple[str, Any]]:
+        """Return this unit's fixed state owners and their public prefixes."""
+        parts = [(self.name, self), (f"{self.name}.ctrl", self.ctrl),
+                 (f"{self.name}.pwm", self.pwm)]
+        if self.adc.averaging:
+            parts.append((f"{self.name}.meas", self.adc))
+        return parts
+
     # ---------------------------------------------------------------- states
     def get_state(self) -> dict[str, Any]:
         return {"tripped": self.tripped}
