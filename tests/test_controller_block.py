@@ -1,4 +1,4 @@
-"""Issue #1: the controller is a closed sampled block; hardware protection belongs to Unit."""
+"""Issue #1: the controller is a closed sampled block; all protection belongs to Unit."""
 
 import cmath
 from types import SimpleNamespace
@@ -10,7 +10,6 @@ import peslite
 from conftest import EXAMPLES
 from peslite.control import Measurement, Sequencer
 from peslite.control.blocks import smoothstep
-from peslite.control.protection import Protection
 
 
 T = 5e-5
@@ -31,19 +30,19 @@ def _current(result):
 
 def test_sequencer_counts_startup_on_controller_interrupts():
     sequence = Sequencer(T=0.25, run=False)
-    sequence.step(False)
-    assert (sequence.running, sequence.ramp_value, sequence.armed) == (False, 0.0, False)
+    sequence.step()
+    assert (sequence.running, sequence.ramp_value, sequence.complete) == (False, 0.0, False)
     sequence.command(True, 1.0)
     seen = []
     for _ in range(6):
-        sequence.step(False)
-        seen.append((sequence.running, sequence.ramp_value, sequence.armed, sequence.steps))
+        sequence.step()
+        seen.append((sequence.running, sequence.ramp_value, sequence.complete, sequence.steps))
     assert seen == [(True, smoothstep(x), x >= 1.0, min(4, n + 1))
                     for n, x in enumerate((0.0, 0.25, 0.5, 0.75, 1.0, 1.0))]
     sequence.set_state({"steps": 100})
     assert sequence.steps == 4
     sequence.command(False)
-    sequence.step(False)
+    sequence.step()
     assert (sequence.running, sequence.steps) == (False, 0)
 
 
@@ -51,25 +50,26 @@ def test_controller_needs_only_samples_and_host_commands(gfl):
     cfg = gfl().unit("vsc")
     controller = peslite.UniteType(cfg)
     assert not hasattr(controller, "scenario")
+    assert not hasattr(controller, "protection")
     voltage, w0 = cfg.base.v_phase_peak, cfg.base.w0
 
-    def sample(k, **extra):
+    def sample(k):
         return Measurement(k * T, voltage * cmath.exp(1j * w0 * k * T), 0j,
-                           cfg.dclink.vdc_ref, np.zeros(3), **extra)
+                           cfg.dclink.vdc_ref, np.zeros(3))
 
     controller.command(False)
     output = controller(0.0, sample(0))
-    assert not output.gates and output.log["in_service"] == 0.0 and not output.tripped
+    assert not output.gates and not output.startup_complete and output.log["in_service"] == 0.0
+    assert not hasattr(output, "tripped") and not hasattr(output, "trip_cause")
     controller.command(True, 4 * T)
     armed = []
     for k in range(1, 8):
         output = controller(k * T, sample(k))
-        armed.append(controller.sequencer.armed)
+        armed.append(controller.sequencer.complete)
         assert output.gates and np.all((0.0 <= output.d_abc) & (output.d_abc <= 1.0))
     assert armed == [False, False, False, False, True, True, True]
-    output = controller(8 * T, sample(8, fault=True))
-    assert (output.tripped, output.gates, output.trip_cause) == (True, False, "overcurrent")
-    assert not controller(9 * T, sample(9)).gates
+    controller.command(False)
+    assert not controller(8 * T, sample(8)).gates
 
 
 def test_pwm_stays_blocked_until_first_controller_word_is_loaded(gfl, tmp_path):
@@ -105,7 +105,7 @@ def test_disconnect_stops_sequence_and_connect_restarts_ramp(gfl, tmp_path):
     assert np.array_equal(steps[after], np.minimum(np.arange(1, after.sum() + 1), end))
 
 
-def test_gate_driver_comparator_trips_during_unarmed_ramp(gfl, tmp_path):
+def test_fast_unit_protection_trips_during_unarmed_ramp(gfl, tmp_path):
     params = gfl(**{
         "units.vsc.protection.overcurrent.limit_pu": 0.01,
         "events.connect_vsc.ramp": 1.0,
@@ -133,26 +133,47 @@ def test_sampled_protection_arms_and_holds(criterion, cause, alarm, inputs):
     cfg = SimpleNamespace(
         hold=0.02,
         rocof=SimpleNamespace(window=0.1, enable=False),
+        overcurrent=SimpleNamespace(enable=False, limit_pu=1.0),
         dc_voltage=SimpleNamespace(enable=False, limit_pu=0.1),
         frequency=SimpleNamespace(enable=False, limit=1.0),
         undervoltage=SimpleNamespace(enable=False, limit_pu=0.8),
         overvoltage=SimpleNamespace(enable=False, limit_pu=1.2),
     )
     getattr(cfg, criterion).enable = True
-    protection = Protection(cfg, 0.01)
-    protection.check_sampled(0.0, *inputs, armed=False)
+    protection = peslite.Protection(cfg, 0.01, 1.0)
+    protection.check_sampled(0.0, *inputs, startup_complete=False)
     assert not protection.tripped and protection.stats.alarms == []
-    protection.check_sampled(0.01, *inputs, armed=True)
+    protection.check_sampled(0.01, *inputs, startup_complete=True)
     assert not protection.tripped and protection.stats.alarms == [alarm]
-    protection.check_sampled(0.02, *inputs, armed=True)
-    protection.check_sampled(0.03, *inputs, armed=True)
+    protection.check_sampled(0.02, *inputs, startup_complete=True)
+    protection.check_sampled(0.03, *inputs, startup_complete=True)
     assert protection.trip is not None and protection.trip.cause == cause
+
+
+def test_fast_and_sampled_paths_share_one_trip_latch():
+    cfg = SimpleNamespace(
+        hold=0.0,
+        rocof=SimpleNamespace(window=0.1, enable=False),
+        overcurrent=SimpleNamespace(enable=True, limit_pu=0.5),
+        dc_voltage=SimpleNamespace(enable=True, limit_pu=0.1),
+        frequency=SimpleNamespace(enable=False, limit=1.0),
+        undervoltage=SimpleNamespace(enable=False, limit_pu=0.8),
+        overvoltage=SimpleNamespace(enable=False, limit_pu=1.2),
+    )
+    protection = peslite.Protection(cfg, 0.01, 1.0)
+    assert protection.check_fast(0.01, (0.6, 0.0, 0.0))
+    first = protection.trip
+    assert not protection.check_sampled(0.02, 1.0, 0.0, 0.2, startup_complete=True)
+    assert protection.trip is first and protection.trip.cause == "overcurrent"
+    assert protection.stats.alarms == ["OVERCURRENT", "TRIP_OVERCURRENT"]
 
 
 def test_controller_block_states_use_entity_first_names(gfl):
     names = set(peslite.Simulation(gfl()).state_names())
     assert {"vsc.ctrl.sequence.run", "vsc.ctrl.sequence.ramp", "vsc.ctrl.sequence.steps",
             "vsc.tripped", "vsc.fault", "vsc.pwm.on", "vsc.pwm.shadow.on"} <= names
+    assert "vsc.prot.hold_uv" in names
+    assert not any(".ctrl.prot." in name for name in names)
     assert not any(".pending." in name for name in names)
 
 

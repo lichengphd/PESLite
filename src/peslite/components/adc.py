@@ -23,8 +23,7 @@ class MeasurementPorts:
     """Zero-argument callables that read one converter's quantities from the model (SI).
 
     ``u_g`` terminal voltage, ``i_c`` converter current, ``u_dc`` dc voltage;
-    ``i_c_state`` reads the current from the state vector; ``i_dc`` is recorded only; ``fault``
-    reads the gate driver's latched digital fault.
+    ``i_c_state`` reads the current from the state vector; ``i_dc`` is recorded only.
     """
 
     u_g: Callable[[], complex]
@@ -32,7 +31,6 @@ class MeasurementPorts:
     i_c_state: Callable[[], complex]
     u_dc: Callable[[], float]
     i_dc: Optional[Callable[[], float]] = None
-    fault: Optional[Callable[[], bool]] = None
 
     def read(self) -> dict[str, complex | float]:
         """The instantaneous values of the ADC channels ``v``, ``i`` and ``dc``."""
@@ -155,8 +153,8 @@ class ADC:
         """Return the :class:`Measurement` at ``t``; model outputs must be up to date at ``t``.
 
         ``u_g``, ``i_c``, ``u_dc`` are window means for averaged channels;
-        ``u_g_raw``, ``i_c_raw``, ``u_dc_raw`` and ``i_abc`` are instantaneous; ``fault`` is the
-        gate driver's digital input.
+        ``u_g_raw``, ``i_c_raw``, ``u_dc_raw`` and ``i_abc`` are instantaneous values before
+        averaging.
         """
         ports = self.ports
         u_raw, i_raw, dc_raw = ports.u_g(), ports.i_c(), ports.u_dc()
@@ -164,8 +162,7 @@ class ADC:
         return Measurement(t=t,
                            u_g=mean.get("v", u_raw), i_c=mean.get("i", i_raw),
                            u_dc=mean.get("dc", dc_raw), i_abc=complex2abc(i_raw),
-                           u_g_raw=u_raw, i_c_raw=i_raw, u_dc_raw=dc_raw,
-                           fault=ports.fault() if ports.fault is not None else False)
+                           u_g_raw=u_raw, i_c_raw=i_raw, u_dc_raw=dc_raw)
 
     def phase_currents(self) -> np.ndarray:
         """Return the instantaneous phase currents read from the state vector."""

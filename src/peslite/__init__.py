@@ -11,7 +11,7 @@ from .solver import (AdaptiveSolver, DormandPrince45, FixedStepSolver, Model, Mu
 from .control import OutputStage, UniteType, make_controller, register_loop_type
 from .components import (ADC, PWM, ZOH, CarrierComparison, MeasurementPorts, TimeStepAveragedCarrier,
                          make_modulator, register_element_type)
-from .assembly import (Params, SourceScenario, System, Unit, dump, dumps, load,
+from .assembly import (Params, Protection, SourceScenario, System, Unit, dump, dumps, load,
                        register_event_type)
 from .solver.simulation import Simulation, SimulationResult, main
 
@@ -19,7 +19,7 @@ __version__ = "0.1.4"
 
 __all__ = [
     "solver", "control", "components", "assembly",
-    "Params", "load", "dump", "dumps", "System", "Unit", "MeasurementPorts", "Model", "SourceScenario",
+    "Params", "load", "dump", "dumps", "System", "Unit", "Protection", "MeasurementPorts", "Model", "SourceScenario",
     "Simulation", "SimulationResult", "UniteType", "main", "make_controller", "make_modulator", "make_solver",
     "register_loop_type", "register_element_type", "register_event_type",
     "OutputStage", "ADC", "PWM", "CarrierComparison", "ZOH", "TimeStepAveragedCarrier",

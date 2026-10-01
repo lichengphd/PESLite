@@ -5,26 +5,30 @@
 ### The controller as a block (#1)
 
 - A converter controller is now one closed sampled block. Each interrupt gives it an ADC
-  `Measurement` including the gate driver's fault; it returns duty ratios, PWM enable and any
-  trip. Connect/disconnect events reach it only as `command(run, ramp)`, so it no longer reads the
-  plant or absolute event schedule.
-- `Sequencer` owns start/stop, an interrupt-counted power-setpoint ramp and the arming of sampled
-  protection. Its named states are `<unit>.ctrl.sequence.run`, `.ramp` and `.steps`. Integrating
-  loops hold while stopped, and grid-forming laws track the terminal voltage before starting.
+  `Measurement`; it returns duty ratios, PWM enable, start-up completion and synchronization
+  estimates. Connect/disconnect events reach it only as `command(run, ramp)`, so it no longer
+  reads the plant, protection state or absolute event schedule.
+- `Sequencer` owns start/stop and an interrupt-counted power-setpoint ramp, and reports when that
+  ramp is complete. Its named states are `<unit>.ctrl.sequence.run`, `.ramp` and `.steps`.
+  Integrating loops hold while stopped, and grid-forming laws track the terminal voltage before
+  starting.
 - PWM starts blocked. Its enable travels with the duty ratios in the active and shadow registers
   (`<unit>.pwm.on`, `<unit>.pwm.shadow.on`); there is no plant-derived start-up duty and no separate
   pending register.
-- The AC breaker, gate enable and instantaneous `OvercurrentComparator` belong to `Unit`. The
-  comparator checks plant phase current at switching/load instants, trips immediately even during
-  start-up, and supplies a latched digital fault to the controller. A trip blocks gates, opens the
-  AC terminal and disconnects the DC source permanently.
+- One `Protection` subsystem owned by `Unit` contains every protection decision and the sole trip
+  latch. Its fast over-current path checks plant phase current at switching/load instants and acts
+  even during start-up; its voltage, frequency, DC-voltage and ROCOF paths run on ADC/controller
+  samples; the unit arms them when the sequencer reports that start-up is complete. Every trip
+  blocks gates, opens the AC terminal and disconnects the DC source permanently.
 - A unit acts on the continuous model only through the run's `Plant` interface. At a coincident
   instant all units protect first, all sample next, and all actuate last, so sampling is independent
   of unit registration order.
-- Summary trip/current fields now come from the unit while sampled protection statistics come from
-  the controller. The split-bound linearisation keeps sequencer counters and PWM modes fixed.
+- All trip, alarm and protection statistics now come from the unit's protection subsystem. Its
+  timer states use `<unit>.prot.*`; the controller has no protection states. The split-bound
+  linearisation keeps sequencer counters and PWM modes fixed.
 - Removed `UnitScenario`, controller access to scenarios, `initial_duty`, `align_startup`,
-  `fast_check`, `Protection.check_current` and the compatibility `ctrl.update()` entry point.
+  `fast_check`, the separate `OvercurrentComparator`, `Measurement.fault`, `ControlOutput.tripped`,
+  `ControlOutput.trip_cause`, `control.protection` and the compatibility `ctrl.update()` entry point.
 
 ### Digital control timing and continuation (#4)
 

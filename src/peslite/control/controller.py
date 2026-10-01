@@ -2,9 +2,9 @@
 
 At each control interrupt the controller takes an ADC sample (:class:`Measurement`, SI), scales it to
 the unit's pu bases, runs its loop network (:class:`ControlGraph`: the loops of :mod:`.loops`
-connected by typed ports), its start-up sequencer and sampled protection, and turns the voltage
-command into duty ratios. It sees only its samples, host commands and its own state, and returns
-duty ratios, PWM enable and a latched trip.
+connected by typed ports) and its start-up sequencer, and turns the voltage command into duty
+ratios. It sees only its samples, host commands and its own state. Protection and physical trip
+actions belong to the unit.
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ from ..solver.model import ConfigError, gather, scatter
 from .blocks import peak_abs, smoothstep
 from .loops import (ANGLE, CURRENT, DC_VOLTAGE, FREQUENCY, I_AB, LOOP_TYPES, POWER_PU, V_AB, V_DQ, VOLTAGE)
 from .modulation import CONFIGURED, OutputStage
-from .protection import Protection
 
 __all__ = ["Measurement", "ControlMeasurement", "ControlOutput", "Controller", "Sequencer",
            "ControlGraph", "default_wiring", "UniteType", "make_controller"]
@@ -47,7 +46,6 @@ class Measurement:
     u_dc_raw: Optional[float] = None
     extras: dict[str, float] = field(default_factory=dict)
     samples: tuple["Measurement", ...] = ()
-    fault: bool = False
 
 
 @dataclass
@@ -68,18 +66,18 @@ class ControlMeasurement:
 class ControlOutput:
     """Result of one controller call.
 
-    ``d_abc`` and ``gates`` go through the PWM registers; ``tripped`` opens the unit immediately.
+    ``d_abc`` and ``gates`` go through the PWM registers. ``startup_complete`` reports that the
+    controller's start-up ramp has finished; the owning unit decides how to use it.
     ``theta`` (rad) and ``omega`` (rad/s): the controller's synchronization angle and frequency,
     required by synchronous modulators; ``None`` allows only asynchronous modulation.
     """
 
     d_abc: NDArray[np.float64]  # duty ratios of phases a, b, c in [0, 1]
-    tripped: bool = False
     log: dict[str, float] | None = None
     theta: float | None = None  # synchronization angle (rad)
     omega: float | None = None  # synchronization frequency (rad/s)
     gates: bool = True
-    trip_cause: str | None = None
+    startup_complete: bool = True
 
 
 @runtime_checkable
@@ -87,7 +85,8 @@ class Controller(Protocol):
     """Sampled controller ``(t, Measurement) -> ControlOutput``.
 
     Optional host-facing methods are ``command``, ``track``, ``retune``, state access and
-    ``summary``; the required target interface is only the sampled call.
+    ``summary``; the required target interface is only the sampled call. Protection is deliberately
+    outside this interface.
     """
 
     def __call__(self, t: float, meas: Measurement) -> ControlOutput: ...
@@ -105,7 +104,7 @@ class Sequencer:
         self.steps = 0
         self.running = False
         self.ramp_value = 0.0
-        self.armed = False
+        self.complete = False
 
     def command(self, run: bool, ramp: float = 0.0) -> None:
         """Take a host run/stop command; every new run has its own ramp."""
@@ -115,15 +114,15 @@ class Sequencer:
         else:
             self.steps = 0
 
-    def step(self, tripped: bool) -> None:
-        self.running = self.run and not tripped
+    def step(self) -> None:
+        self.running = self.run
         if not self.running:
-            self.steps, self.ramp_value, self.armed = 0, 0.0, False
+            self.steps, self.ramp_value, self.complete = 0, 0.0, False
             return
         progress = 1.0 if self.ramp <= 0.0 else min(1.0, self.steps * self.T / self.ramp)
         self.ramp_value = smoothstep(progress)
-        self.armed = progress >= 1.0
-        if not self.armed:
+        self.complete = progress >= 1.0
+        if not self.complete:
             self.steps += 1
 
     def setpoints(self, p_ref: float, q_ref: float, v_ref: float) -> tuple[float, float, float]:
@@ -470,10 +469,10 @@ def default_wiring(cfg, family):
 # ------------------------------------------------------------------ the controller
 
 class UniteType:
-    """Configurable closed controller block with loops, start-up, protection and output stage.
+    """Configurable closed controller block with loops, start-up and output stage.
 
     The host gives it only ``command(run, ramp)`` and parameter updates. At each interrupt it sees
-    one :class:`Measurement` and returns duty ratios, PWM enable and its trip.
+    one :class:`Measurement` and returns duty ratios, PWM enable and synchronization estimates.
     """
 
     def __init__(self, cfg, pwm_method=None, *, limiter=CONFIGURED):
@@ -484,7 +483,6 @@ class UniteType:
         self.periods = graph.periods
         self.v_base, self.i_base, self.w0 = cfg.base.v_phase_peak, cfg.base.i_phase_peak, cfg.base.w0
         self.v_dc_base = cfg.dc_base.v
-        self.protection = Protection(cfg.protection, cfg.ctrl.period)
         self.stage = OutputStage(cfg, pwm_method=pwm_method, limiter=limiter)
         self.theta, self.omega = self.initial_sync()
         self.u_cmd = 1.0 + 0j
@@ -517,11 +515,9 @@ class UniteType:
         return self.graph.describe()
 
     def retune(self, cfg, paths, t):
-        """Queue new control parameters and apply new protection settings."""
+        """Queue new controller parameters for its next interrupt."""
         if any(path.startswith("ctrl.") for path in paths):
             self.graph.schedule(cfg)
-        if any(path.startswith("protection.") for path in paths):
-            self.protection.retune(cfg.protection)
         self.p = cfg
 
     def initial_sync(self):
@@ -537,10 +533,6 @@ class UniteType:
         if self.graph.track(self._pu(meas)):
             self.theta, self.omega = self.initial_sync()
             self.command_theta = self.theta
-
-    @property
-    def tripped(self):
-        return self.protection.tripped
 
     # ------------------------------------------------------------ one sample
     def _pu(self, meas: Measurement) -> ControlMeasurement:
@@ -593,7 +585,7 @@ class UniteType:
     def __call__(self, t, meas):
         control_meas = self._pu(meas)
         sequence = self.sequencer
-        sequence.step(self.tripped)
+        sequence.step()
         self.stage.new_instant()
         self.graph.update(t, control_meas, finalize=self._accept_command)
         frame = self.graph.values.get(self._frame_key, self.theta)
@@ -602,15 +594,9 @@ class UniteType:
         rot = cmath.exp(-1j * frame)
         self.v_dq, self.i_dq = control_meas.u_g * rot, control_meas.i_c * rot
         freq_dev = (self.omega - self.w0) / (2 * math.pi)
-        refs, prot = self.graph.references, self.protection
-        if meas.fault:
-            prot.fault(t)
-        prot.check_sampled(t, abs(self.v_dq), freq_dev,
-                           control_meas.u_dc - refs["vdc_ref_pu"], sequence.armed)
-        tripped = prot.tripped
-        gates = sequence.running and not tripped
-        duty = self.stage.modulate(t, 0j if tripped else self.u_cmd,
-                                   self.command_theta, control_meas.u_dc, count=gates)
+        refs = self.graph.references
+        gates = sequence.running
+        duty = self.stage.modulate(t, self.u_cmd, self.command_theta, control_meas.u_dc, count=gates)
         log = {"id_pu": self.i_dq.real, "iq_pu": self.i_dq.imag,
                "vd_pu": self.v_dq.real, "vq_pu": self.v_dq.imag,
                "vac_pu": abs(self.v_dq), "vdc_pu": control_meas.u_dc,
@@ -627,22 +613,19 @@ class UniteType:
                        p_ref_pu=pr, v_ref_pu=values.get(self._v_ref_key, 1.0),
                        freq_dev=freq_dev, angle_rel=angle_rel)
         self.last_log = log
-        trip = prot.trip
-        return ControlOutput(duty, tripped, log, theta=self.theta, omega=self.omega,
-                             gates=gates, trip_cause=trip.cause if trip is not None else None)
+        return ControlOutput(duty, log=log, theta=self.theta, omega=self.omega,
+                             gates=gates, startup_complete=sequence.complete)
 
     # ------------------------------------------------------------ states and summary
     def get_state(self):
-        return {**self.graph.get_state(), **gather({"prot": self.protection}), "command.u_dq_pu": self.u_cmd,
+        return {**self.graph.get_state(), "command.u_dq_pu": self.u_cmd,
                 "command.theta": self.command_theta, "command.omega": self.omega,
                 **gather({"sequence": self.sequencer})}
 
     def set_state(self, values):
-        rest, prot, sequence = {}, {}, {}
+        rest, sequence = {}, {}
         for name, value in values.items():
-            if name.startswith("prot."):
-                prot[name] = value
-            elif name.startswith("sequence."):
+            if name.startswith("sequence."):
                 sequence[name] = value
             elif name == "command.u_dq_pu":
                 self.u_cmd = complex(value)
@@ -653,17 +636,15 @@ class UniteType:
             else:
                 rest[name] = value
         self.graph.set_state(rest)
-        scatter({"prot": self.protection}, prot)
         scatter({"sequence": self.sequencer}, sequence)
         self.theta, self.omega = self.initial_sync()
 
     def summary(self):
-        """Return what the sampled controller observed."""
+        """Return controller and modulation observations."""
         stage = self.stage
         summary = {
             "modulation_saturation_fraction": stage.n_saturated / max(1, stage.n_updates),
             "modulation_saturation_first_t": stage.first_saturation_t,
-            **self.protection.summary(),
         }
         if self._dc is not None:
             dc = self.graph.nodes[self._dc]

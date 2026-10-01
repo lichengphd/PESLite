@@ -125,11 +125,11 @@ def test_switching_schedule_and_scenario_connection_ramps():
     sequence = Sequencer(0.5, run=False)
     sequence.command(True, 2.0)
     for _ in range(3):
-        sequence.step(False)
-    assert 0.0 < sequence.ramp_value < 1.0 and not sequence.armed
+        sequence.step()
+    assert 0.0 < sequence.ramp_value < 1.0 and not sequence.complete
     for _ in range(3):
-        sequence.step(False)
-    assert sequence.ramp_value == 1.0 and sequence.armed
+        sequence.step()
+    assert sequence.ramp_value == 1.0 and sequence.complete
 
     always = Scenario()
     assert always.connected(0.0) and always.since(0.0) == (-math.inf, 0.0)

@@ -107,8 +107,8 @@ units:                     # converters, one entry each
       # like the built-in ones and its parameters are checked the same way.
 
     protection:            # trips only this converter (gates blocked, AC and DC sides opened)
-      overcurrent: {enable: 1, limit_pu: 1.15}   # gate-driver comparator: instantaneous, armed from start
-      #                    # the remaining criteria use controller samples and arm after the ramp
+      overcurrent: {enable: 1, limit_pu: 1.15}   # unit protection: checked at PWM edges, armed from start
+      #                    # sampled unit criteria use ADC/controller-rate values and arm after the ramp
       undervoltage: {enable: 1, limit_pu: 0.50}  # ac voltage magnitude, held for hold
       overvoltage: {enable: 1, limit_pu: 1.20}
       # frequency: {enable: 0, limit: 0.5}       # frequency deviation, Hz, held for hold

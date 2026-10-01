@@ -244,8 +244,8 @@ def test_system_applies_retunes_and_control_loops_keep_their_state():
     assert (line.L, line.R) == (current.branches["line"].l, current.branches["line"].r)
     assert load.branch.state.i == 7 + 8j and load.branch.R == current.elements["load"].r
     assert unit.dclink.source.i_nom == current.unit("vsc").dclink.source.i
-    assert unit.ctrl.protection.cfg.hold == 0.01
-    assert unit.ctrl.protection._rocof_window == pytest.approx(0.2)
+    assert unit.protection.cfg.hold == 0.01
+    assert unit.protection._rocof_window == pytest.approx(0.2)
     assert unit.ctrl.graph.nodes["pll"] is old_pll  # queued until the next controller update
 
     unit.ctrl(change.t, _measurement(p, change.t))

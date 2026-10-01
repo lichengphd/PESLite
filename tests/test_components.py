@@ -25,6 +25,7 @@ def test_unit_delegates_sampling_and_modulation_state_to_components():
 
     assert isinstance(unit.adc, ADC)
     assert isinstance(unit.pwm, PWM)
+    assert isinstance(unit.protection, peslite.Protection)
     assert peslite.ADC is ADC and peslite.PWM is PWM
     assert not hasattr(unit, "sampler")
     assert not hasattr(unit, "window")

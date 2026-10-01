@@ -1,7 +1,7 @@
-"""A converter unit: power stage, ADC/PWM/gate driver peripherals and controller.
+"""A converter unit: power stage, ADC/PWM peripherals, controller and protection.
 
-The controller is a closed sampled block. Breakers, gates and the instantaneous over-current
-comparator belong to the unit and act on the continuous plant.
+The controller is a closed sampled block. All protection decisions, their single trip latch,
+breakers and gates belong to the unit and act on the continuous plant.
 """
 
 from __future__ import annotations
@@ -13,13 +13,14 @@ from typing import Any, ContextManager, Mapping, Optional, Protocol
 import numpy as np
 
 from ..components.adc import ADC, MeasurementPorts
-from ..components.converter import Bridge, OvercurrentComparator, make_dclink
+from ..components.converter import Bridge, make_dclink
 from ..components.network import RLBranch
 from ..components.pwm import PWM, TIME_EPS, Modulator, make_modulator
 from ..control.blocks import phases
 from ..control.controller import Controller, Measurement, make_controller
 from .events import Scenario
 from .params import SimulationParams, UnitParams
+from .protection import Protection
 
 __all__ = ["Plant", "Unit"]
 
@@ -58,11 +59,8 @@ class Unit:
         self.branch_f = RLBranch(cfg.ac_filter.l_f, cfg.ac_filter.r_f)
         self.breaker = True
         self.gates = False
-        self.comparator = OvercurrentComparator(cfg.protection.overcurrent, cfg.base.i_phase_peak)
-        self.tripped = False
-        self.trip_time: Optional[float] = None
-        self.trip_cause: Optional[str] = None
-        self._trip_due: Optional[str] = None
+        self.protection = Protection(cfg.protection, cfg.ctrl.period, cfg.base.i_phase_peak)
+        self._trip_due = False
         self._diodes_warned = False
 
         # ------------------------------------------------------------ ADC
@@ -76,7 +74,7 @@ class Unit:
         self.ports = MeasurementPorts(
             u_g=lambda: bus.out.u, i_c=lambda: self.branch_f.out.i,
             i_c_state=lambda: self.branch_f.state.i, u_dc=lambda: self.dclink.out.u_dc,
-            i_dc=lambda: self.dclink.inp.i_dc, fault=lambda: self.comparator.fault)
+            i_dc=lambda: self.dclink.inp.i_dc)
         T_c = cfg.ctrl.period
         sample_period = meas.period if meas.period is not None else T_c
         self.adc = ADC(self.ports, T_c, sample_period,
@@ -144,13 +142,22 @@ class Unit:
                 *(period for period in getattr(self.ctrl, "periods", {}).values() if period)]
 
     # ---------------------------------------------------------------- states
+    @property
+    def tripped(self) -> bool:
+        return self.protection.tripped
+
     def get_state(self) -> dict[str, Any]:
-        return {"tripped": self.tripped, "fault": self.comparator.fault}
+        return {"tripped": self.tripped, "fault": self.protection.fault,
+                **{f"prot.{name}": value for name, value in self.protection.get_state().items()}}
 
     def set_state(self, values: Mapping[str, Any]) -> None:
-        if "fault" in values:
-            self.comparator.fault = bool(values["fault"])
-        if values.get("tripped", False) and not self.tripped:
+        self.protection.set_state({name[5:]: value for name, value in values.items()
+                                   if name.startswith("prot.")})
+        tripped = values.get("tripped")
+        if tripped is None and values.get("fault"):
+            tripped = True
+        self.protection.restore_latches(tripped, values.get("fault"))
+        if self.tripped:
             self.trip(math.nan, "restored")
 
     # ---------------------------------------------------------------- events and trips
@@ -180,25 +187,28 @@ class Unit:
 
     def retune(self, cfg: UnitParams, paths: list[str], t: float) -> None:
         """Apply runtime-changeable DC-source, control and protection parameters."""
+        self.cfg = cfg
         if any(path.startswith("dclink.source.") for path in paths):
             source = cfg.dclink.source
             self.dclink.retune_source(source.i, source.k, source.v, source.r)
-        if any(path.startswith("protection.overcurrent.") for path in paths):
-            self.comparator.retune(cfg.protection.overcurrent)
+        if any(path.startswith("protection.") for path in paths):
+            self.protection.retune(cfg.protection)
         rest = [path for path in paths
-                if not path.startswith(("dclink.", "protection.overcurrent."))]
+                if not path.startswith(("dclink.", "protection."))]
         if rest:
             self.ctrl.retune(cfg, rest, t)
 
-    def trip(self, t: float, cause: str, plant: Optional[Plant] = None) -> None:
-        """Block gates, open both sides and latch a permanent trip."""
+    def trip(self, t: float, cause: str, plant: Optional[Plant] = None, detail: str = "") -> None:
+        """Latch one unit trip, stop the controller and open its gates, AC and DC sides."""
         if plant is not None:
             with plant.change():
-                self.trip(t, cause)
+                self.trip(t, cause, detail=detail)
             return
-        if not self.tripped:
-            self.trip_time, self.trip_cause = t, cause
-        self.tripped, self.gates, self.breaker = True, False, False
+        self.protection.latch(t, cause, detail)
+        command = getattr(self.ctrl, "command", None)
+        if command is not None:
+            command(False)
+        self.gates, self.breaker = False, False
         self._terminal()
         self.dclink.open_breaker()
 
@@ -218,6 +228,10 @@ class Unit:
     def states_loaded(self) -> None:
         """Apply the loaded PWM enable to the physical gates."""
         given_current = self.branch_f.state.i
+        if self.tripped:
+            command = getattr(self.ctrl, "command", None)
+            if command is not None:
+                command(False)
         self._set_gates(self.pwm.on)
         if self.blocked and given_current != 0j:
             warnings.warn(
@@ -232,8 +246,7 @@ class Unit:
         if self._running and not continued and track is not None:
             plant.outputs(t)
             ports = self.ports
-            track(Measurement(t, ports.u_g(), ports.i_c(), ports.u_dc(), self.adc.phase_currents(),
-                              fault=self.comparator.fault))
+            track(Measurement(t, ports.u_g(), ports.i_c(), ports.u_dc(), self.adc.phase_currents()))
         sync = self.ctrl.initial_sync() if hasattr(self.ctrl, "initial_sync") else (None, None)
         plant.hold(self.zoh, self.pwm.start(t, sync, continued))
         if self.windowed:
@@ -252,12 +265,14 @@ class Unit:
         return next_
 
     def protect(self, t: float, plant: Plant) -> bool:
-        """Run the gate-driver comparator before any controller samples at this instant."""
+        """Run fast protection before any controller samples at this instant."""
         if self.tripped or not self.pwm.edge(t):
             return False
-        if not self.comparator.check(t, phases(self.branch_f.state.i)):
+        if not self.protection.check_fast(t, phases(self.branch_f.state.i)):
             return False
-        self.trip(t, "overcurrent", plant)
+        event = self.protection.trip
+        assert event is not None
+        self.trip(event.t, event.cause, plant, event.detail)
         return True
 
     def sense(self, t: float, plant: Plant) -> Optional[tuple[int, Any]]:
@@ -274,11 +289,25 @@ class Unit:
         if self.blocked and not self._diodes_warned:
             self._warn_diodes(t, measurement)
         output = self.ctrl(t, measurement)
+        if not self.tripped:
+            vac_pu = abs(measurement.u_g) / self.cfg.base.v_phase_peak
+            vdc_pu = measurement.u_dc / self.cfg.dc_base.v
+            if output.omega is None:
+                if self.protection.needs_frequency:
+                    raise ValueError(
+                        f"unit {self.name!r}: frequency or ROCOF protection needs "
+                        "the controller's omega output")
+                freq_dev = 0.0
+            else:
+                freq_dev = (output.omega - self.cfg.base.w0) / (2.0 * math.pi)
+            vdc_ref = self.cfg.ctrl.references.vdc_ref_pu
+            if self.protection.check_sampled(
+                    t, vac_pu, freq_dev, vdc_pu - vdc_ref,
+                    getattr(output, "startup_complete", True)):
+                self._trip_due = True
         # Keep the result only until every unit has sampled this same instant.  It is then written
         # to the one shadow register in actuate(); this is not another delayed register or state.
         self._write_due = (t, output)
-        if output.tripped and not self.tripped:
-            self._trip_due = getattr(output, "trip_cause", None) or "controller"
         return index, output
 
     def _warn_diodes(self, t: float, measurement: Measurement) -> None:
@@ -295,16 +324,19 @@ class Unit:
             )
 
     def actuate(self, t: float, plant: Plant) -> bool:
-        """Apply the controller trip, PWM load, ADC-window opening and bridge switches."""
-        cause = self._trip_due
-        if cause is not None:
-            self._trip_due = None
-            self.trip(t, cause, plant)
+        """Apply a sampled-protection trip, PWM load, ADC-window opening and bridge switches."""
+        tripped_now = self._trip_due
+        if tripped_now:
+            self._trip_due = False
+            event = self.protection.trip
+            assert event is not None
+            self.trip(event.t, event.cause, plant, event.detail)
         pwm = self.pwm
         write = self._write_due
         if write is not None and pwm.computation == 0.0:
             at, output = write
-            pwm.write(at, output.d_abc, getattr(output, "gates", True), output.theta, output.omega)
+            pwm.write(at, output.d_abc, getattr(output, "gates", True) and not self.tripped,
+                      output.theta, output.omega)
         if abs(pwm.t_load - t) < TIME_EPS:
             switching = pwm.load(t)
             enabled = pwm.on and not self.tripped
@@ -314,32 +346,19 @@ class Unit:
             plant.hold(self.zoh, switching)
         if write is not None and pwm.computation > 0.0:
             at, output = write
-            pwm.write(at, output.d_abc, getattr(output, "gates", True), output.theta, output.omega)
+            pwm.write(at, output.d_abc, getattr(output, "gates", True) and not self.tripped,
+                      output.theta, output.omega)
         self._write_due = None
         if self.windowed and abs(self.adc.t_window(pwm.t_interrupt) - t) < TIME_EPS:
             self.adc.open()
         for switching in pwm.switches(t):
             plant.hold(self.zoh, switching)
-        return cause is not None
+        return tripped_now
 
     # ---------------------------------------------------------------- results
     def summary(self) -> dict[str, Any]:
         seen = dict(self.ctrl.summary()) if hasattr(self.ctrl, "summary") else {}
-        comparator = self.comparator
-        alarms = list(seen.get("alarms", []))
-        own = ["OVERCURRENT"] if comparator.first_t is not None else []
-        if self.tripped and self.trip_cause not in (None, "restored"):
-            own.append("TRIP_" + self.trip_cause.upper())
-        trip_time = (self.trip_time if self.trip_time is not None
-                     and math.isfinite(self.trip_time) else None)
-        seen.update(
-            tripped=int(self.tripped),
-            trip_time=trip_time,
-            trip_cause=self.trip_cause,
-            max_current_pu=comparator.max_current_pu,
-            overcurrent_first_t=comparator.first_t,
-            alarms=alarms + [alarm for alarm in own if alarm not in alarms],
-        )
+        seen.update(self.protection.summary())
         return seen
 
     def signals(self) -> dict[str, float | complex]:
