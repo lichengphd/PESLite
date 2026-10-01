@@ -49,8 +49,7 @@ units:                     # converters, one entry each
         # voltage source: v_pu (emf, default 1), r_pu (series R)
 
     # meas:                # the ADC, sampled by the control interrupt
-    #   average: instantaneous  # ac voltage and current: instantaneous | window (mean over (t_k - window, t_k])
-    #   u_dc: instantaneous     # the same choice for the dc voltage
+    #   average: []        # window-averaged channels: any of [u_g, i_c, u_dc]; others instantaneous
     #   window: 50.0e-6    # averaging window, s (default: ctrl.period)
     #   period: 25.0e-6    # oversampling period, s; divides ctrl.period (default: one sample)
 
@@ -106,8 +105,9 @@ units:                     # converters, one entry each
       # A custom loop type, registered with peslite.register_loop_type, is written here
       # like the built-in ones and its parameters are checked the same way.
 
-    protection:            # trips only this converter; each criterion is switched by enable (1/0)
-      overcurrent: {enable: 1, limit_pu: 1.15}   # instantaneous phase current: trips at once
+    protection:            # trips only this converter (gates blocked, AC and DC sides opened)
+      overcurrent: {enable: 1, limit_pu: 1.15}   # unit protection: checked at PWM edges, armed from start
+      #                    # sampled unit criteria use ADC/controller-rate values and arm after the ramp
       undervoltage: {enable: 1, limit_pu: 0.50}  # ac voltage magnitude, held for hold
       overvoltage: {enable: 1, limit_pu: 1.20}
       # frequency: {enable: 0, limit: 0.5}       # frequency deviation, Hz, held for hold
@@ -122,9 +122,11 @@ units:                     # converters, one entry each
 events:                    # what happens during the run, by name; written only when it happens
   connect_vsc: {type: connect, target: vsc, t: 0.2, ramp: 1.0}
   #                        # target: a unit, source, branch or element, by name; one whose first
-  #                        # connect/disconnect event is connect starts disconnected. ramp (s): after
-  #                        # connecting, a converter ramps up its dc source and power setpoints and arms
-  #                        # its protection at the end; other targets have nothing to ramp
+  #                        # connect/disconnect event is connect starts disconnected. A unit's
+  #                        # controller receives run/stop; its PWM stays blocked until its first running
+  #                        # result reaches the active registers. ramp (s): the dc source ramps in time,
+  #                        # the power setpoint over controller interrupts; sampled protection arms at
+  #                        # the end. Other targets have nothing to ramp.
   # trip_line: {type: disconnect, target: line1, t: 3.0}
   # load_on: {type: connect, target: load1, t: 1.0}                # load1 starts disconnected
   # p_step: {type: set, t: 2.0, set: {units.vsc.ctrl.references.p_ref_pu: 0.8}}

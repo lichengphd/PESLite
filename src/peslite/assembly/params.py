@@ -319,17 +319,14 @@ class PWMParams:
 class MeasurementParams:
     """ADC measurement settings.
 
-    ``average`` (AC) and ``u_dc`` (DC): ``"instantaneous"`` or ``"window"`` (mean over
-    ``window``, s, at most the control period).
+    ``average`` lists any of ``u_g``, ``i_c`` and ``u_dc`` which use a mean over ``window``
+    (s, at most the control period). Channels not listed are instantaneous.
     ``period`` is the ADC oversampling period; it defaults to the control period.
     """
 
-    average: str = "instantaneous"
+    average: list[str] = field(default_factory=list)
     window: Optional[float] = None  # s; default: the control period
-    u_dc: str = "instantaneous"
     period: Optional[float] = None  # s; default: the control period
-
-    _choices = {"average": ("instantaneous", "window"), "u_dc": ("instantaneous", "window")}
 
 
 @dataclass(frozen=True)
@@ -1096,7 +1093,7 @@ def _written_out(p: Params) -> dict:
         meas = unit["meas"]
         if meas["period"] is None:
             meas["period"] = u.ctrl.period
-        if meas["window"] is None and "window" in (meas["average"], meas["u_dc"]):
+        if meas["window"] is None and meas["average"]:
             meas["window"] = u.ctrl.period
     for name, source in d["sources"].items():
         if source["f"] is None:

@@ -1,28 +1,45 @@
-"""A converter unit: dc link, bridge and filter branch, its ADC, controller and PWM.
+"""A converter unit: power stage, ADC, controller and protection.
 
-Plant quantities are in SI; the controller works in the unit's pu bases.
+The controller is a closed sampled block. All protection decisions, their single trip latch,
+breakers and gates belong to the unit and act on the continuous plant.
 """
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Optional
+import math
+import warnings
+from typing import Any, ContextManager, Mapping, Optional, Protocol
+
+import numpy as np
 
 from ..components.adc import ADC, MeasurementPorts
-from ..components.converter import Bridge, make_dclink
+from ..components.converter import make_bridge, make_dclink
 from ..components.network import RLBranch
-from ..components.pwm import PWM, Modulator, make_modulator
-from ..control.controller import Controller, make_controller
-from .events import UnitScenario
+from ..components.pwm import TIME_EPS, Modulator
+from ..control.blocks import phases
+from ..control.controller import Controller, Measurement, make_controller
+from .events import Scenario
 from .params import SimulationParams, UnitParams
+from .protection import Protection
 
-__all__ = ["Unit"]
+__all__ = ["Plant", "Unit"]
+
+
+class Plant(Protocol):
+    """The plant operations a unit may use during a run."""
+
+    def outputs(self, t: float) -> None: ...
+
+    def hold(self, label: str, value: Any) -> None: ...
+
+    def change(self) -> ContextManager[None]: ...
 
 
 class Unit:
     """One converter unit built from its parameter section, connected to ``bus``.
 
     ``ctrl`` and ``modulator`` replace the parts built from the section. The unit samples with
-    ``adc``, controls with ``ctrl`` and switches its bridge through ``pwm``.
+    ``adc`` and controls a bridge which owns its model-specific actuation timing.
     Events connect or disconnect its filter and DC source and may retune runtime parameters.
     """
 
@@ -31,44 +48,54 @@ class Unit:
         self.name = name
         self.cfg = cfg
         self.bus = bus
-        self.scenario = sc = UnitScenario(cfg.events)
+        self.scenario = sc = Scenario(cfg.events)
 
         # ------------------------------------------------------------ power
         self.dclink = make_dclink(cfg.dclink)
         t0 = sim.initial.t
-        since, ramp = sc.since(t0)
-        self.dclink.connect(sc.connected(t0), since, ramp if t0 < since + ramp else 0.0)
-        self.bridge = Bridge()
+        connected, since, ramp = sc.at(t0)
+        self.dclink.connect(connected, since, ramp if t0 < since + ramp else 0.0)
+        try:
+            self.bridge = make_bridge(cfg, sim, modulator)
+        except ValueError as exc:
+            raise ValueError(f"{name}: {exc}") from None
         self.branch_f = RLBranch(cfg.ac_filter.l_f, cfg.ac_filter.r_f)
-        self.breakers = [self.branch_f, self.dclink]
-        self.tripped = False
+        self.breaker = True
+        self.gates = False
+        self.protection = Protection(cfg.protection, cfg.ctrl.period, cfg.base.i_phase_peak)
+        self._trip_due = False
+        self._diodes_warned = False
 
         # ------------------------------------------------------------ ADC
         # instantaneous samples or window means; the window holds only the averaged channels
         meas = cfg.meas
-        channels: dict[str, complex | float] = {}
-        if meas.average == "window":
-            channels["v"], channels["i"] = 0j, 0j
-        if meas.u_dc == "window":
-            channels["dc"] = 0.0
+        zero = {"u_g": 0j, "i_c": 0j, "u_dc": 0.0}
+        channels = {name: zero[name] for name in meas.average}
         self.ports = MeasurementPorts(
             u_g=lambda: bus.out.u, i_c=lambda: self.branch_f.out.i,
             i_c_state=lambda: self.branch_f.state.i, u_dc=lambda: self.dclink.out.u_dc,
             i_dc=lambda: self.dclink.inp.i_dc)
         T_c = cfg.ctrl.period
         sample_period = meas.period if meas.period is not None else T_c
-        samples = max(1, int(round(T_c / sample_period)))
-        self.adc = ADC(self.ports, T_c, samples,
+        self.adc = ADC(self.ports, T_c, sample_period,
                        meas.window if meas.window is not None else T_c, channels)
+        self.windowed = self.adc.averaging
+        self.accumulate, self.restart_windows = self.adc.accumulate, self.adc.seed
+        self._oversamples = self.adc.samples > 1
 
-        # ------------------------------------------------------------ control
-        self.ctrl = ctrl if ctrl is not None else make_controller(cfg, sc)
-        pwm = cfg.pwm
-        self.pwm = PWM(
-            T_c, pwm.load_period, pwm.grid_offset, cfg.ctrl.computation, pwm.switching_period,
-            modulator if modulator is not None else make_modulator(pwm, cfg.base.f0, cfg.averaging, sim),
-        )
+        # ------------------------------------------------------------ bridge actuation and control
+        self.bridge.reset(np.full(3, 0.5), on=False)
         self.zoh = f"{name}.q"                   # model label of the bridge's held switching state
+        self.ctrl = ctrl if ctrl is not None else make_controller(cfg)
+        parts = [(self.ctrl, Controller)]
+        modulator = getattr(self.bridge, "modulator", None)
+        if modulator is not None:
+            parts.append((modulator, Modulator))
+        for obj, proto in parts:
+            if not isinstance(obj, proto):
+                raise TypeError(f"{name}: {type(obj).__name__} does not satisfy the {proto.__name__} protocol")
+        self._initially_connected = False
+        self._write_due: Optional[tuple[float, Any]] = None
 
     # ---------------------------------------------------------------- assembly
     def subsystems(self) -> dict[str, Any]:
@@ -102,45 +129,228 @@ class Unit:
     def state_parts(self) -> list[tuple[str, Any]]:
         """Return this unit's fixed state owners and their public prefixes."""
         parts = [(self.name, self), (f"{self.name}.ctrl", self.ctrl),
-                 (f"{self.name}.pwm", self.pwm)]
+                 (f"{self.name}.{self.bridge.state_prefix}", self.bridge.state_owner)]
         if self.adc.averaging:
             parts.append((f"{self.name}.meas", self.adc))
         return parts
 
+    @property
+    def periods(self) -> list[float]:
+        return [*self.bridge.event_periods,
+                *(period for period in getattr(self.ctrl, "periods", {}).values() if period)]
+
     # ---------------------------------------------------------------- states
+    @property
+    def tripped(self) -> bool:
+        return self.protection.tripped
+
     def get_state(self) -> dict[str, Any]:
-        return {"tripped": self.tripped}
+        return {"tripped": self.tripped, "fault": self.protection.fault,
+                **{f"prot.{name}": value for name, value in self.protection.get_state().items()}}
 
     def set_state(self, values: Mapping[str, Any]) -> None:
-        if values.get("tripped", False) and not self.tripped:
-            self.trip()
+        self.protection.set_state({name[5:]: value for name, value in values.items()
+                                   if name.startswith("prot.")})
+        tripped = values.get("tripped")
+        if tripped is None and values.get("fault"):
+            tripped = True
+        self.protection.restore_latches(tripped, values.get("fault"))
+        if self.tripped:
+            self.trip(math.nan, "restored")
 
-    # ---------------------------------------------------------------- the run
-    def connect(self, on: bool, t: float, ramp: float = 0.0) -> None:
-        """Connect or disconnect the filter branch and DC source at ``t``."""
-        if on and not self.tripped:
+    # ---------------------------------------------------------------- events and trips
+    def _terminal(self) -> None:
+        if self.breaker and self.gates and not self.tripped:
             self.branch_f.close_breaker()
-        elif not on:
+        else:
             self.branch_f.open_breaker()
-        self.dclink.connect(on, t, ramp)
+
+    @property
+    def blocked(self) -> bool:
+        return self.breaker and not self.gates and not self.tripped
+
+    def connect(self, on: bool, t: float, ramp: float = 0.0) -> None:
+        """Connect/disconnect the unit and give the controller its run/stop command."""
+        effective = bool(on) and not self.tripped
+        self.breaker = effective
+        self._terminal()
+        self.dclink.connect(effective, t, ramp)
+        command = getattr(self.ctrl, "command", None)
+        if command is not None:
+            command(effective, ramp)
+
+    def _set_gates(self, on: bool) -> None:
+        self.gates = bool(on) and not self.tripped
+        self._terminal()
 
     def retune(self, cfg: UnitParams, paths: list[str], t: float) -> None:
         """Apply runtime-changeable DC-source, control and protection parameters."""
+        self.cfg = cfg
         if any(path.startswith("dclink.source.") for path in paths):
             source = cfg.dclink.source
             self.dclink.retune_source(source.i, source.k, source.v, source.r)
-        rest = [path for path in paths if not path.startswith("dclink.")]
+        if any(path.startswith("protection.") for path in paths):
+            self.protection.retune(cfg.protection)
+        rest = [path for path in paths
+                if not path.startswith(("dclink.", "protection."))]
         if rest:
             self.ctrl.retune(cfg, rest, t)
 
-    def trip(self) -> None:
-        """Open this unit's breakers (filter branch and dc source); other units keep running.
+    def trip(self, t: float, cause: str, plant: Optional[Plant] = None, detail: str = "") -> None:
+        """Latch one unit trip, stop the controller and open its gates, AC and DC sides."""
+        if plant is not None:
+            with plant.change():
+                self.trip(t, cause, detail=detail)
+            return
+        self.protection.latch(t, cause, detail)
+        command = getattr(self.ctrl, "command", None)
+        if command is not None:
+            command(False)
+        self.gates, self.breaker = False, False
+        self._terminal()
+        self.dclink.open_breaker()
 
-        The caller must repack the solver state vector afterwards.
-        """
-        self.tripped = True
-        for breaker in self.breakers:
-            breaker.open_breaker()
+    # ---------------------------------------------------------------- run instants
+    def start(self, t: float) -> None:
+        """Prepare the controller command before initial named states are loaded."""
+        self._initially_connected, since, ramp = self.scenario.at(t)
+        command = getattr(self.ctrl, "command", None)
+        if command is None:
+            return
+        command(self._initially_connected, ramp if self._initially_connected else 0.0)
+        if not self._initially_connected:
+            return
+        states = getattr(self.ctrl, "get_state", None)
+        if math.isfinite(since) and states is not None and "startup.steps" in states():
+            self.ctrl.set_state({"startup.steps": self.bridge.control_count(since, t)})
+
+    def states_loaded(self) -> None:
+        """Apply the loaded PWM enable to the physical gates."""
+        given_current = self.branch_f.state.i
+        if self.tripped:
+            command = getattr(self.ctrl, "command", None)
+            if command is not None:
+                command(False)
+        self._set_gates(self.bridge.on)
+        if self.blocked and given_current != 0j:
+            warnings.warn(
+                f"simulation.initial.states: unit {self.name!r} starts with its PWM blocked, "
+                f"so {self.name}.branch_f.i starts at zero, not at the value given",
+                stacklevel=5,
+            )
+
+    def begin(self, t: float, plant: Plant, continued: bool, window_given: bool) -> None:
+        """Pre-synchronise, resume PWM timing and reconstruct the ADC at run start."""
+        track = getattr(self.ctrl, "track", None)
+        if self._initially_connected and not continued and track is not None:
+            plant.outputs(t)
+            ports = self.ports
+            track(Measurement(t, ports.u_g(), ports.i_c(), ports.u_dc(), self.adc.phase_currents()))
+        sync = self.ctrl.initial_sync() if hasattr(self.ctrl, "initial_sync") else (None, None)
+        plant.hold(self.zoh, self.bridge.start(t, sync, continued))
+        if self.windowed:
+            plant.outputs(t)
+            self.adc.seed()
+        bridge = self.bridge
+        self.adc.start(t, bridge.previous_control_time(), bridge.next_control_time,
+                       held=not window_given)
+
+    def next_time(self) -> float:
+        bridge = self.bridge
+        next_ = bridge.next_time()
+        if self.windowed:
+            next_ = min(next_, self.adc.t_window(bridge.next_control_time))
+        if self._oversamples:
+            next_ = min(next_, self.adc.t_sample(bridge.previous_control_time()))
+        return next_
+
+    def protect(self, t: float, plant: Plant) -> bool:
+        """Run fast protection before any controller samples at this instant."""
+        if self.tripped or not self.bridge.fast_edge(t):
+            return False
+        if not self.protection.check_fast(t, phases(self.branch_f.state.i)):
+            return False
+        event = self.protection.trip
+        assert event is not None
+        self.trip(event.t, event.cause, plant, event.detail)
+        return True
+
+    def sense(self, t: float, plant: Plant) -> Optional[tuple[int, Any]]:
+        """Take oversamples or run the controller interrupt, before any unit actuates."""
+        bridge = self.bridge
+        if not bridge.control_due(t):
+            if (self._oversamples
+                    and abs(self.adc.t_sample(bridge.previous_control_time()) - t) < TIME_EPS):
+                plant.outputs(t)
+                self.adc.peek(t)
+            return None
+        plant.outputs(t)
+        index = bridge.control_index
+        measurement = self.adc.sample(t)
+        if self.blocked and not self._diodes_warned:
+            self._warn_diodes(t, measurement)
+        output = self.ctrl(t, measurement)
+        if not self.tripped:
+            vac_pu = abs(measurement.u_g) / self.cfg.base.v_phase_peak
+            vdc_pu = measurement.u_dc / self.cfg.dc_base.v
+            if output.omega is None:
+                if self.protection.needs_frequency:
+                    raise ValueError(
+                        f"unit {self.name!r}: frequency or ROCOF protection needs "
+                        "the controller's omega output")
+                freq_dev = 0.0
+            else:
+                freq_dev = (output.omega - self.cfg.base.w0) / (2.0 * math.pi)
+            vdc_ref = self.cfg.ctrl.references.vdc_ref_pu
+            if self.protection.check_sampled(
+                    t, vac_pu, freq_dev, vdc_pu - vdc_ref,
+                    getattr(output, "startup_complete", True)):
+                self._trip_due = True
+        # Keep the result only until every unit has sampled this same instant.  It is then written
+        # to the one shadow register in actuate(); this is not another delayed register or state.
+        self._write_due = (t, output)
+        return index, output
+
+    def _warn_diodes(self, t: float, measurement: Measurement) -> None:
+        u_g = measurement.u_g_raw if measurement.u_g_raw is not None else measurement.u_g
+        u_dc = measurement.u_dc_raw if measurement.u_dc_raw is not None else measurement.u_dc
+        v_ll_peak = math.sqrt(3.0) * abs(u_g)
+        if v_ll_peak > u_dc:
+            self._diodes_warned = True
+            warnings.warn(
+                f"t = {t:.6g} s: unit {self.name!r} has blocked gates with peak line voltage "
+                f"({v_ll_peak:.4g} V) above dc voltage ({u_dc:.4g} V); its diodes would conduct, "
+                "which the open-circuit model leaves out",
+                stacklevel=4,
+            )
+
+    def actuate(self, t: float, plant: Plant) -> bool:
+        """Apply a sampled-protection trip, PWM load, ADC-window opening and bridge switches."""
+        tripped_now = self._trip_due
+        if tripped_now:
+            self._trip_due = False
+            event = self.protection.trip
+            assert event is not None
+            self.trip(event.t, event.cause, plant, event.detail)
+        bridge = self.bridge
+        write = self._write_due
+        changes = bridge.actuate(t, write, not self.tripped)
+        enabled = bridge.on and not self.tripped
+        if enabled != self.gates:
+            with plant.change():
+                self._set_gates(enabled)
+        for value in changes:
+            plant.hold(self.zoh, value)
+        self._write_due = None
+        if self.windowed and abs(self.adc.t_window(bridge.next_control_time) - t) < TIME_EPS:
+            self.adc.open()
+        return tripped_now
+
+    # ---------------------------------------------------------------- results
+    def summary(self) -> dict[str, Any]:
+        seen = dict(self.ctrl.summary()) if hasattr(self.ctrl, "summary") else {}
+        seen.update(self.protection.summary())
+        return seen
 
     def signals(self) -> dict[str, float | complex]:
         """Return this unit's recorded signals (SI); outputs must be synced first."""

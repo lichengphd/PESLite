@@ -2,10 +2,44 @@
 
 ## 0.1.4
 
+### The controller as a block (#1)
+
+- A converter controller is now one closed sampled block. Each interrupt gives it an ADC
+  `Measurement`; it returns duty ratios, PWM enable, start-up completion and synchronization
+  estimates. Connect/disconnect events reach it only as `command(run, ramp)`, so it no longer
+  reads the plant, protection state or absolute event schedule.
+- `Startup` owns only the controller's run/ramp state and interrupt count; loops apply its ramp
+  value to their own references. Its states are `<unit>.ctrl.startup.run`, `.ramp` and `.steps`.
+  Integrating loops hold while stopped, and grid-forming laws track the terminal voltage before
+  starting.
+- PWM starts blocked. Its enable travels with the duty ratios in the active and shadow registers
+  (`<unit>.pwm.on`, `<unit>.pwm.shadow.on`); there is no plant-derived start-up duty and no separate
+  pending register.
+- One `Protection` subsystem owned by `Unit` contains every protection decision and the sole trip
+  latch. Its fast over-current path checks plant phase current at switching/load instants and acts
+  even during start-up; its voltage, frequency, DC-voltage and ROCOF paths run on ADC/controller
+  samples; the unit arms them when `Startup` reports that start-up is complete. Every trip
+  blocks gates, opens the AC terminal and disconnects the DC source permanently.
+- A unit acts on the continuous model only through the run's `Plant` interface. At a coincident
+  instant all units protect first, all sample next, and all actuate last, so sampling is independent
+  of unit registration order.
+- All trip, alarm and protection statistics now come from the unit's protection subsystem. Its
+  timer states use `<unit>.prot.*`; the controller has no protection states. The split-bound
+  linearisation keeps start-up counters and PWM modes fixed.
+- `Scenario` remains only a read-only projection of connection events. Bridge power equations and
+  model-specific actuation timing now share one bridge boundary; Unit and Simulation do not own
+  PWM register/load ordering.
+- ADC window selection is one channel list (`meas.average`: `u_g`, `i_c`, `u_dc`) instead of a
+  coupled AC switch plus a special `meas.u_dc` switch; accumulator states use matching names such
+  as `<unit>.meas.x_u_g`.
+- Removed `UnitScenario`, controller access to scenarios, `initial_duty`, `align_startup`,
+  `fast_check`, the separate `OvercurrentComparator`, `Measurement.fault`, `ControlOutput.tripped`,
+  `ControlOutput.trip_cause`, `control.protection` and the compatibility `ctrl.update()` entry point.
+
 ### Digital control timing and continuation (#4)
 
 - Each converter owns its control-interrupt, PWM-load and ADC timer grids. A control result is
-  written to the PWM shadow registers at its interrupt and becomes eligible for an active-register
+  written to its sole PWM shadow register at its interrupt and becomes eligible for an active-register
   load after `ctrl.computation`; `pwm.update` selects valley-only or valley-and-peak loads.
 - PWM state paths are `<unit>.pwm.d_*` for the active compare registers and
   `<unit>.pwm.shadow.d_*` for the shadow registers. Computation progress is derived from the saved

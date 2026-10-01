@@ -36,7 +36,7 @@ def _record(p, out):
     unit = sim.unit("vsc")
     interrupts, loads = [], []
     unit.ctrl = _Recorder(unit.ctrl, interrupts, "ctrl")
-    unit.pwm.modulator = _Recorder(unit.pwm.modulator, loads, "mod")
+    unit.bridge.modulator = _Recorder(unit.bridge.modulator, loads, "mod")
     result = sim.run(out_dir=out)
     return result, interrupts, loads[1:]  # first call resumes the registers present at the start
 
@@ -67,9 +67,12 @@ def test_timing_defaults_follow_the_carrier(gfl):
     ({"units.vsc.ctrl.loops.dvc.period": 7.5e-5}, "not a multiple of ctrl.period"),
     ({"units.vsc.meas.period": 2e-5}, "does not divide ctrl.period"),
     ({"units.vsc.meas.period": 1e-4}, "longer than ctrl.period"),
-    ({"units.vsc.meas.average": "window", "units.vsc.meas.window": 1e-4},
+    ({"units.vsc.meas.average": "window"}, "expected a list of channels"),
+    ({"units.vsc.meas.average": ["u_g", "unknown"]}, "unknown channel"),
+    ({"units.vsc.meas.average": ["u_g", "u_g"]}, "must not be repeated"),
+    ({"units.vsc.meas.average": ["u_g", "i_c"], "units.vsc.meas.window": 1e-4},
      "longer than ctrl.period"),
-    ({"units.vsc.meas.average": "window", "units.vsc.meas.period": 2.5e-5},
+    ({"units.vsc.meas.average": ["u_g", "i_c"], "units.vsc.meas.period": 2.5e-5},
      "cannot be combined"),
     ({"units.vsc.pwm.update": "triple"}, "update"),
     ({"units.vsc.delay.steps": 1}, "unknown key"),
@@ -164,7 +167,7 @@ def test_timer_starts_at_the_first_carrier_valley(gfl):
     pwm = peslite.Simulation(gfl(**{
         "units.vsc.pwm.carrier_phase": 0.25,
         "units.vsc.pwm.update": "double",
-    })).unit().pwm
+    })).unit().bridge
     assert (pwm.offset, pwm.period, pwm.load_period) == (pytest.approx(0.75 * T), T, T / 2)
     assert pwm.after(0.0) == 0
     assert pwm.after(pwm.interrupt(3)) == 4
@@ -176,7 +179,7 @@ def test_timer_starts_at_the_first_carrier_valley(gfl):
     synchronous = peslite.Simulation(gfl(**{
         "units.vsc.pwm.carrier_phase": 0.25,
         "units.vsc.pwm.sync": "synchronous",
-    })).unit().pwm
+    })).unit().bridge
     assert synchronous.offset == 0.0
 
 
@@ -192,7 +195,7 @@ def test_duty_registers_are_states_and_loop_clocks_are_not(gfl):
      0.003005),  # computation is in progress
     ({"units.vsc.pwm.carrier_phase": 0.3, "units.vsc.averaging.enable": 0},
      0.003010),  # between timer points
-    ({"units.vsc.meas.average": "window", "units.vsc.meas.u_dc": "window",
+    ({"units.vsc.meas.average": ["u_g", "i_c", "u_dc"],
       "units.vsc.meas.window": 2.5e-5, "units.vsc.averaging.enable": 0},
      0.003025),  # an ADC window is open
 ])
@@ -236,7 +239,7 @@ def test_an_oversampled_continuation_starts_at_an_interrupt(gfl):
 
 
 def test_a_window_open_before_a_new_run_uses_the_start_values(gfl, tmp_path):
-    over = {"units.vsc.meas.average": "window", "units.vsc.meas.u_dc": "window",
+    over = {"units.vsc.meas.average": ["u_g", "i_c", "u_dc"],
             "simulation.output.signals": 1}
     shifted = peslite.Simulation(gfl(**over, **{"units.vsc.pwm.carrier_phase": 0.3})).run(
         out_dir=tmp_path / "shifted")

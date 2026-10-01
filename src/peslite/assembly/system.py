@@ -238,7 +238,8 @@ class System:
                     raise ConfigError(
                         f"events.{change.event}: elements.{name} has no retune(parameters), so a "
                         "set event cannot change it")
-                if (section == "units" and not rest.startswith("dclink.")
+                if (section == "units"
+                        and not rest.startswith(("dclink.", "protection."))
                         and not hasattr(self.units[name].ctrl, "retune")):
                     raise ConfigError(
                         f"events.{change.event}: the controller of unit {name!r} has no "

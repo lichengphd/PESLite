@@ -92,10 +92,10 @@ class OutputStage:
 
     pwm_method: ``None`` uses ``cfg.pwm.method``.
     limiter: omitted uses ``ModulationLimiter(cfg.pwm.modulation_limit)``; ``None`` disables the limit
-    and its anti-windup. ``u_init_ab``: the alpha-beta voltage (V) of the start-up modulation.
+    and its anti-windup.
     """
 
-    def __init__(self, cfg: Any, u_init_ab: complex, pwm_method: Optional[PWMMethod] = None, *,
+    def __init__(self, cfg: Any, pwm_method: Optional[PWMMethod] = None, *,
                  limiter: SignalLimiter | None | _ConfiguredLimiter = CONFIGURED) -> None:
         self.v_base, self.v_dc_base = cfg.base.v_phase_peak, cfg.dc_base.v
         self.pwm_method = PWM_METHODS[cfg.pwm.method] if pwm_method is None else pwm_method
@@ -108,18 +108,8 @@ class OutputStage:
         self.n_saturated = 0
         self.first_saturation_t: float | None = None
         self.saturated = False
+        self.m_abc = np.zeros(3)
         self._memo = None  # cached evaluation for the current control instant
-        # start-up modulation from u_init_ab and the rated dc voltage
-        self.align_startup(u_init_ab, cfg.dclink.vdc_ref)
-
-    def initial_duty(self) -> np.ndarray:
-        """The duty ratios of the start-up modulation."""
-        return 0.5 * (1.0 + self.m_init)
-
-    def align_startup(self, u_ab: complex, u_dc: float) -> None:
-        """Set the start-up modulation that reproduces ``u_ab`` (V, alpha-beta) from the dc voltage ``u_dc`` (V)."""
-        self.modulate(0.0, u_ab / self.v_base, 0.0, u_dc / self.v_dc_base, count=False)
-        self.m_init = self.m_abc.copy()
 
     def new_instant(self) -> None:
         """Start a new control instant (clear the cached evaluation)."""
