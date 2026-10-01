@@ -183,6 +183,10 @@ class PWM:
         unknown = set(values) - names
         if unknown:
             raise KeyError(f"PWM registers: no state(s) {sorted(unknown)}; known: {sorted(names)}")
+        if self.active is self.shadow:
+            # load() may transfer ownership without copying.  Named-state writes address the two
+            # register banks independently, so detach them before changing either bank in place.
+            self.active = self.active.copy()
         for key, value in values.items():
             head, _, name = key.rpartition(".")
             k = "abc".index(name[-1])

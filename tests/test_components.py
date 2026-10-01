@@ -92,6 +92,9 @@ def test_pwm_owns_timer_registers_and_switching_schedule():
     assert pwm.next_switch == float("inf")
     pwm.load(1e-3)
     assert pwm.active[0] == 0.8
+    pwm.set_state({"shadow.d_a": 0.1})
+    assert pwm.get_state()["d_a"] == 0.8
+    assert pwm.get_state()["shadow.d_a"] == 0.1
 
 
 def test_ideal_averaging_holds_its_initial_value_until_the_delayed_output_arrives():
