@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.3
+## 0.1.4
 
 ### Digital control timing and continuation (#4)
 
@@ -56,7 +56,7 @@
   and the `control`/`measurement` configuration keys are not aliases.
 - PWM register states use `<unit>.pwm.d_*` and `<unit>.pwm.shadow.d_*`; timing is derived rather
   than exposed as clock, queue or generic `delay.*` states.
-- Project version is 0.1.3. The root `examples/` directory remains data-only, keeps the
+- Project version is 0.1.4. The root `examples/` directory remains data-only, keeps the
   `*-example.pes` names and is included in the wheel. The PEP 639 `AGPL-3.0-only` metadata is
   unchanged.
 - Added Issue #3 acceptance coverage for every bundled file under all three bridge models,

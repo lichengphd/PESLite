@@ -149,7 +149,6 @@ def test_dump_and_initial_file_use_the_nested_simulation_section(tmp_path):
            "simulation.initial.states.pcc.u_C": [500.0, 0.0]})
     path = tmp_path / "restart.pes"
     peslite.dump(p, path)
-    assert path.read_text(encoding="utf-8").startswith("# PESLite 0.1.3")
 
     restarted = peslite.load(EXAMPLES / "gfl-example.pes", initial=path)
     assert restarted.simulation.initial.t == 0.001

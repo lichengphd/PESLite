@@ -50,12 +50,3 @@ def test_registry_rejects_duplicate_paths_and_flat_columns_during_construction()
 
     with pytest.raises(ConfigError, match="state prefix 'vsc'.*both"):
         StateRegistry([("vsc", _States(a=1.0)), ("vsc", _States(b=2.0))])
-
-
-def test_registry_rejects_a_runtime_state_schema_change():
-    part = _States(x=1.0)
-    states = StateRegistry({"part": part})
-    part.values["extra"] = 2.0
-
-    with pytest.raises(ConfigError, match=r"changed after Simulation construction.*added: \['extra'\]"):
-        states.read()

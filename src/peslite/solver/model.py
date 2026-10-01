@@ -118,7 +118,6 @@ class _RegisteredPart:
     prefix: str
     part: Any
     states: tuple[_RegisteredState, ...]
-    local_names: frozenset[str]
 
 
 def _state_kind(value: Any) -> str:
@@ -183,29 +182,11 @@ class StateRegistry:
                 if kind == "bool":
                     bools.add(name)
                 registered.append(_RegisteredState(local_name, name, state_columns, kind))
-            groups.append(_RegisteredPart(
-                prefix, part, tuple(registered), frozenset(state.local_name for state in registered)
-            ))
+            groups.append(_RegisteredPart(prefix, part, tuple(registered)))
         self._groups = tuple(groups)
         self.names = tuple(names)
         self.columns = tuple(columns)
         self.boolean_names = frozenset(bools)
-
-    @staticmethod
-    def _values(group: _RegisteredPart) -> Mapping[str, Any]:
-        values = group.part.get_state()
-        if not isinstance(values, Mapping):
-            raise ConfigError(f"{type(group.part).__name__}.get_state() no longer returns a mapping")
-        actual = set(values)
-        if actual != group.local_names:
-            added = sorted(actual - group.local_names)
-            removed = sorted(group.local_names - actual)
-            owner = group.prefix or type(group.part).__name__
-            raise ConfigError(
-                f"state schema of {owner!r} changed after Simulation construction"
-                f" (added: {added}, removed: {removed})"
-            )
-        return values
 
     def read(self, prefixes: Iterable[str] | None = None) -> dict[str, Any]:
         """Read current values using the paths registered during assembly."""
@@ -214,36 +195,31 @@ class StateRegistry:
         for group in self._groups:
             if selected is not None and group.prefix not in selected:
                 continue
-            values = self._values(group)
+            values = group.part.get_state()
             for state in group.states:
-                value = values[state.local_name]
-                if _state_kind(value) != state.kind:
-                    raise ConfigError(
-                        f"state {state.name!r} changed representation from {state.kind} "
-                        f"to {_state_kind(value)}"
-                    )
-                out[state.name] = value
+                out[state.name] = values[state.local_name]
         return out
 
     def read_flat(self, prefixes: Iterable[str] | None = None) -> dict[str, float]:
-        """Read the fixed real-valued state-table columns."""
+        """Read the fixed real-valued state-table columns using the registered layout.
+
+        Construction fixes each owner's names, representations and output columns.  The normal
+        snapshot path therefore trusts that contract: it avoids rebuilding a set of names or
+        rediscovering every value's kind.  A custom owner must not change its state schema after
+        the registry has been constructed.
+        """
         selected = None if prefixes is None else set(prefixes)
         out: dict[str, float] = {}
         for group in self._groups:
             if selected is not None and group.prefix not in selected:
                 continue
-            values = self._values(group)
+            values = group.part.get_state()
             for state in group.states:
                 value = values[state.local_name]
-                kind = _state_kind(value)
-                if kind != state.kind:
-                    raise ConfigError(
-                        f"state {state.name!r} changed representation from {state.kind} to {kind}"
-                    )
-                if kind == "complex":
+                if state.kind == "complex":
                     out[state.columns[0]] = value.real
                     out[state.columns[1]] = value.imag
-                elif kind == "bool":
+                elif state.kind == "bool":
                     out[state.columns[0]] = 1.0 if value else 0.0
                 else:
                     out[state.columns[0]] = float(value)

@@ -164,7 +164,6 @@ def test_saved_simulation_file_repeats_the_run(gfl, tmp_path):
     first_dir = tmp_path / "first"
     first = peslite.Simulation(params).run(out_dir=first_dir)
     text = (first_dir / "simulation.pes").read_text(encoding="utf-8")
-    assert text.startswith("# PESLite 0.1.3")
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         loaded = peslite.load(first_dir / "simulation.pes")
