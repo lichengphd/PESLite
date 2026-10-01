@@ -19,7 +19,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from ..solver.model import Bag, ConfigError, gather, scatter
-from .blocks import peak_abs, smoothstep
+from .blocks import abc2complex, peak_abs, phases, smoothstep
 from .loops import (ANGLE, CURRENT, DC_VOLTAGE, FREQUENCY, I_AB, LOOP_TYPES, POWER_PU,
                     V_AB, V_DQ, VOLTAGE, Loop, SyncLaw)
 from .modulation import CONFIGURED, OutputStage
@@ -857,7 +857,9 @@ class UniteType:
     def __init__(self, cfg, pwm_method=None, *, limiter=CONFIGURED):
         self.p = cfg
         self.continuous = cfg.bridge.model == "averaging"
-        self.startup = ContinuousStartup() if self.continuous else Startup(cfg.ctrl.period)
+        # A continuous controller already participates in construction-time energy probes, before
+        # Unit.start() applies its scenario. Keep its ideal source off until that command arrives.
+        self.startup = ContinuousStartup(run=False) if self.continuous else Startup(cfg.ctrl.period)
         wires, outputs = default_wiring(cfg, cfg.ctrl.type)
         self.graph = graph = ControlGraph(cfg, self.startup, wires, outputs)
         self.periods = graph.periods
@@ -1173,8 +1175,18 @@ class UniteType:
                       else cmath.exp(-1j * frame))
         self.v_dq, self.i_dq = meas.u_g * into_frame, meas.i_c * into_frame
         u_dc = meas.u_dc * self.v_dc_base
-        self.out.q = (self.u_cmd * command_rot * self.v_base / u_dc
-                      if self.startup.active and u_dc > 0.0 else 0j)
+        if self.startup.active and u_dc != 0.0:
+            u_ab = self.u_cmd * command_rot * self.v_base
+            a, b, c = phases(u_ab)
+            gain = 2.0 / u_dc
+            # Express the ideal three-leg average on the common bridge-ratio port. The common
+            # 0.5 term cancels from the space vector; retaining this operation order also keeps
+            # saved-state continuation bit-level stable across solver restarts.
+            self.out.q = abc2complex((0.5 * (1.0 + gain * a),
+                                      0.5 * (1.0 + gain * b),
+                                      0.5 * (1.0 + gain * c)))
+        else:
+            self.out.q = 0j
         self._last_control_meas = meas
 
     def rhs(self, t):
