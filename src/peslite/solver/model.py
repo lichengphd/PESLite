@@ -1,9 +1,11 @@
 """Continuous-time model: what a subsystem is, subsystems connected by signals into one model, and
-named states.
+named states and automatically solved algebraic signal loops.
 
 A subsystem has ``state``, ``inp`` and ``out`` records (:class:`Bag`) and state derivatives; the
 :class:`Model` packs the states of its subsystems into a flat real vector (two entries per complex
 state) named ``<subsystem>.<state>`` and evaluates their outputs and connections in signal order.
+Strongly connected output/input dependencies are detected during assembly and reduced to
+internally solved algebraic groups; individual subsystems do not need case-specific break rules.
 Every part with a state (a model, a controller, a PWM peripheral, a solver) is :class:`Stateful`: it
 gives its state by name, parts are composed by dotted names (``vsc.ctrl.pll``), flattened to the
 real columns of ``states.csv`` and resolved from ``initial.states`` values.
@@ -13,6 +15,7 @@ from __future__ import annotations
 
 import keyword
 import linecache
+import math
 import re
 from collections import Counter, deque
 from dataclasses import dataclass
@@ -387,6 +390,199 @@ def assign(obj: Any, values: Mapping[str, Any], names: tuple[str, ...] | Mapping
 Connection = tuple[Any, str]
 
 
+def _copy_value(operation: tuple) -> Any:
+    """Value produced by one connection-copy operation, without assigning it."""
+    _dst, _field, src, src_field, fanin = operation
+    if fanin is None:
+        return getattr(src, src_field)
+    total = 0
+    for out, name, gain in fanin:
+        total += gain * getattr(out, name)
+    return total
+
+
+def _run_output_operation(operation: tuple, t: float) -> None:
+    """Execute one uncompiled output/copy operation."""
+    kind, item = operation
+    if kind == "out":
+        item(t)
+    else:
+        dst, field, _src, _src_field, _fanin = item
+        setattr(dst, field, _copy_value(item))
+
+
+def _signal_error(a: Any, b: Any) -> tuple[float, float]:
+    """Absolute error and scale of two real, complex or array-valued signals."""
+    if isinstance(a, (int, float, complex)) and isinstance(b, (int, float, complex)):
+        return abs(a - b), max(1.0, abs(a), abs(b))
+    aa, bb = np.asarray(a), np.asarray(b)
+    delta = float(np.max(np.abs(aa - bb))) if aa.size else 0.0
+    scale = max(1.0,
+                float(np.max(np.abs(aa))) if aa.size else 0.0,
+                float(np.max(np.abs(bb))) if bb.size else 0.0)
+    return delta, scale
+
+
+class _AlgebraicLoop:
+    """Automatically solved strongly connected group of output stages and signal copies.
+
+    A small set of connection copies is selected as tear variables while the model is assembled.
+    The remaining operations are acyclic.  Repeated Gauss--Seidel sweeps enforce the torn
+    connections without assigning the responsibility to any participating subsystem.
+    """
+
+    __slots__ = ("operations", "tears", "owners", "labels", "max_sweeps", "rtol", "atol",
+                 "_inverse", "_scalar_sweep")
+
+    def __init__(self, operations: tuple, tears: tuple, owners: tuple,
+                 labels: tuple[str, ...],
+                 max_sweeps: int = 16, rtol: float = 1e-8, atol: float = 1e-10) -> None:
+        self.tears = tears
+        torn = {id(item) for item in tears}
+        self.operations = tuple(operation for operation in operations
+                                if not (operation[0] == "copy" and id(operation[1]) in torn))
+        self.owners = owners
+        self.labels = labels
+        self.max_sweeps = max_sweeps
+        self.rtol = rtol
+        self.atol = atol
+        self._inverse: complex | float | None = None
+        self._scalar_sweep = self._compile_scalar_sweep() if len(tears) == 1 else None
+
+    def _compile_scalar_sweep(self):
+        """Compile the torn scalar assignment and its acyclic operations into one Python call."""
+        env: dict[str, Any] = {}
+        refs: dict[int, str] = {}
+
+        def ref(obj: Any) -> str:
+            key = refs.get(id(obj))
+            if key is None:
+                key = refs[id(obj)] = f"_{len(refs)}"
+                env[key] = obj
+            return key
+
+        def get(obj: Any, field: str) -> str:
+            return (f"{ref(obj)}.{field}" if field.isidentifier() and not keyword.iskeyword(field)
+                    else f"getattr({ref(obj)}, {field!r})")
+
+        def put(obj: Any, field: str, value: str) -> str:
+            return (f"{ref(obj)}.{field} = {value}"
+                    if field.isidentifier() and not keyword.iskeyword(field)
+                    else f"setattr({ref(obj)}, {field!r}, {value})")
+
+        def value(item: tuple) -> str:
+            _dst, _field, src, src_field, fanin = item
+            if fanin is None:
+                return get(src, src_field)
+            expression = "0"
+            for out, name, gain in fanin:
+                expression = f"({expression} + {ref(gain)} * {get(out, name)})"
+            return expression
+
+        tear = self.tears[0]
+        body = [put(tear[0], tear[1], "x")]
+        for kind, item in self.operations:
+            if kind == "out":
+                body.append(f"{ref(item)}(t)")
+            else:
+                body.append(put(item[0], item[1], value(item)))
+        body.append("return " + value(tear))
+        source = "def sweep(t, x):\n" + "\n".join("    " + line for line in body) + "\n"
+        exec(compile(source, "<peslite algebraic scalar>", "exec"), env)
+        return env["sweep"]
+
+    def _evaluate_scalar(self, t: float, x: complex | float) -> complex | float:
+        return self._scalar_sweep(t, x)
+
+    def _close(self, a: Any, b: Any) -> bool:
+        error, scale = _signal_error(a, b)
+        return error <= self.atol + self.rtol * scale
+
+    @staticmethod
+    def _finite_scalar(value: Any) -> bool:
+        return (isinstance(value, (int, float, complex))
+                and math.isfinite(value.real if isinstance(value, complex) else value)
+                and (not isinstance(value, complex) or math.isfinite(value.imag)))
+
+    def _scalar(self, t: float) -> None:
+        """Warm-started secant solve for the common one-scalar feedback case."""
+        item = self.tears[0]
+        dst, field, _src, _src_field, _fanin = item
+        x0 = getattr(dst, field)
+        y0 = self._evaluate_scalar(t, x0)
+        r0 = y0 - x0
+        if self._close(y0, x0):
+            return
+
+        inverse = self._inverse
+        x1 = x0 - inverse * r0 if inverse is not None else y0
+        scale = max(1.0, abs(x0), abs(y0))
+        if (not self._finite_scalar(x1)) or abs(x1 - x0) > 10.0 * scale:
+            x1 = y0
+        for _iteration in range(self.max_sweeps - 1):
+            y1 = self._evaluate_scalar(t, x1)
+            r1 = y1 - x1
+            denominator = r1 - r0
+            if denominator != 0:
+                estimate = (x1 - x0) / denominator
+                if self._finite_scalar(estimate):
+                    self._inverse = estimate
+            if self._close(y1, x1):
+                return
+            inverse = self._inverse
+            x2 = x1 - inverse * r1 if inverse is not None else y1
+            scale = max(1.0, abs(x1), abs(y1))
+            if (not self._finite_scalar(x2)) or abs(x2 - x1) > 10.0 * scale:
+                x2 = y1
+            x0, r0, x1 = x1, r1, x2
+        raise FloatingPointError(
+            "algebraic loop did not converge after "
+            f"{self.max_sweeps} scalar iterations: " + ", ".join(self.labels)
+        )
+
+    def __call__(self, t: float) -> None:
+        begun = []
+        for owner in self.owners:
+            begin = getattr(owner, "begin_algebraic", None)
+            if begin is not None:
+                begin()
+                begun.append(owner)
+        try:
+            if len(self.tears) == 1:
+                item = self.tears[0]
+                dst, field, _src, _src_field, _fanin = item
+                if isinstance(getattr(dst, field), (int, float, complex)):
+                    self._scalar(t)
+                    return
+            worst = math.inf
+            for _sweep in range(self.max_sweeps):
+                for item in self.tears:
+                    dst, field, _src, _src_field, _fanin = item
+                    setattr(dst, field, _copy_value(item))
+                for operation in self.operations:
+                    _run_output_operation(operation, t)
+                worst = 0.0
+                converged = True
+                for item in self.tears:
+                    dst, field, _src, _src_field, _fanin = item
+                    current = getattr(dst, field)
+                    target = _copy_value(item)
+                    error, scale = _signal_error(current, target)
+                    worst = max(worst, error / scale)
+                    if error > self.atol + self.rtol * scale:
+                        converged = False
+                if converged:
+                    return
+            raise FloatingPointError(
+                "algebraic loop did not converge after "
+                f"{self.max_sweeps} sweeps (relative residual {worst:.3g}): "
+                + ", ".join(self.labels)
+            )
+        finally:
+            for owner in begun:
+                owner.end_algebraic()
+
+
 class GroupPlan:
     """Subsystem group and its evaluation plans (see :meth:`Model.groups`).
 
@@ -612,40 +808,143 @@ class Model:
                 if copy is not None:
                     dependencies[node].add(copy)
 
+        # Collapse every strongly connected component into one automatically solved algebraic
+        # group.  Acyclic models retain one operation per plan entry and therefore pay no
+        # iteration or dispatch cost.
         successors = [[] for _ in operations]
-        indegree = [len(deps) for deps in dependencies]
         for node, deps in enumerate(dependencies):
-            for dep in sorted(deps):
+            for dep in deps:
                 successors[dep].append(node)
+
+        index = 0
+        stack: list[int] = []
+        on_stack: set[int] = set()
+        indices = [-1] * len(operations)
+        low = [0] * len(operations)
+        components: list[tuple[int, ...]] = []
+
+        def visit(node: int) -> None:
+            nonlocal index
+            indices[node] = low[node] = index
+            index += 1
+            stack.append(node)
+            on_stack.add(node)
+            for nxt in successors[node]:
+                if indices[nxt] < 0:
+                    visit(nxt)
+                    low[node] = min(low[node], low[nxt])
+                elif nxt in on_stack:
+                    low[node] = min(low[node], indices[nxt])
+            if low[node] == indices[node]:
+                component = []
+                while True:
+                    member = stack.pop()
+                    on_stack.remove(member)
+                    component.append(member)
+                    if member == node:
+                        break
+                components.append(tuple(sorted(component)))
+
+        for node in range(len(operations)):
+            if indices[node] < 0:
+                visit(node)
+
+        component_of = {node: ci for ci, component in enumerate(components) for node in component}
+        compact_ops, compact_owners, compact_labels, compact_deps = [], [], [], []
+        for ci, component in enumerate(components):
+            members = set(component)
+            cyclic = len(component) > 1 or any(node in dependencies[node] for node in component)
+            if not cyclic:
+                node = component[0]
+                operation = operations[node]
+                own, srcs = owners[node]
+                label = labels[node]
+                own_group = (own,)
+            else:
+                # Topologically order the component while automatically tearing connection-copy
+                # nodes only when a cycle leaves no ready operation.  The torn connections are
+                # precisely the residuals checked by _AlgebraicLoop.
+                pending = {node: set(dependencies[node]) & members for node in component}
+                internal_order: list[int] = []
+                tears: list[tuple] = []
+                while pending:
+                    ready = sorted(node for node, deps in pending.items() if not deps)
+                    if not ready:
+                        candidates = sorted(node for node in pending if operations[node][0] == "copy")
+                        if not candidates:
+                            raise ValueError(
+                                "algebraic output cycle has no connected signal to solve: "
+                                + ", ".join(labels[node] for node in component)
+                            )
+                        torn = candidates[0]
+                        pending[torn].clear()
+                        tears.append(operations[torn][1])
+                        ready = [torn]
+                    for node in ready:
+                        if node not in pending:
+                            continue
+                        internal_order.append(node)
+                        pending.pop(node)
+                        for deps in pending.values():
+                            deps.discard(node)
+                own_group = tuple(dict.fromkeys(owners[node][0] for node in component))
+                srcs = tuple(dict.fromkeys(source for node in component
+                                           for source in owners[node][1]))
+                operation = ("algebraic", _AlgebraicLoop(
+                    tuple(operations[node] for node in internal_order), tuple(tears),
+                    own_group, tuple(labels[node] for node in component),
+                ))
+                label = "algebraic(" + ", ".join(labels[node] for node in component) + ")"
+            compact_ops.append(operation)
+            compact_owners.append((own_group, srcs))
+            compact_labels.append(label)
+            compact_deps.append({component_of[dep] for node in component
+                                 for dep in dependencies[node] if component_of[dep] != ci})
+
+        compact_successors = [[] for _ in compact_ops]
+        indegree = [len(deps) for deps in compact_deps]
+        for node, deps in enumerate(compact_deps):
+            for dep in deps:
+                compact_successors[dep].append(node)
         ready = deque(i for i, degree in enumerate(indegree) if degree == 0)
         order = []
         while ready:
             node = ready.popleft()
             order.append(node)
-            for nxt in successors[node]:
+            for nxt in compact_successors[node]:
                 indegree[nxt] -= 1
                 if indegree[nxt] == 0:
                     ready.append(nxt)
-        if len(order) != len(operations):
-            blocked = [labels[i] for i, degree in enumerate(indegree) if degree]
-            raise ValueError(f"algebraic loop between output stages and inputs: {blocked}")
+        if len(order) != len(compact_ops):
+            raise RuntimeError("internal error while collapsing algebraic output groups")
         position = {node: i for i, node in enumerate(order)}
-        self._plan = tuple(operations[i] for i in order)
-        self._plan_owners = tuple(owners[i] for i in order)
-        self._plan_dependencies = tuple(tuple(position[d] for d in sorted(dependencies[i])) for i in order)
+        self._plan = tuple(compact_ops[i] for i in order)
+        self._plan_owners = tuple(compact_owners[i] for i in order)
+        self._plan_dependencies = tuple(
+            tuple(position[d] for d in sorted(compact_deps[i])) for i in order
+        )
+        self.algebraic_loops = tuple(
+            compact_ops[i][1] for i in order if compact_ops[i][0] == "algebraic"
+        )
         # Minimal output plan reached by a held-input change.  States, time and ordinary
         # parameters are unchanged in this path, so unrelated subsystem outputs need no refresh.
         zoh_owners = {id(sub) for sub, _field in self.zoh_connections}
         affected: set[int] = set()
-        for i, (owner, _sources) in enumerate(self._plan_owners):
-            if id(owner) in zoh_owners or any(dependency in affected
-                                              for dependency in self._plan_dependencies[i]):
+        for i, (op_owners, _sources) in enumerate(self._plan_owners):
+            if (any(id(owner) in zoh_owners for owner in op_owners)
+                    or any(dependency in affected for dependency in self._plan_dependencies[i])):
                 affected.add(i)
         self._zoh_plan = tuple(sorted(affected))
         # staged subsystems appear once per output call
         aliases = [s for s in self.subsystems if id(s) in legacy and legacy[id(s)] is None]
-        self.output_order = aliases + [owner for (kind, _), (owner, _) in zip(self._plan, self._plan_owners)
-                                      if kind == "out"]
+        output_order = list(aliases)
+        for (kind, _), (op_owners, _) in zip(self._plan, self._plan_owners):
+            if kind not in ("out", "algebraic"):
+                continue
+            for owner in op_owners:
+                if owner not in output_order:
+                    output_order.append(owner)
+        self.output_order = output_order
 
     def _compile(self) -> None:
         """Generate and compile ``_load``, ``_outputs``, ``rhs_list`` (source in ``compiled_source``)."""
@@ -673,8 +972,8 @@ class Model:
                 for st, name, idx, is_c in self._state_ops]
 
         plan = []
-        for (kind, item), (owner, _srcs) in zip(self._plan, self._plan_owners):
-            if kind == "out":
+        for (kind, item), (op_owners, _srcs) in zip(self._plan, self._plan_owners):
+            if kind in ("out", "algebraic"):
                 line = f"{ref(item)}(t)"
             else:
                 dst, field, src, src_field, fanin = item
@@ -685,7 +984,8 @@ class Model:
                     for out, name, gain in fanin:
                         value = f"({value} + {ref(gain)} * {get(out, name)})"
                 line = put(dst, field, value)
-            plan.append(f"{line}  # {owners[id(owner)]}")
+            comment = ", ".join(owners[id(owner)] for owner in op_owners)
+            plan.append(f"{line}  # {comment}")
 
         derive, packed = [], []
         for j, (sub, flags, _all_complex) in enumerate(self._rhs_plan):
@@ -746,12 +1046,17 @@ class Model:
                         pending.append(dep)
             return tuple(self._plan[i] for i in sorted(needed))
 
-        member_ops = [i for i, (owner, _) in enumerate(self._plan_owners) if id(owner) in member_ids]
+        member_ops = [i for i, (owners, _) in enumerate(self._plan_owners)
+                      if any(id(owner) in member_ids for owner in owners)]
         plan = closure(member_ops)
-        own = tuple(item for item, (owner, srcs) in zip(self._plan, self._plan_owners)
-                    if id(owner) in member_ids and (item[0] == "out" or all(id(x) in member_ids for x in srcs)))
-        boundary = [i for i, ((kind, _), (owner, srcs)) in enumerate(zip(self._plan, self._plan_owners))
-                    if kind == "copy" and id(owner) in member_ids and any(id(x) not in member_ids for x in srcs)]
+        own = tuple(item for item, (owners, srcs) in zip(self._plan, self._plan_owners)
+                    if any(id(owner) in member_ids for owner in owners)
+                    and (item[0] in ("out", "algebraic")
+                         or all(id(x) in member_ids for x in srcs)))
+        boundary = [i for i, ((kind, _), (owners, srcs))
+                    in enumerate(zip(self._plan, self._plan_owners))
+                    if kind == "copy" and any(id(owner) in member_ids for owner in owners)
+                    and any(id(x) not in member_ids for x in srcs)]
         inputs = tuple(self._plan[i] for i in boundary)
         # only the stages producing boundary signals
         feed = closure(boundary)
@@ -761,7 +1066,7 @@ class Model:
     def run_plan(self, t: float, plan: tuple) -> None:
         """Run a plan (subset of the output plan) on the current subsystem records."""
         for kind, item in plan:
-            if kind == "out":
+            if kind in ("out", "algebraic"):
                 item(t)
             else:
                 dst_inp, dst_name, src_out, src_name, fanin = item

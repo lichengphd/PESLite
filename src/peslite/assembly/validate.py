@@ -10,7 +10,7 @@ import math
 import warnings
 from dataclasses import fields, is_dataclass
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from ..components.network import element_buses
 from ..solver.integrators import ADAPTIVE_METHODS, FIXED_METHODS
@@ -68,13 +68,13 @@ def _dclink(cfg, where):
         raise ConfigError(f"{where}: a voltage source with a capacitor requires positive source resistance or ESR")
 
 
-def _pwm(w, base, where: str) -> None:
+def _pwm(w, base, where: str, continuous: bool = False) -> None:
     """Check switching frequency, phase and synchronous pulse ratio."""
     if not math.isfinite(w.f_sw) or w.f_sw <= 0.0:
         raise ConfigError(f"{where}.f_sw must be finite and positive, got {w.f_sw}")
     if not math.isfinite(w.carrier_phase):
         raise ConfigError(f"{where}.carrier_phase must be finite, got {w.carrier_phase}")
-    if w.sync == "synchronous":
+    if not continuous and w.sync == "synchronous":
         ratio = w.f_sw / base.f0
         if abs(ratio - round(ratio)) > 1e-9 * max(1.0, ratio):
             raise ConfigError(f"{where}.sync = 'synchronous' needs an integer pulse ratio "
@@ -86,8 +86,16 @@ def _period(c, pwm) -> float:
     return c.period if c.period is not None else pwm.switching_period
 
 
-def _timing(c, pwm, where: str) -> None:
+def _timing(c, pwm, where: str, continuous: bool = False) -> None:
     """Check the carrier-triggered control interrupt and computation time."""
+    if continuous:
+        if c.period is not None and (not math.isfinite(c.period) or c.period <= 0.0):
+            raise ConfigError(f"{where}.period must be finite and positive, got {c.period}")
+        if c.computation is not None and (not math.isfinite(c.computation) or c.computation < 0.0):
+            raise ConfigError(
+                f"{where}.computation must be finite and nonnegative, got {c.computation}"
+            )
+        return
     T_c = _period(c, pwm)
     if not math.isfinite(T_c) or T_c <= 0.0:
         raise ConfigError(f"{where}.period must be finite and positive, got {T_c}")
@@ -96,24 +104,24 @@ def _timing(c, pwm, where: str) -> None:
         raise ConfigError(f"{where}.period = {T_c:.6g} s is not a multiple of half the carrier period "
                           f"({half:.6g} s at pwm.f_sw = {pwm.f_sw:g} Hz): the carrier triggers the "
                           f"interrupt at its valleys and peaks")
-    tau = c.computation
+    tau = 1.0e-6 if c.computation is None else c.computation
     if not math.isfinite(tau) or tau < 0.0 or tau >= T_c:
         raise ConfigError(f"{where}.computation = {tau} s must be at least 0 and shorter than the "
                           f"control period {T_c:.6g} s")
 
 
-def _control(c, dclink, pwm, where: str) -> None:
+def _control(c, dclink, pwm, where: str, continuous: bool = False) -> None:
     """Check typed control loops and their requirements on the DC side."""
     if not c.loops:
         raise ConfigError(f"{where}.loops must contain at least one loop")
-    T_c = _period(c, pwm)
+    T_c = None if continuous else _period(c, pwm)
     for name, cfg in c.loops.items():
         if name in {"meas", "references", "held", "command", "prot"}:
             raise ConfigError(f"{where}.loops.{name}: reserved loop name")
         T = cfg.period
         if T is not None and (not math.isfinite(T) or T <= 0):
             raise ConfigError(f"{where}.loops.{name}.period must be finite and positive")
-        if T is not None and not _whole(T / T_c):
+        if not continuous and T is not None and not _whole(T / T_c):
             raise ConfigError(f"{where}.loops.{name}.period = {T:.6g} s is not a multiple of "
                               f"ctrl.period = {T_c:.6g} s: a loop runs at every n-th control interrupt")
         for key, value in vars(cfg).items():
@@ -132,7 +140,7 @@ def _control(c, dclink, pwm, where: str) -> None:
             raise ConfigError(f"{where}.references: expected finite scalar references")
 
 
-def _measurement(m, T_c: float, where: str) -> None:
+def _measurement(m, T_c: Optional[float], where: str) -> None:
     """Check ADC oversampling and averaging windows within one control period."""
     if not isinstance(m.average, (list, tuple)):
         raise ConfigError(f"{where}.average: expected a list of channels, got {m.average!r}")
@@ -144,10 +152,14 @@ def _measurement(m, T_c: float, where: str) -> None:
         raise ConfigError(f"{where}.average: channels must not be repeated")
     for key in ("period", "window"):
         value = getattr(m, key)
+        if value is not None and (not math.isfinite(value) or value <= 0.0):
+            raise ConfigError(f"{where}.{key} must be finite and positive, got {value}")
+    if T_c is None:
+        return
+    for key in ("period", "window"):
+        value = getattr(m, key)
         if value is None:
             continue
-        if not math.isfinite(value) or value <= 0.0:
-            raise ConfigError(f"{where}.{key} must be finite and positive, got {value}")
         if value > T_c * (1.0 + 1e-9):
             raise ConfigError(f"{where}.{key} = {value:.6g} s is longer than ctrl.period = {T_c:.6g} s")
     if m.period is not None and not _whole(T_c / m.period):
@@ -167,10 +179,11 @@ def _unit(u, base, where: str) -> None:
     if u.ac_filter.l_f <= 0.0:
         raise ConfigError(f"{where}.ac_filter.l_f must be > 0")
     _dclink(u.dclink, f"{where}.dclink")
-    _pwm(u.pwm, base, f"{where}.pwm")
-    _timing(u.ctrl, u.pwm, f"{where}.ctrl")
-    _control(u.ctrl, u.dclink, u.pwm, f"{where}.ctrl")
-    _measurement(u.meas, _period(u.ctrl, u.pwm), f"{where}.meas")
+    continuous = u.bridge.model == "averaging"
+    _pwm(u.pwm, base, f"{where}.pwm", continuous)
+    _timing(u.ctrl, u.pwm, f"{where}.ctrl", continuous)
+    _control(u.ctrl, u.dclink, u.pwm, f"{where}.ctrl", continuous)
+    _measurement(u.meas, None if continuous else _period(u.ctrl, u.pwm), f"{where}.meas")
     protection = u.protection
     for name in ("overcurrent", "undervoltage", "overvoltage", "frequency", "dc_voltage", "rocof"):
         _switched(getattr(protection, name), f"{where}.protection.{name}")
@@ -290,6 +303,8 @@ def _initial(p: Params) -> None:
     if t0 < 0.0:
         raise ConfigError("simulation.initial.t must be >= 0")
     for name, u in p.units.items():
+        if u.bridge.model == "averaging":
+            continue
         m, T_c = u.meas, _period(u.ctrl, u.pwm)
         continued = any(key.startswith((f"{name}.ctrl.", f"{name}.pwm.",
                                          f"{name}.bridge.", f"{name}.meas."))

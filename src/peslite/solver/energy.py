@@ -606,9 +606,11 @@ def ph_report(model: Any, zoh: Optional[dict[str, Any]] = None, rtol: float = 1e
             owners = {id(op): info for op, info in zip(model._plan, model._plan_owners)}
             for op in gp.plan:
                 kind, item = op
-                owner, srcs = owners[id(op)]
-                if kind == "out" and id(owner) not in member_ids:
-                    held_subs[id(owner)] = owner
+                op_owners, srcs = owners[id(op)]
+                if kind in ("out", "algebraic"):
+                    for owner in op_owners:
+                        if id(owner) not in member_ids:
+                            held_subs[id(owner)] = owner
                 if kind == "copy":
                     for src in srcs:
                         if id(src) not in member_ids:

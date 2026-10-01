@@ -103,7 +103,7 @@ def test_ideal_averaging_is_a_bridge_implementation_without_a_pwm(tmp_path):
     simulation.run(out_dir=tmp_path)
 
 
-def test_changing_bridge_model_keeps_the_same_power_and_modulation_connections(gfl):
+def test_changing_bridge_model_keeps_the_same_bridge_power_boundary(gfl):
     switching = peslite.Simulation(gfl()).unit()
     averaging = peslite.Simulation(
         gfl(**{"units.vsc.bridge.model": "averaging"})
@@ -111,10 +111,13 @@ def test_changing_bridge_model_keeps_the_same_power_and_modulation_connections(g
 
     assert tuple(switching.bridge.inp.__slots__) == tuple(averaging.bridge.inp.__slots__)
     assert set(switching.bridge.inp.__slots__) == {"q", "u_dc", "i_c"}
-    assert [port for _component, port in switching.zoh_connections()] == [
-        port for _component, port in averaging.zoh_connections()
-    ] == ["q"]
-    assert len(switching.connections()) == len(averaging.connections())
+    assert [port for _component, port in switching.zoh_connections()] == ["q"]
+    assert averaging.zoh_connections() == {}
+    assert (averaging.bridge, "q") in averaging.connections()
+    assert averaging.connections()[(averaging.ctrl, "u_dc")] == (averaging.dclink, "u_dc")
+    for port in ("u_dc", "i_c"):
+        assert (switching.bridge, port) in switching.connections()
+        assert (averaging.bridge, port) in averaging.connections()
 
 
 def test_only_exact_switching_bridge_enters_the_switching_event_loop(gfl):
@@ -126,6 +129,40 @@ def test_only_exact_switching_bridge_enters_the_switching_event_loop(gfl):
     assert not bridges["pwm_averaging"].has_switching_events
     assert not bridges["averaging"].has_switching_events
     assert not hasattr(bridges["averaging"], "next_switch")
+
+
+def test_averaging_silently_ignores_all_sampled_timing_semantics(tmp_path):
+    common = {
+        "units.vsc.bridge.model": "averaging",
+        "events.connect_vsc.t": 0.0,
+        "events.connect_vsc.ramp": 0.0,
+        "simulation.t_end": 0.001,
+        "simulation.solver.linearisations": 0,
+    }
+    baseline = peslite.load(EXAMPLES / "gfl-example.pes", **common)
+    configured = peslite.load(EXAMPLES / "gfl-example.pes", **common, **{
+        "units.vsc.ctrl.period": 37e-6,
+        "units.vsc.ctrl.computation": 1.0,
+        "units.vsc.ctrl.loops.pll.period": 31e-6,
+        "units.vsc.ctrl.loops.cc.period": 43e-6,
+        "units.vsc.ctrl.loops.dvc.period": 59e-6,
+        "units.vsc.meas.period": 7e-6,
+        "units.vsc.meas.window": 0.2,
+        "units.vsc.meas.average": ["u_g", "i_c", "u_dc"],
+        "units.vsc.pwm.f_sw": 19_999.0,
+        "units.vsc.pwm.sync": "synchronous",
+        "units.vsc.pwm.update": "double",
+        "units.vsc.pwm.carrier_phase": 0.37,
+    })
+
+    first = peslite.Simulation(baseline).run(out_dir=tmp_path / "baseline")
+    second_sim = peslite.Simulation(configured)
+    assert second_sim.unit().adc is None
+    assert second_sim.unit().periods == []
+    assert second_sim.unit().ctrl.periods == {"pll": 31e-6, "cc": 43e-6, "dvc": 59e-6}
+    second = second_sim.run(out_dir=tmp_path / "configured")
+    for name, value in first.final_states().items():
+        assert second.final_states()[name] == pytest.approx(value, rel=1e-13, abs=1e-13)
 
 
 def test_pwm_averaging_flag_is_the_same_as_setting_the_file_value(tmp_path):
@@ -205,20 +242,35 @@ def test_pwm_averaging_accepts_synchronous_pwm(gfl, tmp_path):
     assert result.t[-1] == pytest.approx(params.simulation.t_end)
 
 
-def test_ideal_averaging_has_its_own_states_and_no_pwm_states(gfl):
+def test_ideal_averaging_has_continuous_control_states_and_no_sampled_hardware_states(gfl):
     simulation = peslite.Simulation(gfl(**{"units.vsc.bridge.model": "averaging"}))
     names = set(simulation.state_names())
-    assert {f"vsc.bridge.d_{phase}" for phase in "abc"} <= names
-    assert {f"vsc.bridge.history.0.d_{phase}" for phase in "abc"} <= names
-    assert {"vsc.bridge.on", "vsc.bridge.history.0.on"} <= names
-    assert not any(name.startswith("vsc.pwm.") for name in names)
+    assert {"vsc.ctrl.pll.theta", "vsc.ctrl.pll.integral_pu",
+            "vsc.ctrl.cc.integral_pu.re", "vsc.ctrl.cc.integral_pu.im"} <= names
+    assert not any(name.startswith(("vsc.pwm.", "vsc.bridge.", "vsc.meas."))
+                   for name in names)
+
+
+def test_ideal_averaging_algebraic_loop_runs_with_a_multirate_group(gfl, tmp_path):
+    params = gfl(**{
+        "units.vsc.bridge.model": "averaging",
+        "simulation.t_end": 0.001,
+        "simulation.solver.subsystems": {"vsc.dclink": 2},
+    })
+    simulation = peslite.Simulation(params)
+
+    result = simulation.run(out_dir=tmp_path)
+
+    assert len(simulation.system.model.algebraic_loops) == 1
+    assert result.summary["t_stop"] == pytest.approx(params.simulation.t_end)
+    assert all(np.isfinite(value) for value in result.final_states().values())
 
 
 @pytest.mark.parametrize("solver", [
     {},
     {"simulation.solver.type": "adaptive", "simulation.solver.method": "DP45"},
 ], ids=["fixed", "adaptive"])
-def test_ideal_averaging_continues_exactly_with_its_delay_history(gfl, solver, tmp_path):
+def test_ideal_averaging_continues_exactly_with_its_continuous_control_states(gfl, solver, tmp_path):
     params = gfl(**{"units.vsc.bridge.model": "averaging",
                     "simulation.t_end": 0.004,
                     "simulation.output.period": 5e-6,
@@ -232,4 +284,5 @@ def test_ideal_averaging_continues_exactly_with_its_delay_history(gfl, solver, t
     start = int(np.argmin(abs(whole.t - 0.003005)))
     assert np.array_equal(continued.t, whole.t[start:])
     for name, values in continued.states.items():
-        assert np.array_equal(values, whole.states[name][start:]), name
+        np.testing.assert_allclose(values, whole.states[name][start:], rtol=1e-13, atol=1e-13,
+                                   err_msg=name)

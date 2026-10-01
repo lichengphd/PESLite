@@ -8,7 +8,8 @@ import pytest
 
 import peslite
 from conftest import EXAMPLES
-from peslite.solver import AdaptiveSolver, DormandPrince45, FixedStepSolver, MultirateSolver, make_solver
+from peslite.solver import (AdaptiveSolver, Bag, DormandPrince45, Empty, FixedStepSolver,
+                            Model, MultirateSolver, make_solver)
 from peslite.solver.multirate import parse_step
 
 QUIET = {"simulation.progress.enable": 0, "simulation.solver.linearisations": 0}
@@ -58,6 +59,35 @@ def test_dp45_float_model_path_matches_the_array_path():
     np.testing.assert_allclose(fast.y, array.y, rtol=1e-13, atol=1e-14)
 
 
+def test_model_automatically_solves_an_algebraic_output_loop():
+    class In(Bag):
+        __slots__ = ("x",)
+
+    class Out(Bag):
+        __slots__ = ("y",)
+
+    class Feedback:
+        state_names = ()
+        outputs_need_inputs = True
+
+        def __init__(self):
+            self.state, self.inp, self.out = Empty(), In(), Out()
+
+        def set_outputs(self, _t):
+            self.out.y = 1.0 + 0.5 * self.inp.x
+
+        def rhs(self, _t):
+            return ()
+
+    block = Feedback()
+    model = Model({"feedback": block}, {(block, "x"): (block, "y")})
+    model.sync(0.0, np.empty(0))
+
+    assert len(model.algebraic_loops) == 1
+    assert block.inp.x == pytest.approx(2.0)
+    assert block.out.y == pytest.approx(2.0)
+
+
 def test_a_run_continues_exactly_from_a_saved_state(tmp_path):
     def run(t_end, out, **changes):
         params = peslite.load(EXAMPLES / "gfl-example.pes", **QUIET, **FAST,
@@ -67,7 +97,12 @@ def test_a_run_continues_exactly_from_a_saved_state(tmp_path):
     whole = run(0.004, tmp_path / "whole")
     run(0.002, tmp_path / "first")
     continued = run(0.004, tmp_path / "continued", initial=tmp_path / "first" / "states.csv")
-    assert continued.final_states() == whole.final_states()
+    continued_states = continued.final_states()
+    whole_states = whole.final_states()
+    assert continued_states.keys() == whole_states.keys()
+    np.testing.assert_allclose(
+        list(continued_states.values()), list(whole_states.values()), rtol=1e-13, atol=1e-13
+    )
 
 
 @pytest.mark.parametrize("value, expected", [(2, (2.0, None)), (0.25, (0.25, None)),

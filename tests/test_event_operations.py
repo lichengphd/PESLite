@@ -147,6 +147,7 @@ def test_system_checks_optional_custom_element_operations():
 
 def test_system_switches_units_sources_and_loads():
     tree = _line(_load(_tree()))
+    tree["units"]["vsc"]["bridge"] = {"model": "pwm_averaging"}
     tree["events"]["connect_vsc"].update(t=0.0, ramp=0.0)
     tree["events"].update({
         "unit_off": {"type": "disconnect", "target": "vsc", "t": 0.1},
@@ -191,6 +192,7 @@ def test_system_switches_units_sources_and_loads():
 
 def test_system_applies_retunes_and_control_loops_keep_their_state():
     tree = _line(_load(_tree()))
+    tree["units"]["vsc"]["bridge"] = {"model": "pwm_averaging"}
     tree["events"]["connect_vsc"].update(t=0.0, ramp=0.0)
     tree["events"]["retune"] = {"type": "set", "t": 0.001, "set": {
         "buses.pcc.c_pu": 0.03,
@@ -264,3 +266,21 @@ def test_system_applies_retunes_and_control_loops_keep_their_state():
     assert specs["grid.branch"].storage[0].value == current.sources["grid"].l
     assert specs["line"].storage[0].value == current.branches["line"].l
     assert specs["load.branch"].storage[0].value == current.elements["load"].l
+
+
+def test_continuous_controller_retune_rebinds_its_ode_states(tmp_path):
+    tree = _tree()
+    tree["events"]["connect_vsc"].update(t=0.0, ramp=0.0)
+    tree["events"]["retune"] = {"type": "set", "t": 1e-4, "set": {
+        "units.vsc.ctrl.loops.pll.kp_pu": 10.0,
+        "units.vsc.ctrl.loops.dvc.kp_pu": 0.4,
+    }}
+    tree["simulation"].update(t_end=2e-4, energy_check="off")
+    tree["simulation"]["progress"] = {"enable": 0}
+    simulation = peslite.Simulation(from_dict(tree))
+
+    result = simulation.run(out_dir=tmp_path)
+
+    assert simulation.unit().ctrl.graph.nodes["pll"].kp == 10.0
+    assert simulation.unit().ctrl.graph.nodes["dvc"].kp == 0.4
+    assert all(np.isfinite(values[-1]) for values in result.states.values())

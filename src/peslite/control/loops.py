@@ -2,7 +2,8 @@
 
 A loop type is one class: its parameters (``Params``, the schema of its ``ctrl.loops`` entry),
 its typed input and output ports, its role in the default wiring, and its discrete-time update.
-How loops are connected is not theirs to know (:mod:`.controller`).
+How loops are connected is not theirs to know (:mod:`.controller`).  Built-in loops also expose
+their continuous-time outputs and state derivatives for the ideal averaged converter model.
 Signals are pu; time s, angles rad, frequencies rad/s.
 """
 
@@ -83,6 +84,35 @@ class Loop:
 
     def update(self, t: float, inputs: Mapping[str, Any]) -> dict[str, Any]:
         raise NotImplementedError
+
+    def continuous(self, t: float, inputs: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Return ``(outputs, named state derivatives)`` for continuous averaging.
+
+        Registered custom loops must implement this method to be usable with
+        ``bridge.model: averaging``.  The derivative keys are those of
+        :meth:`continuous_state`.
+        """
+        raise NotImplementedError(
+            f"loop type {self.type!r} has no continuous-time implementation"
+        )
+
+    def continuous_state(self) -> dict[str, Any]:
+        """States integrated by the continuous controller."""
+        return self.get_state()
+
+    def continuous_state_bindings(self):
+        """Optional direct ``state name -> (object, attribute)`` bindings for the RHS hot path.
+
+        The default covers loops whose public state names map directly to their attributes.  A
+        loop with a custom/nested state representation may return ``None`` and keep using
+        :meth:`set_state`, or override this method with equivalent direct bindings.
+        """
+        names = self.state_names
+        attrs = names if isinstance(names, Mapping) else {name: name for name in names}
+        continuous = self.continuous_state()
+        if set(continuous) != set(attrs):
+            return None
+        return {name: (self, attrs[name]) for name in continuous}
 
     def get_state(self) -> dict[str, Any]:
         names = self.state_names
@@ -201,6 +231,18 @@ class SRFPLL(Loop):
             self.u_g = u_g + self.T * self.kp * (v.real - u_g)
         return {"theta": self.theta, "frame": frame, "omega": self.omega}
 
+    def continuous(self, t, inputs):
+        v = inputs["v"] * _into(self.theta)
+        if self.u_g is None:
+            eps = v.imag
+        else:
+            eps = v.imag / self.u_g if self.u_g > 0.0 else 0.0
+        self.omega = self.w0 + self.kp * eps + self.ki * self.integral
+        derivatives = {"theta": self.omega, "integral_pu": eps}
+        if self.u_g is not None:
+            derivatives["u_g_pu"] = self.kp * (v.real - self.u_g)
+        return {"theta": self.theta, "frame": self.theta, "omega": self.omega}, derivatives
+
     def reset_integrator(self):
         self.integral = 0.0
 
@@ -260,6 +302,17 @@ class CurrentLoop(Loop):
             self.integral = self.integral + self.T * e
         self._last = (e, i, u_ff, omega)
         return {"u_dq": self.command(e, i, u_ff, omega) + self.extra, "extra": self.extra}
+
+    def continuous(self, t, inputs):
+        rot = _into(inputs["frame"])
+        self.extra = inputs["extra"]
+        i, u_ff, omega = inputs["i"] * rot, inputs["v"] * rot, inputs["omega"]
+        e = 0j if not self.startup.active else complex(inputs["id_ref"], inputs["iq_ref"]) - i
+        self._last = (e, i, u_ff, omega)
+        self._continuous_error = e
+        return ({"u_dq": self.command(e, i, u_ff, omega) + self.extra,
+                 "extra": self.extra},
+                {"integral_pu": e})
 
     def command(self, e: complex, i: complex, u_ff: complex, omega: float) -> complex:
         """Voltage command (without ``extra``) from the integrator state (no integration)."""
@@ -362,6 +415,28 @@ class DCVoltageLoop(Loop):
             self.n_reverse += 1
         return {"id_ref": id_ref}
 
+    def continuous_state(self):
+        # ``clamped`` is discrete bookkeeping in the sampled implementation.  The continuous
+        # anti-windup decision is algebraic and therefore needs no boolean ODE state.
+        return {"integral_pu": self.integral}
+
+    def continuous(self, t, inputs):
+        ff = self.startup.value * self.cfg.id0_export_pu
+        self.error = inputs["u_dc"] - inputs["vdc_ref"]
+        self.raw = 0.0 if not self.startup.active else (
+            ff + self.kp * self.error + self.ki * self.integral
+        )
+        id_ref = clamp(self.raw, self.floor, self.limit)
+        self.clamped = id_ref != self.raw
+        derivative = self.error if self.startup.active else 0.0
+        if self.antiwindup == "conditional" and self.clamped:
+            # Freeze only while the error would drive the integrator farther into the active
+            # limit.  An inward error must be allowed to release a saturated continuous PI.
+            if ((id_ref >= self.limit and derivative > 0.0)
+                    or (id_ref <= self.floor and derivative < 0.0)):
+                derivative = 0.0
+        return {"id_ref": id_ref}, {"integral_pu": derivative}
+
     def reset_integrator(self):
         self.integral = 0.0
         self.clamped = False
@@ -390,6 +465,7 @@ class PowerLoop(Loop):
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
         bandwidth = cfg.filter.bandwidth if cfg.filter.enable else 0.0
+        self.bandwidth = bandwidth
         self.lpf_p = LowPass1(bandwidth, cfg.period, 0.0, init_on_first=False)
         self.lpf_q = LowPass1(bandwidth, cfg.period, 0.0, init_on_first=False)
 
@@ -399,6 +475,25 @@ class PowerLoop(Loop):
     def update(self, t, inputs):
         s = inputs["v"] * inputs["i"].conjugate()
         return {"p": self.lpf_p.update(s.real), "q": self.lpf_q.update(s.imag)}
+
+    def continuous_state(self):
+        # With the filter disabled, power is algebraic; do not add two constant dummy states to
+        # the system merely because the sampled implementation owns filter objects.
+        return self.get_state() if self.bandwidth > 0.0 else {}
+
+    def continuous_state_bindings(self):
+        if self.bandwidth <= 0.0:
+            return {}
+        return {"p_pu": (self.lpf_p, "y"), "q_pu": (self.lpf_q, "y")}
+
+    def continuous(self, t, inputs):
+        s = inputs["v"] * inputs["i"].conjugate()
+        if self.bandwidth <= 0.0:
+            return {"p": s.real, "q": s.imag}, {}
+        pole = 2.0 * math.pi * self.bandwidth
+        return ({"p": self.lpf_p.y, "q": self.lpf_q.y},
+                {"p_pu": pole * (s.real - self.lpf_p.y),
+                 "q_pu": pole * (s.imag - self.lpf_q.y)})
 
     def get_state(self):
         return gather({"p_pu": self.lpf_p, "q_pu": self.lpf_q})
@@ -453,6 +548,30 @@ class SyncLaw(Loop):
     def step(self, T, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu, q_ref_pu, v_ref_pu, i_dq) -> None:
         raise NotImplementedError
 
+    def continuous(self, t, inputs):
+        frame = float(self.theta)
+        rot = _into(frame)
+        v, i = inputs["v"] * rot, inputs["i"] * rot
+        if not self.startup.active:
+            self.omega = self.w0
+            self.v_mag = abs(v) if abs(v) > 0.1 else self.v_mag
+            derivatives = {name: 0j if isinstance(value, complex) else 0.0
+                           for name, value in self.continuous_state().items()}
+            derivatives["theta"] = self.w0
+        else:
+            p_ref = self.startup.value * inputs["p_ref"]
+            derivatives = self.flow(
+                inputs["p"], inputs["q"], abs(v), inputs["u_dc"], p_ref,
+                inputs["q_ref"], inputs["v_ref"], i,
+            )
+        return ({"theta": self.theta, "frame": frame, "omega": self.omega,
+                 "v_ref": self.v_mag}, derivatives)
+
+    def flow(self, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu,
+             q_ref_pu, v_ref_pu, i_dq) -> dict[str, Any]:
+        """Continuous state derivatives, also refreshing algebraic outputs."""
+        raise NotImplementedError
+
     def track(self, inputs):
         """Hold the law on a usable measured voltage before start-up."""
         voltage = inputs["v"]
@@ -499,6 +618,12 @@ class PSC(SyncLaw):
         self.v_int += T * e_v
         self.v_mag = v_ref_pu + self.k_v * e_v + self.k_vi * self.v_int
 
+    def flow(self, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
+        self.omega = self.w0 + self.k_p * (p_ref_pu - p_pu)
+        e_v = v_ref_pu - v_mag_pu
+        self.v_mag = v_ref_pu + self.k_v * e_v + self.k_vi * self.v_int
+        return {"theta": self.omega, "v_int_pu": e_v}
+
     def follow(self, theta, v_mag_pu, v_ref_pu):
         super().follow(theta, v_mag_pu, v_ref_pu)
         error = v_ref_pu - v_mag_pu
@@ -532,6 +657,11 @@ class Droop(SyncLaw):
         self.omega = self.w0 + self.m_p * (p_ref_pu - p_pu)
         self.theta += T * self.omega
         self.v_mag = v_ref_pu + self.n_q * (q_ref_pu - q_pu)
+
+    def flow(self, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
+        self.omega = self.w0 + self.m_p * (p_ref_pu - p_pu)
+        self.v_mag = v_ref_pu + self.n_q * (q_ref_pu - q_pu)
+        return {"theta": self.omega}
 
 
 @register_loop_type
@@ -570,6 +700,17 @@ class VSG(SyncLaw):
             self.v_mag += T / self.t_q * (v_cmd - self.v_mag)
         else:
             self.v_mag = v_cmd
+
+    def flow(self, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
+        d_dw = (p_ref_pu - p_pu - self.d_p * self.dw_pu) / (2.0 * self.h)
+        self.omega = self.w0 * (1.0 + self.dw_pu)
+        v_cmd = v_ref_pu + self.k_q * (q_ref_pu - q_pu)
+        derivatives = {"theta": self.omega, "dw_pu": d_dw}
+        if self.t_q > 0.0:
+            derivatives["v_mag_pu"] = (v_cmd - self.v_mag) / self.t_q
+        else:
+            self.v_mag = v_cmd
+        return derivatives
 
     def follow(self, theta, v_mag_pu, v_ref_pu):
         super().follow(theta, v_mag_pu, v_ref_pu)
@@ -610,6 +751,14 @@ class DVOC(SyncLaw):
         self.v_mag = V + T * w.real
         self.theta += T * self.omega
 
+    def flow(self, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
+        V = max(self.v_mag, 1e-12)
+        i_star = complex(p_ref_pu, -q_ref_pu) * V / (v_ref_pu * v_ref_pu)
+        w = (self.eta * self.rot * (i_star - i_dq)
+             + self.eta * self.alpha * (1.0 - V * V / (v_ref_pu * v_ref_pu)) * V)
+        self.omega = self.w0 + w.imag / V
+        return {"theta": self.omega, "v_mag_pu": w.real}
+
 
 @register_loop_type
 class Matching(SyncLaw):
@@ -639,6 +788,11 @@ class Matching(SyncLaw):
         self.omega = self.k_theta * v_dc_pu
         self.theta += T * self.omega
         self.v_mag = v_ref_pu + self.k_q * (q_ref_pu - q_pu)
+
+    def flow(self, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
+        self.omega = self.k_theta * v_dc_pu
+        self.v_mag = v_ref_pu + self.k_q * (q_ref_pu - q_pu)
+        return {"theta": self.omega}
 
 
 # ------------------------------------------------------------------ voltage-reference shaping
@@ -675,6 +829,9 @@ class VirtualImpedance(Loop):
         i = inputs["i"] * _into(inputs["frame"])
         drop = (self.r_pu + 1j * inputs["omega"] / self.w0 * self.x_pu) * i
         return {"u_dq": complex(inputs["v_ref"], 0.0) - drop + inputs["extra"]}
+
+    def continuous(self, t, inputs):
+        return self.update(t, inputs), {}
 
 
 @register_loop_type
@@ -720,8 +877,29 @@ class VirtualAdmittance(Loop):
         self.i_ref = i_ref
         return {"id_ref": i_ref.real, "iq_ref": i_ref.imag}
 
+    def continuous(self, t, inputs):
+        v_ref_dq = complex(inputs["v_ref"], 0.0)
+        v_dq = inputs["v"] * _into(inputs["frame"])
+        omega = inputs["omega"]
+        i_ref = self.i_ref
+        mag = abs(i_ref)
+        i_out = i_ref if mag <= self.i_limit else i_ref * (self.i_limit / mag)
+        derivative = self.w0 / self.x_pu * (
+            v_ref_dq - v_dq
+            - (self.r_pu + 1j * omega / self.w0 * self.x_pu) * i_out
+        )
+        if mag >= self.i_limit:
+            radial = (derivative * i_out.conjugate()).real
+            if radial > 0.0:
+                derivative -= radial / (self.i_limit * self.i_limit) * i_out
+        return ({"id_ref": i_out.real, "iq_ref": i_out.imag},
+                {"i_ref_pu": derivative})
+
     def get_state(self):
         return {"i_ref_pu": self.i_ref}
+
+    def continuous_state_bindings(self):
+        return {"i_ref_pu": (self, "i_ref")}
 
     def set_state(self, values):
         if set(values) - {"i_ref_pu"}:
@@ -754,6 +932,7 @@ class ActiveDamping(Loop):
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
         self.r_a = cfg.r_a_pu
+        self.alpha_d = cfg.alpha_d
         self.hpf = HighPass1(cfg.alpha_d / (2.0 * math.pi), cfg.period, init_on_first=False, y0=0j)
 
     def initial_outputs(self):
@@ -762,8 +941,16 @@ class ActiveDamping(Loop):
     def update(self, t, inputs):
         return {"extra": -(self.r_a * self.hpf.update(inputs["i"] * _into(inputs["frame"])))}
 
+    def continuous(self, t, inputs):
+        current = inputs["i"] * _into(inputs["frame"])
+        low = self.hpf.y
+        return {"extra": -self.r_a * (current - low)}, {"hpf_pu": self.alpha_d * (current - low)}
+
     def get_state(self):
         return gather({"hpf_pu": self.hpf})
+
+    def continuous_state_bindings(self):
+        return {"hpf_pu": (self.hpf, "y")}
 
     def set_state(self, values):
         scatter({"hpf_pu": self.hpf}, values)

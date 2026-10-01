@@ -4,6 +4,15 @@
 
 - The default per-unit bridge model is now ideal `averaging`. The mutually exclusive
   `--switching`, `--pwm-averaging` and `--averaging` options override every unit for one run.
+- Ideal `averaging` now integrates controller states and instantaneous measurements with the plant
+  ODE and directly drives the controlled voltage-source bridge. ADC, control-interrupt,
+  computation and PWM timing values remain loadable but are silently ignored in this mode, so one
+  configuration can be reused by all three CLI model selections.
+- Model assembly automatically detects algebraic port loops, reduces each strongly connected
+  group to feedback variables and solves it during derivative evaluation. Continuous controllers
+  therefore read the actual DC terminal voltage without substituting the capacitor state or
+  requiring per-case loop ordering. Direct feedback between continuous custom control loops is
+  likewise detected and solved, while acyclic controllers retain a single-pass path.
 - Bundled examples use the default averaged bridge and a fixed solver step of 25 us.
 - `simulation.output.record_every` controls controller-log decimation; the former
   `ctrl_every` name is removed.
@@ -80,14 +89,10 @@
   asynchronous/synchronous PWM. The former solver-time-step averaging mode and its `over`
   parameter are removed.
 - `units.<u>.bridge.model: averaging` and CLI `--averaging` select a separate ideal controlled
-  voltage source with no PWM peripheral. Each controller output is held from the first equivalent
-  PWM update interval available after `ctrl.computation`; the centre of that held interval gives
-  the effective delay (`1.5 Ts` with the defaults) and follows `pwm.update`, carrier timing and
-  computation parameters otherwise.
-  The bridge keeps the same AC/DC/modulation connections in every model. The initial output fills
-  the delay history automatically, and `<unit>.bridge.*` states make
-  continuation from any saved output row exact. `--averaging` uses the `-averaging` result suffix
-  and is mutually exclusive with `--pwm-averaging`.
+  voltage source with continuous controller equations and no sampled/PWM timing machinery.
+  Controller dynamic states are ordinary ODE states; there are no `<unit>.bridge.*` delay states.
+  `--averaging` uses the `-averaging` result suffix and is mutually exclusive with
+  `--pwm-averaging`.
 
 ### Progress lines and watched quantities (#3)
 

@@ -5,12 +5,12 @@ Time-domain simulation of power-electronic converters in Python.
 - Networks of buses, lines, grid sources and any number of converters, defined in YAML
   simulation files, with run-time changes described as events.
 - Grid-following (PLL, current loop, dc-voltage loop) and grid-forming control
-  (PSC, droop, VSG, dVOC, matching), with each loop scheduled on control interrupts.
-- Switching bridges (ideal switches at exact instants) and bridges averaged over the PWM period
-  or solver step, selected independently for each converter.
+  (PSC, droop, VSG, dVOC, matching), in sampled or continuous form.
+- Switching, PWM-period-averaged and ideal continuously averaged bridges, selected independently
+  for each converter.
 - Fixed-step, adaptive (SciPy or built-in DP45) and multirate integration.
-- Closed sampled controllers with interrupt-counted start-up, ADC sampling, computation time,
-  PWM enable and duty registers, plus unit-owned protection.
+- Closed sampled controllers with ADC/PWM timing, or controller states integrated directly with
+  the plant for ideal averaging, plus unit-owned protection.
 - Energy accounting of the power circuit and restart from any saved state.
 
 The power circuit works in SI units (V, A, H, F, ohm); controllers work in pu of each
@@ -152,7 +152,7 @@ units:
 |---|---|
 | `switching` | ideal switches at the exact carrier-comparison instants |
 | `pwm_averaging` | the active duty ratios are continuous bridge values until the next PWM register load; no carrier ripple |
-| `averaging` | an ideal controlled voltage source driven through a PWM-equivalent output delay; no PWM peripheral |
+| `averaging` | an ideal controlled voltage source with continuous measurements and controller equations; no ADC or PWM timing |
 
 When `bridge.model` is omitted, a converter uses `averaging`. `--switching`, `--pwm-averaging`
 and `--averaging` select that model for every converter for one run without editing the file.
@@ -165,23 +165,22 @@ timing as switching. With single update a duty is held for one carrier period; w
 it may load at each carrier valley and peak. An asynchronous carrier phase still shifts that
 unit's control interrupts and loads, although the carrier waveform itself is not evaluated.
 
-Ideal averaging is a bridge implementation with the same AC, DC and modulation connections as
-the other bridge models; changing modes does not alter the system connection graph. It does not
-construct a PWM peripheral, carrier, modulator or active/shadow registers. For a controller output
-at `t_k`, let `t_load` be the first equivalent register-load instant at or after
-`t_k + ctrl.computation`, and let `T_load` be one carrier period for single update or half a
-carrier period for double update. The controlled source applies that output from `t_load` through
-the following update interval. The interval's centre therefore places its effective output at
+Ideal averaging keeps the same electrical bridge boundary, but connects the controller output
+directly to the ideal controlled voltage source. Controller states join the plant ODE and terminal
+measurements are evaluated at every solver stage. It constructs no ADC, control-interrupt grid,
+computation wait, carrier, active/shadow register or PWM delay state. Consequently `ctrl.period`,
+`ctrl.computation`, loop periods, ADC sampling/window settings and PWM timing settings are retained
+in a loaded configuration but silently ignored in this mode; the same file can be reused unchanged
+with `--switching` or `--pwm-averaging`.
 
-```text
-t_load + T_load / 2
-```
-
-and its effective delay is `t_load + T_load/2 - t_k`. With the default single update and nonzero
-computation this is `1.5 Ts`; zero computation gives `0.5 Ts`; double update with the default
-computation gives `0.75 Ts`. Other control/update grids are evaluated for each output. Before the
-first delayed output arrives, the source naturally keeps the start-up value. Its current output and delay
-history are bridge states saved as `<unit>.bridge.*`, so a saved row continues exactly.
+Instantaneous feedback through component ports can form algebraic loops—for example terminal DC
+voltage, controller command and bridge DC current. Model assembly detects these loops from declared
+port dependencies, reduces each strongly connected group to the smallest connected feedback
+variables it can tear, and solves it internally at each derivative evaluation. No loop-specific
+ordering or manual break is configured, and the controller continues to measure the actual terminal
+`u_dc` rather than a substituted storage voltage. The continuous control graph applies the same
+strongly-connected-component rule to direct feedback between custom control loops; acyclic loop
+networks retain their single-pass evaluation path.
 
 ## Example configurations
 
@@ -208,9 +207,9 @@ history are bridge states saved as `<unit>.bridge.*`, so a saved row continues e
 | `simulation.progress` | `{enable: 1, period: 0.1, watch: [...]}`; CLI: `--progress`, `--watch` |
 | `units.<u>.bridge.model` | `averaging` (default) \| `pwm_averaging` \| `switching`; CLI: `--averaging`, `--pwm-averaging`, `--switching` |
 | `units.<u>.ctrl.type` | `gfl` \| `gfm` \| `custom` |
-| `units.<u>.ctrl.period` / `.computation` | control-interrupt period and computation time, s |
-| `units.<u>.ctrl.loops.<loop>.period` | loop period, an integer multiple of `ctrl.period` |
-| `units.<u>.meas.period` / `.average` | ADC period; window-averaged channels chosen from `[u_g, i_c, u_dc]` |
+| `units.<u>.ctrl.period` / `.computation` | sampled-mode control-interrupt period and computation time, s; ignored by `averaging` |
+| `units.<u>.ctrl.loops.<loop>.period` | sampled-mode loop period, an integer multiple of `ctrl.period`; ignored by `averaging` |
+| `units.<u>.meas.period` / `.average` | sampled-mode ADC period and window-averaged channels; ignored by `averaging` |
 | `units.<u>.pwm.update` | `single` (valleys) \| `double` (valleys and peaks) |
 | `units.<u>.pwm.method` / `.sync` | `spwm` \| `svpwm`; `asynchronous` \| `synchronous` |
 | `simulation.output.states` / `.signals` / `.energy` | which files are written |
@@ -226,9 +225,9 @@ history are bridge states saved as `<unit>.bridge.*`, so a saved row continues e
 | `simulation.pes` | complete resolved simulation file; loading it repeats the run |
 
 `simulation.initial.t` and `simulation.t_end` are used exactly; neither is aligned or rounded to
-a converter's timer grid. A saved row restores either the active/shadow PWM registers or the ideal
-average source and its delay history, derives the next timer points from that row's time, and
-restores any ADC averaging-window accumulators. An oversampled ADC's intermediate samples are not states, so its saved
+a converter's timer grid. A saved row restores either the active/shadow PWM registers and ADC
+averaging-window accumulators, or the continuous controller states of an ideal averaged unit, and
+derives any next timer points from that row's time. An oversampled ADC's intermediate samples are not states, so its saved
 run must be continued from a control interrupt.
 With `simulation.output.states: 0`, no `states.csv` is written and only the terminal state is
 collected internally, so `final_states()` remains available without serialising every snapshot.
@@ -285,12 +284,20 @@ class MyLaw(SyncLaw):
         self.omega = self.w0 + self.cfg.k_p_pu * (p_ref_pu - p_pu)
         self.theta += T * self.omega
         self.v_mag = v_ref_pu
+
+    def flow(self, p_pu, q_pu, v_mag_pu, v_dc_pu,
+             p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
+        self.omega = self.w0 + self.cfg.k_p_pu * (p_ref_pu - p_pu)
+        self.v_mag = v_ref_pu
+        return {"theta": self.omega}
 ```
 
 The registered name can then be used at `units.<u>.ctrl.loops.<loop>.type`. Circuit element
 types can likewise be registered with `register_element_type`, and event types with
 `register_event_type`; each type owns a frozen parameter dataclass, so its file parameters use the
-same parsing and validation as built-in types. A user solver may implement the normal solver call
+same parsing and validation as built-in types. A custom loop used by ideal `averaging` implements
+its continuous outputs and state derivatives (`flow()` for a `SyncLaw`); a sampled-only loop still
+works with `switching` and `pwm_averaging`. A user solver may implement the normal solver call
 alone; event-aware solvers may additionally provide `settle()` and `parameters_changed()` hooks.
 
 A custom controller output stage can also be built with
@@ -306,7 +313,7 @@ pyproject.toml
 src/peslite/            the package: __init__.py and four code parts
   components/           what the system is made of
     network.py            three-phase source, R-L branch, bus (R-C node), element types
-    converter.py          bridge models (including their actuation timing) and dc link
+    converter.py          switching/PWM-averaged bridges, ideal continuous bridge and dc link
     adc.py                sampling of a converter's measurements, averaging window, oversampling
     pwm.py                PWM timer, duty registers, carrier and modulators used inside a bridge
   control/              the converter's controller
@@ -322,7 +329,7 @@ src/peslite/            the package: __init__.py and four code parts
     unit.py               power stage, ADC/PWM peripherals, controller, protection and trip actions
     system.py             the network, units and elements as one model; applies events
   solver/               the numerical kernel and the run
-    model.py              subsystems, their connections and named states
+    model.py              subsystems, connections, automatic algebraic-loop solving and named states
     energy.py             energy declarations, power balance, port-Hamiltonian report
     integrators.py        solver interface and single-rate integrators
     multirate.py          multirate integration and make_solver

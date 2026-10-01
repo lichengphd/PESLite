@@ -155,7 +155,8 @@ def test_resolved_cli_prints_a_loadable_complete_file():
         ]) == 0
     tree = yaml.safe_load(stream.getvalue())
     assert tree["simulation"]["t_end"] == 0.5
-    assert tree["units"]["vsc"]["ctrl"]["period"] == pytest.approx(1e-4)
+    assert tree["units"]["vsc"]["ctrl"]["period"] is None
+    assert tree["units"]["vsc"]["ctrl"]["computation"] is None
     from_dict(tree)
 
 
