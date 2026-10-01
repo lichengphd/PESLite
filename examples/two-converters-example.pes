@@ -57,6 +57,6 @@ events:
   grid_f: {type: set, t: 0.75, set: {sources.grid.f: 49.8}}
 simulation:
   t_end: 1.0
-  solver: {dt: 12.5e-6}
+  solver: {dt: 25e-6}
   stop_on_trip: 0
-  output: {ctrl_every: 10}
+  output: {record_every: 10}

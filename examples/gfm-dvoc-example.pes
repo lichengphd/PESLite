@@ -15,7 +15,6 @@ units:
       vdc_ref: 1500.0
       source: {type: voltage}
     pwm: {f_sw: 20000.0, modulation_limit: 0.95}
-    bridge: {model: pwm_averaging}
     ctrl:
       type: gfm
       loops:
@@ -30,5 +29,5 @@ events:
   grid_f: {type: set, t: 4.0, set: {sources.grid.f: 49.8}}
 simulation:
   t_end: 6.0
-  solver: {dt: 12.5e-6}
-  output: {ctrl_every: 10}
+  solver: {dt: 25e-6}
+  output: {record_every: 10}

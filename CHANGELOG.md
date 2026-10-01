@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- The default per-unit bridge model is now ideal `averaging`. The mutually exclusive
+  `--switching`, `--pwm-averaging` and `--averaging` options override every unit for one run.
+- Bundled examples use the default averaged bridge and a fixed solver step of 25 us.
+- `simulation.output.record_every` controls controller-log decimation; the former
+  `ctrl_every` name is removed.
+
 ## 0.1.4
 
 ### The controller as a block (#1)
@@ -58,7 +66,7 @@
 - With `simulation.output.states: 0`, only the terminal state row is retained for
   `final_states()`. Disabled energy output keeps the energy summary checks but no energy history.
 - Controller logs consistently use the abbreviation: `r.ctrl`, `ctrl.<unit>.csv` and
-  `simulation.output.ctrl_every`; the old full-word interfaces are removed.
+  `simulation.output.record_every`; the old full-word interfaces are removed.
 
 ### Per-unit bridge models (#3)
 

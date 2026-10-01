@@ -26,8 +26,8 @@ def test_unit_delegates_sampling_to_adc_and_actuation_to_bridge():
     unit = peslite.Simulation(p).unit()
 
     assert isinstance(unit.adc, ADC)
-    assert isinstance(unit.bridge, peslite.PWMBridge)
-    assert isinstance(unit.bridge, PWM)
+    assert isinstance(unit.bridge, AveragingBridge)
+    assert not isinstance(unit.bridge, PWM)
     assert not hasattr(unit, "pwm")
     assert isinstance(unit.protection, peslite.Protection)
     assert peslite.ADC is ADC and peslite.PWM is PWM
@@ -147,7 +147,10 @@ def test_ideal_averaging_keeps_only_the_last_command_for_one_equivalent_load():
 
 
 def test_duty_register_states_are_owned_by_pwm():
-    params = peslite.load(EXAMPLES / "gfl-example.pes")
+    params = peslite.load(
+        EXAMPLES / "gfl-example.pes",
+        **{"units.vsc.bridge.model": "switching"},
+    )
     names = set(peslite.Simulation(params).state_names())
     for part in ("", "shadow."):
         assert {f"vsc.pwm.{part}d_{phase}" for phase in "abc"} <= names

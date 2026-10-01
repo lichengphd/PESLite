@@ -429,7 +429,7 @@ class BridgeParams:
     PWM-equivalent output delay and no PWM peripheral.
     """
 
-    model: str = "switching"
+    model: str = "averaging"
 
     _choices = {"model": ("switching", "pwm_averaging", "averaging")}
 
@@ -550,7 +550,7 @@ class OutputParams:
     """Histories streamed by ``Simulation.run`` into its output directory."""
 
     period: float = 5e-4  # plant snapshot interval, s
-    ctrl_every: int = 1  # keep every n-th controller sample
+    record_every: int = 1  # keep every n-th controller sample
     states: bool = True  # states.csv
     signals: bool = False  # plant.csv and ctrl.<unit>.csv
     energy: bool = False  # energy.csv

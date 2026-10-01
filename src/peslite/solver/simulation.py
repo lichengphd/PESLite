@@ -613,7 +613,7 @@ class Simulation:
         t_end = p.simulation.t_end if t_end is None else t_end
         output = p.simulation.output
         log_period = output.period
-        ctrl_every = max(1, output.ctrl_every)
+        record_every = max(1, output.record_every)
         stop_on_trip = p.simulation.stop_on_trip
         progress = p.simulation.progress
         progress_every = progress.period if progress.enable else 0.0
@@ -820,7 +820,7 @@ class Simulation:
                     k, out = done
                     if out.log is not None:
                         rec.last_ctrl_log[unit.name] = out.log
-                        if k % ctrl_every == 0:
+                        if k % record_every == 0:
                             rec.ctrl_sample(unit.name, t_stop, out.log)
             for unit in units:
                 if unit.actuate(t_stop, plant) and stop_on_trip:
@@ -1127,6 +1127,8 @@ def main(argv=None) -> int:
     ap.add_argument("--initial-time", type=float, default=None, metavar="T",
                     help="with a states.csv: start from the row at time T instead of the last row")
     bridge = ap.add_mutually_exclusive_group()
+    bridge.add_argument("--switching", action="store_true",
+                        help="run every unit with exact switching; this option wins over --set")
     bridge.add_argument("--pwm-averaging", action="store_true",
                         help="run every unit with PWM-period averaging; this option wins over --set")
     bridge.add_argument("--averaging", action="store_true",
@@ -1134,7 +1136,7 @@ def main(argv=None) -> int:
                              "this option wins over --set")
     ap.add_argument("--out", default=None,
                     help="output directory (default: output/<file name>, or "
-                         "a -pwm-averaging/-averaging suffix with the corresponding bridge option)")
+                         "a bridge-mode suffix with --switching/--pwm-averaging/--averaging)")
     ap.add_argument("--progress", type=float, default=None, metavar="SECONDS",
                     help="print a progress line every SECONDS of simulated time")
     ap.add_argument("--watch", action="append", default=None, metavar="NAME",
@@ -1162,7 +1164,9 @@ def main(argv=None) -> int:
                                                    for name in value.split(",") if name]
     p = load(config, initial=args.initial,
                     initial_time=args.initial_time, **overrides)
-    if args.pwm_averaging:
+    if args.switching:
+        p = p.replace(**{f"units.{name}.bridge.model": "switching" for name in p.units})
+    elif args.pwm_averaging:
         p = p.replace(**{f"units.{name}.bridge.model": "pwm_averaging" for name in p.units})
     elif args.averaging:
         p = p.replace(**{f"units.{name}.bridge.model": "averaging" for name in p.units})
@@ -1188,7 +1192,9 @@ def main(argv=None) -> int:
     if sim.ph_report is not None:
         print(f"structure: {sim.ph_report.verdict} (state coverage {sim.ph_report.coverage:.0%}"
               f"{'; ' + '; '.join(sim.energy_problems) if sim.energy_problems else ''})")
-    suffix = "-pwm-averaging" if args.pwm_averaging else "-averaging" if args.averaging else ""
+    suffix = ("-switching" if args.switching else
+              "-pwm-averaging" if args.pwm_averaging else
+              "-averaging" if args.averaging else "")
     out = Path(args.out) if args.out else _RESULTS / f"{config.stem}{suffix}"
     r = sim.run(out_dir=out, info={"config": str(config)})
     s = r.summary
