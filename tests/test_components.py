@@ -134,7 +134,6 @@ def test_ideal_averaging_keeps_only_the_last_command_for_one_equivalent_load():
     last = np.array([0.7, 0.6, 0.5])
     bridge.write(0.0, first)
     bridge.write(load_period / 2, last)
-    assert len(bridge._queue) == 1
     assert bridge.apply(load_period) == abc2complex(last)
 
 

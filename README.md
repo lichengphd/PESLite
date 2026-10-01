@@ -154,10 +154,10 @@ the following update interval. The interval's centre therefore places its effect
 t_load + T_load / 2
 ```
 
-and its effective delay is `t_load + T_load/2 - t_k`. With the default single update and nonzero computation
-this is `1.5 Ts`; zero computation gives `0.5 Ts`; double update with the default computation gives
-`0.75 Ts`. Other control/update grids are evaluated for each output. Before the first delayed
-output arrives, the source naturally keeps the start-up value. Its current output and delay
+and its effective delay is `t_load + T_load/2 - t_k`. With the default single update and nonzero
+computation this is `1.5 Ts`; zero computation gives `0.5 Ts`; double update with the default
+computation gives `0.75 Ts`. Other control/update grids are evaluated for each output. Before the
+first delayed output arrives, the source naturally keeps the start-up value. Its current output and delay
 history are bridge states saved as `<unit>.bridge.*`, so a saved row continues exactly.
 
 ## Example configurations
