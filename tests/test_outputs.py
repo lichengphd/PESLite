@@ -106,3 +106,47 @@ def test_continuation_uses_the_renamed_states(gfl, tmp_path):
     assert continued.states["vsc.ctrl.pll.integral_pu"][continued_index] == pytest.approx(
         result.states["vsc.ctrl.pll.integral_pu"][index], rel=1e-9
     )
+
+
+def test_disabled_state_output_collects_only_the_final_row(gfl, tmp_path):
+    simulation = peslite.Simulation(gfl(**{
+        "simulation.output.period": 5e-5,
+        "simulation.output.states": 0,
+    }))
+    read_flat = simulation._states.read_flat
+    calls = 0
+
+    def counted():
+        nonlocal calls
+        calls += 1
+        return read_flat()
+
+    simulation._states.read_flat = counted
+    result = simulation.run()
+    assert calls == 1
+    assert len(result.states["t"]) == 1
+    assert result.states["t"][0] == pytest.approx(result.summary["t_stop"])
+    assert result.final_states()["t"] == pytest.approx(result.summary["t_stop"])
+
+    written = result.save(tmp_path)
+    assert tmp_path / "states.csv" not in written
+    assert not (tmp_path / "states.csv").exists()
+
+
+def test_numeric_histories_are_numpy_backed_and_energy_history_is_optional(gfl):
+    without_energy = _run(gfl(**{
+        "simulation.output.period": 5e-5,
+        "simulation.output.energy": 0,
+    }))
+    assert without_energy.energy == {}
+    assert "energy_balance_max_rel" in without_energy.summary
+    histories = [without_energy.states, without_energy.plant, without_energy.control]
+    assert all(isinstance(values, np.ndarray) for history in histories for values in history.values())
+    assert len({id(values.base) for values in without_energy.states.values()}) == 1
+
+    with_energy = _run(gfl(**{
+        "simulation.output.period": 5e-5,
+        "simulation.output.energy": 1,
+    }))
+    assert len(with_energy.energy["t"]) == len(with_energy.t)
+    assert all(isinstance(values, np.ndarray) for values in with_energy.energy.values())

@@ -125,9 +125,10 @@ class SimulationResult:
         with Path(path).open("w", newline="") as fh:
             w = csv.writer(fh)
             w.writerow(keys)
-            columns = [self.states[k].tolist() for k in keys]
-            for row in zip(*columns):
-                w.writerow([repr(v) for v in row])
+            # Stream the arrays directly: converting every column with tolist() first duplicates
+            # the complete state table in memory immediately before it is written.
+            for row in zip(*(self.states[k] for k in keys)):
+                w.writerow([repr(float(v)) for v in row])
 
     def energy_to_csv(self, path: str | Path) -> None:
         keys = list(self.energy)
@@ -170,69 +171,155 @@ def _write(path: str | Path, cols: dict) -> None:
             w.writerow([f"{v:.10g}" for v in row])
 
 
-class Recorder:
-    """Collects snapshots during a run. ``keep_states=False`` keeps only the last state row."""
+class _NumericSeries:
+    """Append numeric values cheaply and compact each small batch into a NumPy array."""
 
-    def __init__(self, keep_states: bool = True) -> None:
-        self.t: list[float] = []
-        self.plant: dict[str, list] = {}
-        self.ctrl_t: dict[str, list[float]] = {}   # one time grid per unit
-        self.ctrl: dict[str, list] = {}
+    def __init__(self, block_values: int = 100) -> None:
+        self.block_values = block_values
+        self._blocks: list[np.ndarray] = []
+        self._pending: list[Any] = []
+        self._size = 0
+        self._array: np.ndarray | None = None
+
+    def __len__(self) -> int:
+        return self._size
+
+    @property
+    def last(self) -> Any:
+        if self._pending:
+            return self._pending[-1]
+        if self._blocks:
+            return self._blocks[-1][-1]
+        raise IndexError("last value of an empty series")
+
+    def append(self, value: Any) -> None:
+        if self._array is not None:
+            raise RuntimeError("cannot append after the recorded series has been finalised")
+        self._pending.append(value)
+        self._size += 1
+        if len(self._pending) == self.block_values:
+            self._flush()
+
+    def extend_constant(self, value: Any, count: int) -> None:
+        for _ in range(count):
+            self.append(value)
+
+    def _flush(self) -> None:
+        if self._pending:
+            self._blocks.append(np.asarray(self._pending))
+            self._pending.clear()
+
+    def array(self) -> np.ndarray:
+        if self._array is None:
+            self._flush()
+            if not self._blocks:
+                self._array = np.asarray([], dtype=float)
+            elif len(self._blocks) == 1:
+                self._array = self._blocks[0]
+            else:
+                self._array = np.concatenate(self._blocks)
+            self._blocks.clear()
+        return self._array
+
+
+class _NumericTable:
+    """Append a fixed set of float columns to NumPy blocks instead of Python float objects."""
+
+    def __init__(self, block_rows: int = 100) -> None:
+        self.keys: list[str] | None = None
+        self.block_rows = block_rows
+        self._blocks: list[np.ndarray] = []
+        self._pending: list[list[float]] = []
+        self._table: np.ndarray | None = None
+
+    def append(self, t: float, columns: Mapping[str, float]) -> None:
+        if self.keys is None:
+            self.keys = list(columns)
+        elif len(columns) != len(self.keys):
+            raise RuntimeError("the set of recorded columns changed during the run")
+        if self._table is not None:
+            raise RuntimeError("cannot append after the recorded table has been finalised")
+        self._pending.append([t, *columns.values()])
+        if len(self._pending) == self.block_rows:
+            self._flush()
+
+    def _flush(self) -> None:
+        if self._pending:
+            self._blocks.append(np.asarray(self._pending, dtype=float))
+            self._pending.clear()
+
+    def arrays(self) -> dict[str, np.ndarray]:
+        if self._table is None:
+            self._flush()
+            if not self._blocks:
+                self._table = np.empty((0, 0), dtype=float)
+            elif len(self._blocks) == 1:
+                self._table = self._blocks[0]
+            else:
+                self._table = np.concatenate(self._blocks, axis=0)
+            self._blocks.clear()
+        if self.keys is None:
+            return {}
+        return {name: self._table[:, index]
+                for index, name in enumerate(["t", *self.keys])}
+
+
+class Recorder:
+    """Collect snapshots; fixed-width state and energy rows use compact NumPy blocks."""
+
+    def __init__(self, keep_states: bool = True, keep_energy: bool = True) -> None:
+        self.t = _NumericSeries()
+        self.plant: dict[str, _NumericSeries] = {}
+        self.ctrl_t: dict[str, _NumericSeries] = {}   # one time grid per unit
+        self.ctrl: dict[str, _NumericSeries] = {}
         self.last_ctrl_log: dict[str, dict[str, float]] = {}
         self.keep_states = keep_states
-        self.state_keys: list[str] | None = None
-        self.state_t: list[float] = []
-        self.state_rows: list[list[float]] = []
-        self.energy_t: list[float] = []
-        self.energy_rows: dict[str, list] = {}
+        self.keep_energy = keep_energy
+        self._states = _NumericTable(block_rows=100 if keep_states else 1)
+        self._energy = _NumericTable()
 
     def energy_row(self, t: float, columns: dict[str, float]) -> None:
-        self.energy_t.append(t)
-        for k, v in columns.items():
-            self.energy_rows.setdefault(k, []).append(v)
+        if self.keep_energy:
+            self._energy.append(t, columns)
 
     def state_row(self, t: float, row: dict[str, float]) -> None:
-        if self.state_keys is None:
-            self.state_keys = list(row)
-        elif len(row) != len(self.state_keys):
-            raise RuntimeError("the set of named states changed during the run")
-        if not self.keep_states:
-            self.state_t.clear()
-            self.state_rows.clear()
-        self.state_t.append(t)
-        self.state_rows.append(list(row.values()))
+        self._states.append(t, row)
 
     def plant_snapshot(self, t: float, signals: dict[str, Any]) -> None:
         n_before = len(self.t)
         self.t.append(t)
         for k, v in signals.items():
-            self.plant.setdefault(k, []).append(v)
+            series = self.plant.get(k)
+            if series is None:
+                series = self.plant[k] = _NumericSeries()
+            series.append(v)
         for unit, log in self.last_ctrl_log.items():
             for k, v in log.items():
                 key = f"{unit}.ctrl.{k}"
                 if key not in self.plant:  # controller signal appearing after the first snapshots
-                    self.plant[key] = [math.nan] * n_before
+                    self.plant[key] = _NumericSeries()
+                    self.plant[key].extend_constant(math.nan, n_before)
                 self.plant[key].append(v)
 
     def control_sample(self, unit: str, t: float, log: dict[str, float]) -> None:
         """Record one controller's log at one of its sampling instants."""
-        self.ctrl_t.setdefault(unit, []).append(t)
+        times = self.ctrl_t.get(unit)
+        if times is None:
+            times = self.ctrl_t[unit] = _NumericSeries()
+        times.append(t)
         for k, v in log.items():
-            self.ctrl.setdefault(f"{unit}.{k}", []).append(v)
+            key = f"{unit}.{k}"
+            series = self.ctrl.get(key)
+            if series is None:
+                series = self.ctrl[key] = _NumericSeries()
+            series.append(v)
 
-    def arrays(self) -> tuple[np.ndarray, dict[str, np.ndarray], dict[str, np.ndarray], dict[str, np.ndarray]]:
-        plant = {k: np.asarray(v) for k, v in self.plant.items()}
-        ctrl = {f"{unit}.t": np.asarray(times) for unit, times in self.ctrl_t.items()}
-        ctrl.update({k: np.asarray(v) for k, v in self.ctrl.items()})
-        states: dict[str, np.ndarray] = {"t": np.asarray(self.state_t, dtype=float)}
-        if self.state_keys:
-            table = np.asarray(self.state_rows, dtype=float).reshape(len(self.state_rows), len(self.state_keys))
-            states.update({k: table[:, j] for j, k in enumerate(self.state_keys)})
-        energy: dict[str, np.ndarray] = {}
-        if self.energy_t:
-            energy = {"t": np.asarray(self.energy_t, dtype=float)}
-            energy.update({k: np.asarray(v, dtype=float) for k, v in self.energy_rows.items()})
-        return np.asarray(self.t), plant, ctrl, states, energy
+    def arrays(self) -> tuple[np.ndarray, dict[str, np.ndarray], dict[str, np.ndarray],
+                              dict[str, np.ndarray], dict[str, np.ndarray]]:
+        plant = {k: values.array() for k, values in self.plant.items()}
+        ctrl = {f"{unit}.t": times.array() for unit, times in self.ctrl_t.items()}
+        ctrl.update({k: values.array() for k, values in self.ctrl.items()})
+        return self.t.array(), plant, ctrl, self._states.arrays(), self._energy.arrays()
 
 
 # ------------------------------------------------------------------ reading results back
@@ -539,7 +626,7 @@ class Simulation:
         progress = p.simulation.progress
         progress_every = progress.period if progress.enable else 0.0
         watch = list(progress.watch) if progress.enable else []
-        rec = Recorder(keep_states=output.states)
+        rec = Recorder(keep_states=output.states, keep_energy=output.energy)
         wall0 = time.time()
 
         units = list(system.units.values())
@@ -578,15 +665,17 @@ class Simulation:
         coarse_reported = False
         stopped = False
         adc_inputs_changed = False
-        def snapshot(t_now: float) -> None:
+        def snapshot(t_now: float, final: bool = False) -> None:
             try:
                 with np.errstate(over="raise"):
                     mdl.sync(t_now, y)
                     rec.plant_snapshot(t_now, system.signals(t_now))
-                    rec.state_row(t_now, self._states.read_flat())
+                    if rec.keep_states or final:
+                        rec.state_row(t_now, self._states.read_flat())
                     if energy_on and _finite(y):
                         rep = mdl.energy_balance(t_now, y)
-                        rec.energy_row(t_now, rep.columns())
+                        if rec.keep_energy:
+                            rec.energy_row(t_now, rep.columns())
                         scale = rep.scale
                         worst["tellegen"] = max(worst["tellegen"], abs(rep.tellegen) / scale)
                         worst["balance"] = max(worst["balance"], rep.max_residual / scale)
@@ -691,7 +780,7 @@ class Simulation:
             advancing = t_stop > t_local + _EPS
             if advancing and advance(t_local, t_stop, event_due):
                 stopped = True
-                snapshot(t_local)
+                snapshot(t_local, final=True)
                 break
             # File events run before the coincident protection/control/PWM events.
             if event_due:
@@ -717,7 +806,7 @@ class Simulation:
                         if stop_on_trip:
                             stopped = True
             if stopped:
-                snapshot(t_local)
+                snapshot(t_local, final=True)
                 break
             # ADC samples due here, before any loop update
             for unit in units:
@@ -740,7 +829,7 @@ class Simulation:
                 for unit, out in shadow_writes:
                     unit.pwm.tick(t_stop, out.theta, out.omega)
                     unit.pwm.write_shadow(out.d_abc)
-                snapshot(t_local)
+                snapshot(t_local, final=True)
                 break
             # 1a. PWM compare-register loads due here, after coincident interrupts
             for unit in units:
@@ -796,8 +885,8 @@ class Simulation:
             for unit, out in shadow_writes:
                 unit.pwm.tick(t_local, out.theta, out.omega)
                 unit.pwm.write_shadow(out.d_abc)
-        if not rec.t or rec.t[-1] < t_local - _EPS:
-            snapshot(t_local)
+        if not rec.t or rec.t.last < t_local - _EPS:
+            snapshot(t_local, final=True)
         if stop_reason:
             warnings.warn(f"simulation stopped at t = {t_local:.6g} s: {stop_reason}", stacklevel=2)
         t_arr, plant_arrays, ctrl_arrays, state_arrays, energy_arrays = rec.arrays()

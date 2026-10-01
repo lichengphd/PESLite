@@ -185,6 +185,11 @@ a converter's timer grid. A saved row restores each converter's active and shado
 derives its computation progress and next timer points from that row's time, and restores any ADC
 averaging-window accumulators. An oversampled ADC's intermediate samples are not states, so its saved
 run must be continued from a control interrupt.
+With `simulation.output.states: 0`, no `states.csv` is written and only the terminal state is
+collected internally, so `final_states()` remains available without serialising every snapshot.
+Numeric histories are compacted into NumPy blocks in batches of 100 output rows rather than kept as
+individual Python objects. With `simulation.output.energy: 0`, energy checks still update the
+summary but their full time history is not retained.
 
 Output names use the same unit convention as input parameters: an SI value has no unit suffix,
 while a per-unit value ends in `_pu`. Runtime state paths are entity-first: physical states are

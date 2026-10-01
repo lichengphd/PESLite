@@ -16,6 +16,12 @@
   states.
 - Each averaged ADC channel keeps one window accumulator (`<unit>.meas.x_*`); the redundant
   absolute integral and window-opening copy (`x_*_open`) are removed.
+- With `simulation.output.states: 0`, only the terminal state row is collected instead of building
+  and discarding a full row at every snapshot. State CSV arrays are streamed directly when enabled,
+  without first duplicating the complete table as Python lists.
+- Numeric histories are compacted into NumPy blocks every 100 output rows instead of retaining
+  individual Python objects. Disabled energy output keeps the energy summary checks but no longer
+  retains the full energy history.
 
 ### Per-unit bridge models (#3)
 
