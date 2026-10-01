@@ -2,9 +2,10 @@
 event loop, and the command line (the ``peslite`` command).
 
 Between events the solver integrates the model; the events are those of the file, each unit's ADC
-samples, control interrupts, PWM loads, averaging-window openings and switching instants, and the
-snapshots. Order at a coincident instant: file events, over-current check, ADC samples, control
-interrupts, PWM loads, window opening, switching instants, snapshot.
+samples, control interrupts, PWM loads or delayed average-source updates, averaging-window
+openings and switching instants, and the snapshots. Order at a coincident instant: file events,
+over-current check, ADC samples, control interrupts, actuation, window opening, switching instants,
+snapshot.
 """
 
 from __future__ import annotations
@@ -404,7 +405,10 @@ class Simulation:
             self.solver = make_solver(p.simulation.solver, model=self.system.model,
                                       ratings=self._ratings())
         for unit in self.system.units.values():
-            for obj, proto in ((unit.ctrl, Controller), (unit.pwm.modulator, Modulator)):
+            checks = [(unit.ctrl, Controller)]
+            if unit.pwm is not None:
+                checks.append((unit.pwm.modulator, Modulator))
+            for obj, proto in checks:
                 if not isinstance(obj, proto):
                     raise TypeError(f"{unit.name}: {type(obj).__name__} does not satisfy the "
                                     f"{proto.__name__} protocol")
@@ -506,16 +510,18 @@ class Simulation:
         else:  # custom systems written for the original aggregate Stateful interface
             parts = [("", self.system)]
             for name, unit in self.system.units.items():
-                parts.extend([(f"{name}.ctrl", unit.ctrl), (f"{name}.pwm", unit.pwm)])
+                prefix = getattr(unit, "actuator_prefix", "pwm")
+                timer = getattr(unit, "timer", unit.pwm)
+                parts.extend([(f"{name}.ctrl", unit.ctrl), (f"{name}.{prefix}", timer)])
                 if unit.adc.averaging:
                     parts.append((f"{name}.meas", unit.adc))
         parts.append(("solver", self.solver))
         return parts
 
     def _start_duty(self) -> None:
-        """Put the controllers' start-up duty ratios in every PWM register."""
+        """Fill every PWM register or averaging delay line with its start-up duty ratios."""
         for unit in self.system.units.values():
-            unit.pwm.reset(np.asarray(unit.ctrl.initial_duty(), dtype=float))
+            unit.timer.reset(np.asarray(unit.ctrl.initial_duty(), dtype=float))
 
     def watch_values(self, t: float,
                      ctrl_logs: Mapping[str, Mapping[str, float]]) -> dict[str, float]:
@@ -546,7 +552,7 @@ class Simulation:
         aliases = dict(getattr(system, "state_aliases", {}))
         presets_of = getattr(system, "state_presets", None)
         presets = presets_of(t0) if presets_of is not None else {}
-        self._start_duty()  # so that the duty ratios and shadow registers have their states
+        self._start_duty()  # so that the PWM registers or averaging delay histories have states
         template = self._states.read()
         try:
             given = expand_aliases(self.p.simulation.initial.states, aliases)
@@ -581,14 +587,15 @@ class Simulation:
             align = getattr(unit.ctrl, "align_startup", None)
             if align is not None:
                 align(unit.ports.u_g(), unit.ports.u_dc())
-            unit.pwm.reset(np.asarray(unit.ctrl.initial_duty(), dtype=float))
-            self._states.load(values, [f"{name}.pwm"])
+            unit.timer.reset(np.asarray(unit.ctrl.initial_duty(), dtype=float))
+            self._states.load(values, [f"{name}.{unit.actuator_prefix}"])
         # 3. controllers, measurement windows, solver
         self._continued = set()
         self._windows_given = set()
         for name, unit in system.units.items():
             self._states.load(values, [f"{name}.ctrl"])
-            if any(key.startswith((f"{name}.ctrl.", f"{name}.pwm.")) for key in values):
+            if any(key.startswith((f"{name}.ctrl.", f"{name}.{unit.actuator_prefix}."))
+                   for key in values):
                 self._continued.add(name)
             if unit.adc.averaging:
                 self._states.load(values, [f"{name}.meas"])
@@ -637,15 +644,19 @@ class Simulation:
         if parameters_changed is not None:
             parameters_changed()
         for unit in units:
-            sync = unit.ctrl.initial_sync() if hasattr(unit.ctrl, "initial_sync") else (None, None)
-            mdl.set_zoh_input(unit.zoh, unit.pwm.start(t_start, sync, unit.name in self._continued))
-        # The loaded compare registers determine the bridge at the exact start time.  Seed every
-        # ADC from that side of the held-input change, then reconstruct its timer/window position.
+            if unit.pwm is not None:
+                sync = unit.ctrl.initial_sync() if hasattr(unit.ctrl, "initial_sync") else (None, None)
+                q = unit.pwm.start(t_start, sync, unit.name in self._continued)
+            else:
+                q = unit.averaging.start(t_start, unit.name in self._continued)
+            mdl.set_zoh_input(unit.zoh, q)
+        # The loaded actuator state determines the bridge at the exact start time. Seed every ADC
+        # from that side of the held-input change, then reconstruct its timer/window position.
         mdl.sync(t_start, y)
         for unit in units:
             unit.adc.seed()
-            pwm = unit.pwm
-            unit.adc.start(t_start, pwm.interrupt(pwm.k - 1), pwm.t_interrupt,
+            timer = unit.timer
+            unit.adc.start(t_start, timer.interrupt(timer.k - 1), timer.t_interrupt,
                            held=unit.name not in self._windows_given)
             unit.adc.latest = unit.adc.measure(t_start)
         ctrl_names = {
@@ -757,7 +768,7 @@ class Simulation:
             out = unit.ctrl(t_k, unit.adc.sample(t_k))
             if out.log is not None:
                 rec.last_ctrl_log[unit.name] = out.log
-                if unit.pwm.k % ctrl_every == 0:
+                if unit.timer.k % ctrl_every == 0:
                     rec.ctrl_sample(unit.name, t_k, out.log)
             new_trip = out.tripped and not tripped[unit.name]
             if new_trip:
@@ -776,12 +787,17 @@ class Simulation:
             t_log = n_log * log_period
             t_stop = t_log if t_log < t_final - _EPS else t_final  # the earliest event of all
             for unit in units:
-                pwm, adc = unit.pwm, unit.adc
-                t_c = pwm.t_next
+                timer, adc = unit.timer, unit.adc
+                t_c = timer.t_next
                 t_stop = min(t_stop, t_c if t_c < t_final - _EPS else t_final,
-                             pwm.t_load if pwm.t_load < t_final - _EPS else t_final,
-                             pwm.next_switch, adc.t_window(t_c),
-                             adc.t_sample(pwm.interrupt(pwm.k - 1)))
+                             adc.t_window(t_c), adc.t_sample(timer.interrupt(timer.k - 1)))
+                if unit.pwm is not None:
+                    pwm = unit.pwm
+                    t_stop = min(t_stop,
+                                 pwm.t_load if pwm.t_load < t_final - _EPS else t_final,
+                                 pwm.next_switch)
+                else:
+                    t_stop = min(t_stop, unit.averaging.t_apply)
             if actions:
                 t_stop = min(t_stop, actions[0][0])
             event_due = bool(actions and actions[0][0] <= t_stop + _EPS)
@@ -804,8 +820,11 @@ class Simulation:
                 adc_inputs_changed = True
             # 0. over-current check of units whose switching interval ends here
             for unit in units:
-                pwm = unit.pwm
-                ends = abs(pwm.next_switch - t_stop) < _EPS or abs(pwm.load_end - t_stop) < _EPS
+                if unit.pwm is not None:
+                    ends = (abs(unit.pwm.next_switch - t_stop) < _EPS
+                            or abs(unit.pwm.load_end - t_stop) < _EPS)
+                else:
+                    ends = abs(unit.averaging.t_apply - t_stop) < _EPS
                 check = getattr(unit.ctrl, "fast_check", None)
                 if ends and check is not None and not tripped[unit.name]:
                     mdl.set_states(y)
@@ -818,15 +837,18 @@ class Simulation:
                 break
             # ADC samples due here, before any loop update
             for unit in units:
-                if abs(unit.adc.t_sample(unit.pwm.interrupt(unit.pwm.k - 1)) - t_stop) < _EPS:
+                timer = unit.timer
+                if abs(unit.adc.t_sample(timer.interrupt(timer.k - 1)) - t_stop) < _EPS:
                     mdl.sync(t_local, y)
                     unit.adc.peek(t_local)
             # 1. control interrupts due here
             shadow_writes = []
             for unit in units:
-                if abs(unit.pwm.t_next - t_stop) < _EPS and t_stop < t_final - _EPS:
+                if abs(unit.timer.t_next - t_stop) < _EPS and t_stop < t_final - _EPS:
                     out, stop = interrupt(unit, t_stop)
-                    if unit.pwm.computation == 0.0:
+                    if unit.averaging is not None:
+                        unit.averaging.write(t_stop, out.d_abc)
+                    elif unit.pwm.computation == 0.0:
                         unit.pwm.tick(t_stop, out.theta, out.omega)
                         unit.pwm.write_shadow(out.d_abc)
                     else:
@@ -841,7 +863,8 @@ class Simulation:
                 break
             # 1a. PWM compare-register loads due here, after coincident interrupts
             for unit in units:
-                if abs(unit.pwm.t_load - t_stop) < _EPS and t_stop < t_final - _EPS:
+                if (unit.pwm is not None and abs(unit.pwm.t_load - t_stop) < _EPS
+                        and t_stop < t_final - _EPS):
                     load_pwm(unit, t_stop)
             # A nonzero computation starts after any coincident load has consumed the old shadow.
             for unit, out in shadow_writes:
@@ -849,12 +872,18 @@ class Simulation:
                 unit.pwm.write_shadow(out.d_abc)
             # 1b. an averaging window shorter than the PWM update period opens here
             for unit in units:
-                if abs(unit.adc.t_window(unit.pwm.t_next) - t_stop) < _EPS:
+                if abs(unit.adc.t_window(unit.timer.t_next) - t_stop) < _EPS:
                     mdl.sync(t_local, y)
                     unit.adc.open()
             # 2. switching instants due here
             for unit in units:
-                for q in unit.pwm.switches(t_stop):
+                if unit.pwm is not None:
+                    values = unit.pwm.switches(t_stop)
+                elif abs(unit.averaging.t_apply - t_stop) < _EPS:
+                    values = [unit.averaging.apply(t_stop)]
+                else:
+                    values = []
+                for q in values:
                     mdl.set_zoh_input(unit.zoh, q)
                     adc_inputs_changed = True
             # An averaging interval after a plant or held-input jump starts from the value on the
@@ -880,19 +909,24 @@ class Simulation:
             # state after that instant, exactly as the same row in a longer run does.
             shadow_writes = []
             for unit in units:
-                if abs(unit.pwm.t_next - t_local) < _EPS:
+                if abs(unit.timer.t_next - t_local) < _EPS:
                     out, _stop = interrupt(unit, t_local)
-                    if unit.pwm.computation == 0.0:
+                    if unit.averaging is not None:
+                        unit.averaging.write(t_local, out.d_abc)
+                    elif unit.pwm.computation == 0.0:
                         unit.pwm.tick(t_local, out.theta, out.omega)
                         unit.pwm.write_shadow(out.d_abc)
                     else:
                         shadow_writes.append((unit, out))
             for unit in units:
-                if abs(unit.pwm.t_load - t_local) < _EPS:
+                if unit.pwm is not None and abs(unit.pwm.t_load - t_local) < _EPS:
                     load_pwm(unit, t_local)
             for unit, out in shadow_writes:
                 unit.pwm.tick(t_local, out.theta, out.omega)
                 unit.pwm.write_shadow(out.d_abc)
+            for unit in units:
+                if unit.averaging is not None and abs(unit.averaging.t_apply - t_local) < _EPS:
+                    mdl.set_zoh_input(unit.zoh, unit.averaging.apply(t_local))
         if rec.last_t is None or rec.last_t < t_local - _EPS:
             snapshot(t_local, final=True)
         if stop_reason:
@@ -975,7 +1009,7 @@ class SystemLoop:
 
         self._cls = Simulation
         self._factories = dict(sim._factories)
-        self.periods = [float(u.pwm.period) for u in sim.units.values()]
+        self.periods = [float(u.timer.period) for u in sim.units.values()]
         for u in sim.units.values():
             self.periods.extend(T for T in getattr(u.ctrl, "periods", {}).values() if T)
         self.period = macro_period(self.periods)
@@ -1172,11 +1206,15 @@ def main(argv=None) -> int:
                     help="initial values: a states.csv row or a simulation file's simulation.initial block")
     ap.add_argument("--initial-time", type=float, default=None, metavar="T",
                     help="with a states.csv: start from the row at time T instead of the last row")
-    ap.add_argument("--pwm-averaging", action="store_true",
-                    help="run every unit with PWM-period averaging; this option wins over --set")
+    bridge = ap.add_mutually_exclusive_group()
+    bridge.add_argument("--pwm-averaging", action="store_true",
+                        help="run every unit with PWM-period averaging; this option wins over --set")
+    bridge.add_argument("--averaging", action="store_true",
+                        help="run every unit as a delayed ideal averaged voltage source; "
+                             "this option wins over --set")
     ap.add_argument("--out", default=None,
                     help="output directory (default: output/<file name>, or "
-                         "output/<file name>-pwm-averaging with --pwm-averaging)")
+                         "a -pwm-averaging/-averaging suffix with the corresponding bridge option)")
     ap.add_argument("--progress", type=float, default=None, metavar="SECONDS",
                     help="print a progress line every SECONDS of simulated time")
     ap.add_argument("--watch", action="append", default=None, metavar="NAME",
@@ -1206,6 +1244,8 @@ def main(argv=None) -> int:
                     initial_time=args.initial_time, **overrides)
     if args.pwm_averaging:
         p = p.replace(**{f"units.{name}.bridge.model": "pwm_averaging" for name in p.units})
+    elif args.averaging:
+        p = p.replace(**{f"units.{name}.bridge.model": "averaging" for name in p.units})
     if args.watch and not p.simulation.progress.enable:
         ap.error("--watch prints on the progress lines: add --progress SECONDS")
     if args.resolved:
@@ -1219,7 +1259,7 @@ def main(argv=None) -> int:
         print(sim.ph_report)
         return 0
     units = ", ".join(f"{n} ({u.ctrl.type}, {u.bridge.model.replace('_', ' ')}, "
-                      f"{sim.units[n].pwm.describe()})"
+                      f"{sim.units[n].timer.describe()})"
                       for n, u in p.units.items())
     print(f"peslite: {config}  units={units}  "
           f"solver={p.simulation.solver.type}/{p.simulation.solver.method}  "
@@ -1228,7 +1268,7 @@ def main(argv=None) -> int:
     if sim.ph_report is not None:
         print(f"structure: {sim.ph_report.verdict} (state coverage {sim.ph_report.coverage:.0%}"
               f"{'; ' + '; '.join(sim.energy_problems) if sim.energy_problems else ''})")
-    suffix = "-pwm-averaging" if args.pwm_averaging else ""
+    suffix = "-pwm-averaging" if args.pwm_averaging else "-averaging" if args.averaging else ""
     out = Path(args.out) if args.out else _RESULTS / f"{config.stem}{suffix}"
     r = sim.run(out_dir=out, info={"config": str(config)})
     s = r.summary

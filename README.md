@@ -50,8 +50,11 @@ peslite gfl-example --set simulation.t_end=1 --set units.vsc.ctrl.computation=2e
 peslite gfl-example --set simulation.solver.type=adaptive --set simulation.solver.method=DP45
 peslite gfm-droop-example --set units.vsc.bridge.model=switching
 
-# average every converter for this run; print progress with selected quantities
+# select either averaged bridge model for every converter in this run
 peslite gfl-example --pwm-averaging
+peslite gfl-example --averaging
+
+# print progress with selected quantities
 peslite gfl-example --progress 0.1 --watch vsc.vdc_pu --watch vsc.i_c
 
 # continue a run from its last saved state (or from time T with --initial-time T)
@@ -114,29 +117,46 @@ disconnected or retuned by events; a small impedance can be used to model a faul
 
 ## Bridge models
 
-Each converter selects its own bridge model, so switching and PWM-averaged converters can share a
-system:
+Each converter selects its own bridge model, so all three models can share a system:
 
 ```yaml
 units:
   vsc:
-    bridge: {model: pwm_averaging}  # switching | pwm_averaging
+    bridge: {model: averaging}  # switching | pwm_averaging | averaging
 ```
 
 | `model` | Behaviour |
 |---|---|
 | `switching` | ideal switches at the exact carrier-comparison instants |
 | `pwm_averaging` | the active duty ratios are continuous bridge values until the next PWM register load; no carrier ripple |
+| `averaging` | an ideal controlled voltage source driven through a PWM-equivalent output delay; no PWM peripheral |
 
 `--pwm-averaging` selects `pwm_averaging` for every converter for one run without editing the file.
-It takes precedence over a `bridge.model` command-line override, and uses
-`output/<name>-pwm-averaging` as the default result directory.
+`--averaging` similarly selects `averaging`; the two options are mutually exclusive. They take
+precedence over a `bridge.model` command-line override and use `output/<name>-pwm-averaging` and
+`output/<name>-averaging`, respectively, as their default result directories.
 
 PWM averaging supports fixed and adaptive solvers and asynchronous or synchronous PWM. It keeps
 the same timer, active/shadow registers, computation eligibility and single/double register-load
 timing as switching. With single update a duty is held for one carrier period; with double update
 it may load at each carrier valley and peak. An asynchronous carrier phase still shifts that
 unit's control interrupts and loads, although the carrier waveform itself is not evaluated.
+
+Ideal averaging has its own delayed-source implementation: it does not construct a PWM modulator,
+timer or active/shadow registers. For a controller output at `t_k`, let `t_load` be the first
+equivalent register-load instant at or after `t_k + ctrl.computation`, and let `T_load` be one
+carrier period for single update or half a carrier period for double update. The controlled source
+applies that output at
+
+```text
+t_load + T_load / 2
+```
+
+so its delay is `t_load + T_load/2 - t_k`. With the default single update and nonzero computation
+this is `1.5 Ts`; zero computation gives `0.5 Ts`; double update with the default computation gives
+`0.75 Ts`. Other control/update grids are evaluated for each output. Before the first delayed
+output arrives, the source naturally keeps the start-up value. Its current output and delay
+history are saved as `<unit>.averaging.*`, so a saved row continues exactly.
 
 ## Example configurations
 
@@ -161,7 +181,7 @@ unit's control interrupts and loads, although the carrier waveform itself is not
 | `simulation.output.period` | snapshot interval, s |
 | `simulation.energy_check` | `warn` \| `strict` \| `off` |
 | `simulation.progress` | `{enable: 1, period: 0.1, watch: [...]}`; CLI: `--progress`, `--watch` |
-| `units.<u>.bridge.model` | `switching` \| `pwm_averaging`; CLI: `--pwm-averaging` |
+| `units.<u>.bridge.model` | `switching` \| `pwm_averaging` \| `averaging`; CLI: `--pwm-averaging`, `--averaging` |
 | `units.<u>.ctrl.type` | `gfl` \| `gfm` \| `custom` |
 | `units.<u>.ctrl.period` / `.computation` | control-interrupt period and computation time, s |
 | `units.<u>.ctrl.loops.<loop>.period` | loop period, an integer multiple of `ctrl.period` |
@@ -181,9 +201,9 @@ unit's control interrupts and loads, although the carrier waveform itself is not
 | `simulation.pes` | complete resolved simulation file; loading it repeats the run |
 
 `simulation.initial.t` and `simulation.t_end` are used exactly; neither is aligned or rounded to
-a converter's timer grid. A saved row restores each converter's active and shadow PWM registers,
-derives its computation progress and next timer points from that row's time, and restores any ADC
-averaging-window accumulators. An oversampled ADC's intermediate samples are not states, so its saved
+a converter's timer grid. A saved row restores either the active/shadow PWM registers or the ideal
+average source and its delay history, derives the next timer points from that row's time, and
+restores any ADC averaging-window accumulators. An oversampled ADC's intermediate samples are not states, so its saved
 run must be continued from a control interrupt.
 With `simulation.output.states: 0`, no `states.csv` is written and only the terminal state is
 collected internally, so `final_states()` remains available without serialising every snapshot.

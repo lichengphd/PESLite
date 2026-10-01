@@ -62,7 +62,8 @@ units:                     # converters, one entry each
       # sync: asynchronous # asynchronous | synchronous (carrier locked to the controller angle)
       # carrier_phase: 0.0 # carrier position at t = 0, in periods
 
-    # bridge: {model: switching}  # switching | pwm_averaging; CLI: --pwm-averaging
+    # bridge: {model: switching}  # switching | pwm_averaging | averaging
+    #                              # CLI: --pwm-averaging | --averaging
 
     ctrl:
       type: gfl            # default wiring: gfl | gfm | custom (explicit connections and outputs)

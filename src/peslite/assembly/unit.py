@@ -1,4 +1,4 @@
-"""A converter unit: dc link, bridge and filter branch, its ADC, controller and PWM.
+"""A converter unit: dc link, bridge and filter branch, its ADC, controller and actuation.
 
 Plant quantities are in SI; the controller works in the unit's pu bases.
 """
@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Any, Mapping, Optional
 
 from ..components.adc import ADC, MeasurementPorts
+from ..components.averaging import AveragingActuator
 from ..components.converter import Bridge, make_dclink
 from ..components.network import RLBranch
 from ..components.pwm import PWM, Modulator, make_modulator
@@ -22,7 +23,8 @@ class Unit:
     """One converter unit built from its parameter section, connected to ``bus``.
 
     ``ctrl`` and ``modulator`` replace the parts built from the section. The unit samples with
-    ``adc``, controls with ``ctrl`` and switches its bridge through ``pwm``.
+    ``adc`` and controls through either its PWM peripheral or an independently delayed ideal
+    averaged bridge.
     Events connect or disconnect its filter and DC source and may retune runtime parameters.
     """
 
@@ -64,10 +66,22 @@ class Unit:
         # ------------------------------------------------------------ control
         self.ctrl = ctrl if ctrl is not None else make_controller(cfg, sc)
         pwm = cfg.pwm
-        self.pwm = PWM(
-            T_c, pwm.load_period, pwm.grid_offset, cfg.ctrl.computation, pwm.switching_period,
-            modulator if modulator is not None else make_modulator(pwm, cfg.base.f0, cfg.bridge),
-        )
+        self.pwm: PWM | None = None
+        self.averaging: AveragingActuator | None = None
+        if cfg.bridge.model == "averaging":
+            if modulator is not None:
+                raise ValueError(f"{name}: an averaging bridge does not use a PWM modulator")
+            self.averaging = AveragingActuator(
+                T_c, pwm.load_period, pwm.grid_offset, cfg.ctrl.computation)
+            self.timer = self.averaging
+            self.actuator_prefix = "averaging"
+        else:
+            self.pwm = PWM(
+                T_c, pwm.load_period, pwm.grid_offset, cfg.ctrl.computation, pwm.switching_period,
+                modulator if modulator is not None else make_modulator(pwm, cfg.base.f0, cfg.bridge),
+            )
+            self.timer = self.pwm
+            self.actuator_prefix = "pwm"
         self.zoh = f"{name}.q"                   # model label of the bridge's held switching state
 
     # ---------------------------------------------------------------- assembly
@@ -102,7 +116,7 @@ class Unit:
     def state_parts(self) -> list[tuple[str, Any]]:
         """Return this unit's fixed state owners and their public prefixes."""
         parts = [(self.name, self), (f"{self.name}.ctrl", self.ctrl),
-                 (f"{self.name}.pwm", self.pwm)]
+                 (f"{self.name}.{self.actuator_prefix}", self.timer)]
         if self.adc.averaging:
             parts.append((f"{self.name}.meas", self.adc))
         return parts

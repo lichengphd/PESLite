@@ -37,6 +37,13 @@
   single/double update timing of switching and supports fixed/adaptive solvers and
   asynchronous/synchronous PWM. The former solver-time-step averaging mode and its `over`
   parameter are removed.
+- `units.<u>.bridge.model: averaging` and CLI `--averaging` select a separate ideal controlled
+  voltage source with no PWM peripheral. Each controller output is delayed to the centre of the
+  first equivalent PWM update interval available after `ctrl.computation`; this gives `1.5 Ts`
+  with the defaults and follows `pwm.update`, carrier timing and computation parameters otherwise.
+  The initial output fills the delay history automatically, and `<unit>.averaging.*` states make
+  continuation from any saved output row exact. `--averaging` uses the `-averaging` result suffix
+  and is mutually exclusive with `--pwm-averaging`.
 
 ### Progress lines and watched quantities (#3)
 
@@ -59,7 +66,7 @@
 - Project version is 0.1.4. The root `examples/` directory remains data-only, keeps the
   `*-example.pes` names and is included in the wheel. The PEP 639 `AGPL-3.0-only` metadata is
   unchanged.
-- Added Issue #3 acceptance coverage for every bundled file under both completed bridge models,
+- Added Issue #3 acceptance coverage for every bundled file under all three bridge models,
   mixed-model systems, CLI precedence and output paths, solver/PWM compatibility, progress values,
   aliases, complex magnitudes and run invariance.
 

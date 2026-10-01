@@ -4,11 +4,13 @@ import ast
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 import peslite
 from conftest import EXAMPLES
 from peslite.components import (
     ADC,
+    AveragingActuator,
     MeasurementPorts,
     PWM,
     ZOH,
@@ -89,6 +91,28 @@ def test_pwm_owns_timer_registers_and_switching_schedule():
     assert pwm.next_switch == float("inf")
     pwm.load(1e-3)
     assert pwm.active[0] == 0.8
+
+
+def test_ideal_averaging_holds_its_initial_value_until_the_delayed_output_arrives():
+    period = 50e-6
+    initial = np.array([0.2, 0.4, 0.6])
+    command = np.array([0.8, 0.7, 0.6])
+    actuator = AveragingActuator(period, period, 0.0, computation=1e-6)
+    actuator.reset(initial)
+    assert actuator.start(0.0, continued=False) == abc2complex(initial)
+
+    actuator.write(period, command)
+    assert actuator.delay(period) == pytest.approx(1.5 * period)
+    assert actuator.t_apply == pytest.approx(2.5 * period)
+    assert abc2complex(actuator.active) == abc2complex(initial)
+    assert actuator.apply(2.5 * period) == abc2complex(command)
+
+
+def test_ideal_averaging_delay_follows_computation_and_pwm_update():
+    period = 50e-6
+    assert AveragingActuator(period, period, 0.0, 0.0).delay(period) == pytest.approx(0.5 * period)
+    assert AveragingActuator(period, period / 2, 0.0, 1e-6).delay(period) == pytest.approx(0.75 * period)
+    assert AveragingActuator(period, period / 2, 0.0, 30e-6).delay(period) == pytest.approx(1.25 * period)
 
 
 def test_duty_register_states_are_owned_by_pwm():

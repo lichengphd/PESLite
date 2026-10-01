@@ -428,12 +428,13 @@ class BridgeParams:
 
     ``"switching"`` follows the exact carrier-comparison edges. ``"pwm_averaging"`` keeps the
     PWM timer, duty registers and load timing but applies each active duty ratio continuously until
-    the next compare-register load.
+    the next compare-register load. ``"averaging"`` is an ideal controlled voltage source with the
+    PWM-equivalent output delay and no PWM peripheral.
     """
 
     model: str = "switching"
 
-    _choices = {"model": ("switching", "pwm_averaging")}
+    _choices = {"model": ("switching", "pwm_averaging", "averaging")}
 
 
 @dataclass(frozen=True)
