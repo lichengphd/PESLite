@@ -180,6 +180,12 @@ and PWM loads.
 | `summary.json` | run summary |
 | `simulation.pes` | complete resolved simulation file; loading it repeats the run |
 
+`simulation.initial.t` and `simulation.t_end` are used exactly; neither is aligned or rounded to
+a converter's timer grid. A saved row restores each converter's active and shadow PWM registers,
+derives its computation progress and next timer points from that row's time, and restores any ADC
+averaging-window integrals. An oversampled ADC's intermediate samples are not states, so its saved
+run must be continued from a control interrupt.
+
 Output names use the same unit convention as input parameters: an SI value has no unit suffix,
 while a per-unit value ends in `_pu`. Runtime state paths are entity-first: physical states are
 `<entity>.*`, while converter internals are `<unit>.ctrl.*`, `<unit>.pwm.*` and `<unit>.meas.*`.

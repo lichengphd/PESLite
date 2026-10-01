@@ -538,7 +538,7 @@ class InitialParams:
 
     ``states`` maps dotted state names to a number, ``[re, im]`` or ``.re``/``.im`` entries,
     or a keyword: ``source`` (bus source voltage at ``t``) or ``rated`` (unit DC reference).
-    ``t`` must lie on every unit's PWM update grid.
+    A run starts at ``t`` exactly; each unit resumes its own timer grid around that instant.
     """
 
     t: float = 0.0

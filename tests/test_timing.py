@@ -185,3 +185,60 @@ def test_duty_registers_are_states_and_loop_clocks_are_not(gfl):
     for part in ("", "shadow."):
         assert {f"vsc.pwm.{part}d_{phase}" for phase in "abc"} <= names
     assert not [name for name in names if ".clock." in name or ".pending." in name or "delay" in name]
+
+
+@pytest.mark.parametrize("over, t0", [
+    ({"units.vsc.pwm.update": "double", "units.vsc.ctrl.computation": 3e-5},
+     0.003005),  # computation is in progress
+    ({"units.vsc.pwm.carrier_phase": 0.3, "units.vsc.averaging.enable": 0},
+     0.003010),  # between timer points
+    ({"units.vsc.meas.average": "window", "units.vsc.meas.u_dc": "window",
+      "units.vsc.meas.window": 2.5e-5, "units.vsc.averaging.enable": 0},
+     0.003025),  # an ADC window is open
+])
+def test_a_run_continues_exactly_from_any_output_row(gfl, tmp_path, over, t0):
+    params = gfl(**{"simulation.t_end": 0.004, "simulation.output.period": 5e-6, **over})
+    whole = peslite.Simulation(params).run()
+    whole.save(tmp_path)
+
+    restarted = peslite.load(
+        tmp_path / "simulation.pes",
+        initial=tmp_path / "states.csv",
+        initial_time=t0,
+    )
+    continued = peslite.Simulation(restarted).run()
+
+    k0 = int(np.argmin(abs(whole.t - t0)))
+    assert whole.t[k0] == pytest.approx(t0)
+    assert np.array_equal(continued.t, whole.t[k0:])
+    for name, values in continued.states.items():
+        assert np.array_equal(values, whole.states[name][k0:]), name
+
+
+def test_initial_and_end_times_are_not_moved_to_a_pwm_grid(gfl):
+    t0, t1 = 3.0e-6, 123.0e-6
+    result = peslite.Simulation(gfl(**{
+        "simulation.initial.t": t0,
+        "simulation.t_end": t1,
+        "simulation.output.period": 10e-6,
+    })).run()
+    assert result.summary["t_start"] == t0
+    assert result.summary["t_stop"] == t1
+    assert result.states["t"][-1] == t1
+
+
+def test_an_oversampled_continuation_starts_at_an_interrupt(gfl):
+    over = {"units.vsc.meas.period": 2.5e-5, "units.vsc.pwm.carrier_phase": 0.3}
+    state = {"simulation.initial.states": {"vsc.ctrl.pll.integral_pu": 0.0}}
+    gfl(**over, **state, **{"simulation.initial.t": 3.5e-5 + 1e-4})
+    with pytest.raises(ConfigError, match="between two control interrupts"):
+        gfl(**over, **state, **{"simulation.initial.t": 1.25e-4})
+
+
+def test_a_window_open_before_a_new_run_uses_the_start_values(gfl):
+    over = {"units.vsc.meas.average": "window", "units.vsc.meas.u_dc": "window"}
+    shifted = peslite.Simulation(gfl(**over, **{"units.vsc.pwm.carrier_phase": 0.3})).run()
+    plain = peslite.Simulation(gfl(**over)).run()
+    for result in (shifted, plain):
+        assert result.control["vsc.vdc_pu"][0] == pytest.approx(1.0, abs=0.01)
+        assert result.control["vsc.vac_pu"][0] == pytest.approx(1.0, abs=0.02)

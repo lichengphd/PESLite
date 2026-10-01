@@ -13,6 +13,7 @@ import numpy as np
 
 from ..control.blocks import complex2abc
 from ..control.controller import Measurement
+from .pwm import TIME_EPS
 
 __all__ = ["MeasurementPorts", "ADC"]
 
@@ -72,11 +73,36 @@ class ADC:
     def averaging(self) -> bool:
         return bool(self.channels)
 
+    def start(self, t: float, last: float, next_: float, held: bool) -> None:
+        """Resume sampling at ``t`` between the interrupts ``last`` and ``next_``.
+
+        ADC integrals are named states, while the position of the sampler and whether the next
+        averaging window is open follow from ``t`` and its timer grid.  Samples already taken
+        between interrupts are not states; validation therefore permits a continued oversampled
+        run only at an interrupt.  For a new run, ``held`` makes a window which began before
+        ``t`` count the value at ``t`` over that preceding part.
+        """
+        self.n_samp = max(1, int(math.floor((t - last + TIME_EPS) / self.sample_period)) + 1)
+        length = self.length
+        self.window_open = length is None or self._full or t >= next_ - length - TIME_EPS
+        if length is not None and held and self.window_open:
+            self.held_before(max(0.0, t - (next_ - length)))
+        self.peeks = []
+        if self.n_samp > 1:  # a new run between interrupts: earlier samples use its start values
+            first = self.measure(t)
+            self.peeks = [dataclasses.replace(first, t=last + i * self.sample_period)
+                          for i in range(1, self.n_samp)]
+
     # ------------------------------------------------------------ the window
     def seed(self) -> None:
         """Take the current values as the start of the integrals (at the start of a run)."""
         values = self.ports.read()
         self._last = {c: values[c] for c in self.channels}
+
+    def held_before(self, duration: float) -> None:
+        """Count the current values as held for ``duration`` seconds before the run starts."""
+        for channel in self.channels:
+            self.opened[channel] -= self._last[channel] * duration
 
     def accumulate(self, dt: float) -> None:
         """Add the trapezoidal integral over the interval of length ``dt`` (s) ending now."""

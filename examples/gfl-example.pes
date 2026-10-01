@@ -148,8 +148,8 @@ simulation:                # how the model is simulated
     # sweeps: 2            # coupling sweeps for subsystems on their own step
     # linearisations: 3    # points of the split error bound (0: none)
   # initial:               # default: buses at their source's emf, dc capacitors at vdc_ref, the rest at zero
-  #   t: 0.0
-  #   states: {vsc.u_dc: 1450.0}  # names as in states.csv (--list-states); keywords: source, rated
+  #   t: 0.0               # exact start time; not moved to a control or PWM timer point
+  #   states: {vsc.u_dc: 1450.0}  # any states.csv row can continue a run; keywords: source, rated
   output:
     control_every: 10      # keep every 10th controller sample
     # period: 0.5e-3       # snapshot interval, s

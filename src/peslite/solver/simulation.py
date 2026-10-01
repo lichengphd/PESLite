@@ -507,14 +507,19 @@ class Simulation:
             align = getattr(unit.ctrl, "align_startup", None)
             if align is not None:
                 align(unit.ports.u_g(), unit.ports.u_dc())
-            unit.adc.seed()  # averaging window starts at t0
             unit.pwm.reset(np.asarray(unit.ctrl.initial_duty(), dtype=float))
             self._states.load(values, [f"{name}.pwm"])
         # 3. controllers, measurement windows, solver
+        self._continued = set()
+        self._windows_given = set()
         for name, unit in system.units.items():
             self._states.load(values, [f"{name}.ctrl"])
+            if any(key.startswith((f"{name}.ctrl.", f"{name}.pwm.")) for key in values):
+                self._continued.add(name)
             if unit.adc.averaging:
                 self._states.load(values, [f"{name}.meas"])
+                if any(key.startswith(f"{name}.meas.") for key in values):
+                    self._windows_given.add(name)
         self._states.load(values, ["solver"])
         return y
 
@@ -538,12 +543,10 @@ class Simulation:
         wall0 = time.time()
 
         units = list(system.units.values())
-        periods = [u.pwm.period for u in units]
-        t_start = min(round(p.simulation.initial.t / T) * T for T in periods)
+        t_start = p.simulation.initial.t
         if t_end <= t_start + _EPS:
             raise ValueError(f"t_end = {t_end} must be after the start time {t_start}")
-        # the run ends at the earliest period boundary at or after t_end
-        t_final = min(math.ceil((t_end - _EPS) / T) * T for T in periods)
+        t_final = t_end
         # trips already handled, by unit (a trip loaded with the initial states is handled at the first sample)
         tripped = {u.name: bool(getattr(u.ctrl, "tripped", False)) or u.tripped for u in units}
         averaging = [u for u in units if u.adc.averaging]  # units whose ADC averages
@@ -552,9 +555,15 @@ class Simulation:
             parameters_changed()
         for unit in units:
             sync = unit.ctrl.initial_sync() if hasattr(unit.ctrl, "initial_sync") else (None, None)
-            continued = any(name.startswith((f"{unit.name}.ctrl.", f"{unit.name}.pwm."))
-                            for name in p.simulation.initial.states)
-            mdl.set_zoh_input(unit.zoh, unit.pwm.start(t_start, sync, continued))
+            mdl.set_zoh_input(unit.zoh, unit.pwm.start(t_start, sync, unit.name in self._continued))
+        # The loaded compare registers determine the bridge at the exact start time.  Seed every
+        # ADC from that side of the held-input change, then reconstruct its timer/window position.
+        mdl.sync(t_start, y)
+        for unit in units:
+            unit.adc.seed()
+            pwm = unit.pwm
+            unit.adc.start(t_start, pwm.interrupt(pwm.k - 1), pwm.t_interrupt,
+                           held=unit.name not in self._windows_given)
             unit.adc.latest = unit.adc.measure(t_start)
         n_log = max(0, math.ceil(t_start / log_period - 1e-9))
         actions = deque(action for action in self._actions() if action[0] > t_start + _EPS)
@@ -568,6 +577,7 @@ class Simulation:
         stop_reason = ""
         coarse_reported = False
         stopped = False
+        adc_inputs_changed = False
         def snapshot(t_now: float) -> None:
             try:
                 with np.errstate(over="raise"):
@@ -637,11 +647,12 @@ class Simulation:
             mdl.set_states(y)
 
         def do_trip(unit: Unit) -> None:
-            nonlocal y
+            nonlocal y, adc_inputs_changed
             tripped[unit.name] = True
             settle_now()
             unit.trip()
             y = mdl.get_initial_values()
+            adc_inputs_changed = True
 
         def interrupt(unit: Unit, t_k: float):
             """Sample and run a controller; return its output and whether its trip stops the run."""
@@ -658,10 +669,13 @@ class Simulation:
 
         def load_pwm(unit: Unit, t_k: float) -> None:
             """Load the unit's PWM compare registers at ``t_k``."""
+            nonlocal adc_inputs_changed
             mdl.set_zoh_input(unit.zoh, unit.pwm.load(t_k))
+            adc_inputs_changed = True
 
         # ---------------------------------------------------------------- the event grid
         while True:
+            adc_inputs_changed = False
             t_log = n_log * log_period
             t_stop = t_log if t_log < t_final - _EPS else t_final  # the earliest event of all
             for unit in units:
@@ -690,6 +704,7 @@ class Simulation:
                 if parameters_changed is not None:
                     parameters_changed()
                 y = mdl.get_initial_values()
+                adc_inputs_changed = True
             # 0. over-current check of units whose switching interval ends here
             for unit in units:
                 pwm = unit.pwm
@@ -744,6 +759,13 @@ class Simulation:
             for unit in units:
                 for q in unit.pwm.switches(t_stop):
                     mdl.set_zoh_input(unit.zoh, q)
+                    adc_inputs_changed = True
+            # An averaging interval after a plant or held-input jump starts from the value on the
+            # new side.  Its integral/opening states do not change at the zero-duration edge.
+            if averaging and adc_inputs_changed:
+                mdl.sync(t_local, y)
+                for unit in averaging:
+                    unit.adc.seed()
             # 3. snapshots
             if abs(t_log - t_stop) < _EPS and t_stop < t_final - _EPS:
                 snapshot(t_local)

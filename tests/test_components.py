@@ -57,6 +57,20 @@ def test_adc_owns_oversampling_and_averaging_window_state():
     assert set(adc.get_state()) == {"x_v", "x_i", "x_v_open", "x_i_open"}
 
 
+def test_adc_reconstructs_its_sampling_position_from_the_start_time():
+    ports = MeasurementPorts(
+        u_g=lambda: 1 + 0j,
+        i_c=lambda: 2 + 0j,
+        i_c_state=lambda: 2 + 0j,
+        u_dc=lambda: 3.0,
+    )
+    adc = ADC(ports, period=1.0, samples=4)
+    adc.start(0.6, 0.0, 1.0, held=True)
+    assert adc.n_samp == 3
+    assert [sample.t for sample in adc.peeks] == [0.25, 0.5]
+    assert adc.t_sample(0.0) == 0.75
+
+
 def test_pwm_owns_timer_registers_and_switching_schedule():
     initial = np.array([0.2, 0.4, 0.6])
     pwm = PWM(period=1e-3, load_period=1e-3, offset=0.0, computation=2e-4,

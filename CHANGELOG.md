@@ -2,6 +2,19 @@
 
 ## 0.1.3
 
+### Digital control timing and continuation (#4)
+
+- Each converter owns its control-interrupt, PWM-load and ADC timer grids. A control result is
+  written to the PWM shadow registers at its interrupt and becomes eligible for an active-register
+  load after `ctrl.computation`; `pwm.update` selects valley-only or valley-and-peak loads.
+- PWM state paths are `<unit>.pwm.d_*` for the active compare registers and
+  `<unit>.pwm.shadow.d_*` for the shadow registers. Computation progress is derived from the saved
+  time and timer grid; there is no separate queue, `pending`, `ready` or configurable delay step.
+- Runs start at `simulation.initial.t` and end at `simulation.t_end` exactly. Continuing from a
+  state-table row restores PWM registers, computation progress, timer positions and ADC averaging
+  windows. An oversampled ADC continues from an interrupt because its intermediate samples are not
+  states.
+
 ### Per-unit bridge models (#3)
 
 - The bridge model is selected independently for each converter. A unit uses exact switching by
@@ -30,11 +43,8 @@
   `<unit>.meas.*`; global solver bookkeeping remains `solver.*`. Unit configuration uses the same
   abbreviations under `units.<unit>.ctrl` and `units.<unit>.meas`; old functional-first state names
   and the `control`/`measurement` configuration keys are not aliases.
-- Computation-delay queue states are owned by PWM and named
-  `<unit>.pwm.computation_delay.<index>.d_a/d_b/d_c`; there is no generic top-level `delay.*`
-  state domain. Their configuration is `units.<unit>.pwm.computation_delay.steps`, and the
-  replaceable Python part is `<unit>.pwm.computation_delay`; other kinds of latency keep their own
-  names and owners.
+- PWM register states use `<unit>.pwm.d_*` and `<unit>.pwm.shadow.d_*`; timing is derived rather
+  than exposed as clock, queue or generic `delay.*` states.
 - Project version is 0.1.3. The root `examples/` directory remains data-only, keeps the
   `*-example.pes` names and is included in the wheel. The PEP 639 `AGPL-3.0-only` metadata is
   unchanged.
