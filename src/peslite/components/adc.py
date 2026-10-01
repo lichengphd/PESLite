@@ -42,7 +42,7 @@ class ADC:
 
     The channels in ``channels`` (``"v"``, ``"i"``, ``"dc"``, each with its zero value) are averaged
     over a window of ``length`` s ending at the interrupt; the others are instantaneous.
-    Named states per averaged channel ``c``: ``x_c`` (integral) and ``x_c_open`` (integral at window start).
+    Named state per averaged channel ``c``: ``x_c`` (the integral accumulated in the open window).
     """
 
     def __init__(self, ports: MeasurementPorts, period: float, samples: int = 1, length: Optional[float] = None,
@@ -54,8 +54,7 @@ class ADC:
         self.length = float(length) if channels else None  # None: instantaneous sampling
         self.channels = tuple(channels)
         self._zero = channels
-        self.integral = dict(channels)  # the running integrals
-        self.opened = dict(channels)  # integrals at window start
+        self.accumulated = dict(channels)  # integrals since the current window opened
         self._last = dict(channels)  # previous sample
         self.period, self.samples = period, samples
         self.sample_period = period / samples
@@ -102,7 +101,7 @@ class ADC:
     def held_before(self, duration: float) -> None:
         """Count the current values as held for ``duration`` seconds before the run starts."""
         for channel in self.channels:
-            self.opened[channel] -= self._last[channel] * duration
+            self.accumulated[channel] += self._last[channel] * duration
 
     def accumulate(self, dt: float) -> None:
         """Add the trapezoidal integral over the interval of length ``dt`` (s) ending now."""
@@ -112,12 +111,13 @@ class ADC:
         half = 0.5 * dt
         for c in self.channels:
             now = values[c]
-            self.integral[c] += half * (self._last[c] + now)
+            if self.window_open:
+                self.accumulated[c] += half * (self._last[c] + now)
             self._last[c] = now
 
     def open(self) -> None:
         """Start the window ending at the next control interrupt."""
-        self.opened = dict(self.integral)
+        self.accumulated = dict(self._zero)
         self.window_open = True
 
     def t_window(self, t_next: float) -> float:
@@ -143,6 +143,8 @@ class ADC:
             self.window_open = self._full
             if self.window_open:
                 self.open()
+            else:
+                self.accumulated = dict(self._zero)
         if self.samples > 1:  # oversampling: this publication's samples, oldest first
             meas = dataclasses.replace(meas, samples=tuple(self.peeks) + (meas,))
         self.peeks, self.n_samp = [], 1
@@ -156,8 +158,7 @@ class ADC:
         """
         ports = self.ports
         u_raw, i_raw, dc_raw = ports.u_g(), ports.i_c(), ports.u_dc()
-        length, opened = self.length, self.opened
-        mean = {c: (self.integral[c] - opened[c]) / length for c in self.channels}
+        mean = {c: self.accumulated[c] / self.length for c in self.channels}
         return Measurement(t=t,
                            u_g=mean.get("v", u_raw), i_c=mean.get("i", i_raw),
                            u_dc=mean.get("dc", dc_raw), i_abc=complex2abc(i_raw),
@@ -169,13 +170,11 @@ class ADC:
 
     # ------------------------------------------------------------ its states
     def get_state(self) -> dict[str, Any]:
-        s: dict[str, Any] = {f"x_{c}": v for c, v in self.integral.items()}
-        s.update({f"x_{c}_open": v for c, v in self.opened.items()})
-        return s
+        return {f"x_{c}": value for c, value in self.accumulated.items()}
 
     def set_state(self, values: Mapping[str, Any]) -> None:
         for channel, zero in self._zero.items():
             cast = complex if isinstance(zero, complex) else float
-            for key, into in ((f"x_{channel}", self.integral), (f"x_{channel}_open", self.opened)):
-                if key in values:
-                    into[channel] = cast(values[key])
+            key = f"x_{channel}"
+            if key in values:
+                self.accumulated[channel] = cast(values[key])

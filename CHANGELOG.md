@@ -14,6 +14,8 @@
   state-table row restores PWM registers, computation progress, timer positions and ADC averaging
   windows. An oversampled ADC continues from an interrupt because its intermediate samples are not
   states.
+- Each averaged ADC channel keeps one window accumulator (`<unit>.meas.x_*`); the redundant
+  absolute integral and window-opening copy (`x_*_open`) are removed.
 
 ### Per-unit bridge models (#3)
 

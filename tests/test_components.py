@@ -54,7 +54,7 @@ def test_adc_owns_oversampling_and_averaging_window_state():
     assert sample.i_c == 4 + 0j
     assert sample.u_dc == 10.0
     assert [s.t for s in sample.samples] == [0.5, 1.0]
-    assert set(adc.get_state()) == {"x_v", "x_i", "x_v_open", "x_i_open"}
+    assert set(adc.get_state()) == {"x_v", "x_i"}
 
 
 def test_adc_reconstructs_its_sampling_position_from_the_start_time():
