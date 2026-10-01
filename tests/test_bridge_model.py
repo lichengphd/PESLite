@@ -73,11 +73,11 @@ def test_units_can_have_different_models():
         EXAMPLES / "two-converters-example.pes",
         **{"simulation.t_end": 0.004,
            "simulation.solver.linearisations": 0,
-           "units.vsc_m.averaging.enable": 1},
+           "units.vsc_1.averaging.enable": 1},
     )
     simulation = peslite.Simulation(params)
     models = tuple(type(simulation.units[name].pwm.modulator).__name__
-                   for name in ("vsc_m", "vsc_l"))
+                   for name in ("vsc_1", "vsc_2"))
     assert models == ("ZOH", "CarrierComparison")
     simulation.run()
 

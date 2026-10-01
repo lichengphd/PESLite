@@ -14,7 +14,7 @@ sources:
     x_pu: 0.4
     r_pu: 0.04
 units:
-  vsc_m:
+  vsc_1:
     bus: bus1
     ac_filter: {l_f_pu: 0.2, r_f_pu: 0.01}
     dclink:
@@ -30,7 +30,7 @@ units:
         damp: {type: active_damping, period: 5.0e-5, r_a_pu: 0.2, alpha_d: 40.0}
       references: {p_ref_pu: 0.5}
     protection: {overcurrent: {enable: 1, limit_pu: 1.5}}
-  vsc_l:
+  vsc_2:
     bus: bus2
     s_base: 1.0e6
     ac_filter: {l_f_pu: 0.2, r_f_pu: 0.01}
@@ -51,9 +51,9 @@ units:
       overvoltage: {enable: 1, limit_pu: 1.2}
       rocof: {enable: 1, limit: 1.0}
 events:
-  connect_vsc_m: {type: connect, target: vsc_m, t: 0.05, ramp: 0.3}
-  connect_vsc_l: {type: connect, target: vsc_l, t: 0.05, ramp: 0.3}
-  p_step: {type: set, t: 0.5, set: {units.vsc_m.ctrl.references.p_ref_pu: 0.3}}
+  connect_vsc_1: {type: connect, target: vsc_1, t: 0.05, ramp: 0.3}
+  connect_vsc_2: {type: connect, target: vsc_2, t: 0.05, ramp: 0.3}
+  p_step: {type: set, t: 0.5, set: {units.vsc_1.ctrl.references.p_ref_pu: 0.3}}
   grid_f: {type: set, t: 0.75, set: {sources.grid.f: 49.8}}
 simulation:
   t_end: 1.0

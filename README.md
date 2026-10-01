@@ -188,7 +188,7 @@ that did not occur are `null`, and alarms, port-Hamiltonian defaults and energy 
 `--watch NAME` appends a value to each line and may be repeated or given comma-separated names.
 A watched name may be a `states.csv` column, a `plant.csv`/controller column, a state alias, or a
 complex state without `.re`/`.im` to print its magnitude. Converters with the same signal use their
-unit prefix, for example `vsc_m.vdc_pu` and `vsc_l.vdc_pu`. State names use the same entity-first
+unit prefix, for example `vsc_1.vdc_pu` and `vsc_2.vdc_pu`. State names use the same entity-first
 paths as `states.csv`; there is no separate `plant.*` domain. Existing public result columns take
 precedence when a signal and a state have the same name. For example:
 
