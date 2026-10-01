@@ -633,13 +633,20 @@ class Simulation:
         wall0 = time.time()
 
         units = list(system.units.values())
+        switching_units = [unit for unit in units if unit.bridge.has_switching_events]
+        window_units = [unit for unit in units if unit.adc.averaging]
+        oversampling_units = [unit for unit in units if unit.adc.samples > 1]
+        fast_checks = [
+            (unit, getattr(unit.ctrl, "fast_check_space_vector", None),
+             getattr(unit.ctrl, "fast_check", None))
+            for unit in units
+        ]
         t_start = p.simulation.initial.t
         if t_end <= t_start + _EPS:
             raise ValueError(f"t_end = {t_end} must be after the start time {t_start}")
         t_final = t_end
         # trips already handled, by unit (a trip loaded with the initial states is handled at the first sample)
         tripped = {u.name: bool(getattr(u.ctrl, "tripped", False)) or u.tripped for u in units}
-        averaging = [u for u in units if u.adc.averaging]  # units whose ADC averages
         y = self._apply_initial(t_start)
         if parameters_changed is not None:
             parameters_changed()
@@ -724,9 +731,9 @@ class Simulation:
                 return True
             t_local = t_b
             finite = _finite(y)
-            if averaging and finite:
+            if window_units and finite:
                 mdl.sync(t_b, y)
-                for unit in averaging:
+                for unit in window_units:
                     unit.adc.accumulate(t_b - t_a)
             if not finite:
                 stop_reason = f"diverged: non-finite states at t = {t_b:.6g} s"
@@ -794,8 +801,14 @@ class Simulation:
                 bridge, adc = unit.bridge, unit.adc
                 t_c = bridge.t_interrupt
                 t_stop = min(t_stop, t_c if t_c < t_final - _EPS else t_final,
-                             bridge.t_load, bridge.next_switch,
-                             adc.t_window(t_c), adc.t_sample(bridge.interrupt(bridge.k - 1)))
+                             bridge.t_load)
+            for unit in window_units:
+                t_stop = min(t_stop, unit.adc.t_window(unit.bridge.t_interrupt))
+            for unit in oversampling_units:
+                bridge = unit.bridge
+                t_stop = min(t_stop, unit.adc.t_sample(bridge.interrupt(bridge.k - 1)))
+            for unit in switching_units:
+                t_stop = min(t_stop, unit.bridge.next_switch)
             if actions:
                 t_stop = min(t_stop, actions[0][0])
             event_due = bool(actions and actions[0][0] <= t_stop + _EPS)
@@ -817,12 +830,15 @@ class Simulation:
                 y = mdl.get_initial_values()
                 adc_inputs_changed = True
             # 0. over-current check of units whose switching interval ends here
-            for unit in units:
-                check = getattr(unit.ctrl, "fast_check", None)
-                edge = min(unit.bridge.next_switch, unit.bridge.load_end)
-                if abs(edge - t_stop) < _EPS and check is not None and not tripped[unit.name]:
+            for unit, vector_check, phase_check in fast_checks:
+                edge = unit.bridge.next_edge
+                if (abs(edge - t_stop) < _EPS and (vector_check is not None or phase_check is not None)
+                        and not tripped[unit.name]):
                     mdl.set_states(y)
-                    if check(t_local, unit.adc.phase_currents()):
+                    trip = (vector_check(t_local, unit.adc.current_space_vector())
+                            if vector_check is not None
+                            else phase_check(t_local, unit.adc.phase_currents()))
+                    if trip:
                         do_trip(unit)
                         if stop_on_trip:
                             stopped = True
@@ -830,7 +846,7 @@ class Simulation:
                 snapshot(t_local, final=True)
                 break
             # ADC samples due here, before any loop update
-            for unit in units:
+            for unit in oversampling_units:
                 bridge = unit.bridge
                 if abs(unit.adc.t_sample(bridge.interrupt(bridge.k - 1)) - t_stop) < _EPS:
                     mdl.sync(t_local, y)
@@ -860,19 +876,19 @@ class Simulation:
             for bridge in deferred:
                 bridge.finish_control()
             # 1b. an averaging window shorter than the PWM update period opens here
-            for unit in units:
+            for unit in window_units:
                 if abs(unit.adc.t_window(unit.bridge.t_interrupt) - t_stop) < _EPS:
                     mdl.sync(t_local, y)
                     unit.adc.open()
             # 2. switching instants due here
-            for unit in units:
+            for unit in switching_units:
                 if abs(unit.bridge.next_switch - t_stop) < _EPS:
                     set_bridge_inputs(unit, unit.bridge.switches(t_stop))
             # An averaging interval after a plant or held-input jump starts from the value on the
             # new side.  Its integral/opening states do not change at the zero-duration edge.
-            if averaging and adc_inputs_changed:
+            if window_units and adc_inputs_changed:
                 mdl.sync(t_local, y)
-                for unit in averaging:
+                for unit in window_units:
                     unit.adc.seed()
             # 3. snapshots
             if abs(t_log - t_stop) < _EPS and t_stop < t_final - _EPS:
@@ -900,7 +916,7 @@ class Simulation:
                     set_bridge_input(unit, unit.bridge.load(t_local))
             for bridge in deferred:
                 bridge.finish_control()
-            for unit in units:
+            for unit in switching_units:
                 if abs(unit.bridge.next_switch - t_local) < _EPS:
                     set_bridge_inputs(unit, unit.bridge.switches(t_local))
         if rec.last_t is None or rec.last_t < t_local - _EPS:

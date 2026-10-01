@@ -15,7 +15,7 @@ from numpy.typing import NDArray
 from ..control.blocks import abc2complex, smoothstep
 from ..solver.energy import PowerPort, StoragePort
 from ..solver.model import Bag, Empty, OutputStage
-from .pwm import Modulator, PWM, make_modulator
+from .pwm import Modulator, PWM, ZOH, make_modulator
 
 __all__ = ["Bridge", "PWMBridge", "AveragingBridge", "DCLink", "DCCapacitor",
            "DCCurrentSource", "DCVoltageSource", "make_bridge", "make_dclink"]
@@ -39,6 +39,7 @@ class Bridge:
     """
 
     state_names: ClassVar[tuple[str, ...]] = ()
+    has_switching_events: ClassVar[bool] = False
     outputs_need_inputs: ClassVar[bool] = True
     dirac: ClassVar[bool] = True
     output_stages: ClassVar[tuple[OutputStage, ...]] = (
@@ -91,6 +92,7 @@ class PWMBridge(Bridge, PWM):
                  carrier_period: float, modulator: Modulator) -> None:
         Bridge.__init__(self)
         PWM.__init__(self, period, load_period, offset, computation, carrier_period, modulator)
+        self.has_switching_events = type(modulator) is not ZOH
         self.state_prefix = "pwm"
         self.state_owner = self
         self._pending: tuple[float, NDArray[np.float64], float | None, float | None] | None = None
@@ -165,7 +167,6 @@ class AveragingBridge(Bridge):
         self.t_interrupt = self.interrupt(0)
         self._queue: deque[tuple[float, int, NDArray[np.float64]]] = deque()
         self.t_load = math.inf
-        self.next_switch = math.inf
         self.load_end = math.inf
         self.modulator = None
         self.state_prefix = "bridge"
@@ -204,7 +205,6 @@ class AveragingBridge(Bridge):
         self.history = [d.copy() for _ in range(self.history_length)]
         self._queue.clear()
         self.t_load = self.load_end = math.inf
-        self.next_switch = math.inf
 
     def start(self, t: float, sync: tuple[float | None, float | None],
               continued: bool) -> complex:
@@ -222,8 +222,12 @@ class AveragingBridge(Bridge):
         for due, index, duty in sorted(pending, key=lambda item: item[:2]):
             self._enqueue(due, index, duty)
         self.t_load = self.load_end = self._queue[0][0] if self._queue else math.inf
-        self.next_switch = math.inf
         return abc2complex(self.active)
+
+    @property
+    def next_edge(self) -> float:
+        """Next held-source change relevant to fast protection."""
+        return self.load_end
 
     def _enqueue(self, due: float, index: int, duty: NDArray[np.float64]) -> None:
         """Keep the last command when several interrupts feed the same equivalent load."""
@@ -237,8 +241,11 @@ class AveragingBridge(Bridge):
               omega: float | None = None) -> bool:
         """Schedule one delayed bridge input; no deferred completion stage is needed."""
         d = np.clip(np.asarray(d_abc, dtype=float), 0.0, 1.0)
-        self.history.insert(0, d)
-        self.history.pop()
+        if self.history_length == 1:
+            self.history[0] = d
+        else:
+            self.history.insert(0, d)
+            self.history.pop()
         self._enqueue(self.apply_time(t), self.k, d)
         self.k += 1
         self.t_interrupt = self.interrupt(self.k)
@@ -258,10 +265,6 @@ class AveragingBridge(Bridge):
     def load(self, t: float) -> complex:
         """Apply the delayed command at its equivalent load instant."""
         return self.apply(t)
-
-    def switches(self, t: float) -> list[complex]:
-        """An ideal averaged bridge has no switching instants."""
-        return []
 
     def get_state(self) -> dict[str, Any]:
         out = {f"d_{phase}": float(self.active[k]) for k, phase in enumerate("abc")}
@@ -402,6 +405,21 @@ class DCLink:
         self.inp = _DCInp(i_dc=0.0)
         self.out = _DCOut(u_dc=u0, u_C=u0, i_src=0.0)
         self.tripped = False
+        # The circuit topology cannot change after assembly. Bind its equations once instead of
+        # rediscovering the capacitor/source combination at every Runge--Kutta stage.
+        if type(self) is DCLink:
+            if capacitor is None:
+                self.set_outputs = self._set_voltage_source_without_capacitor
+                self.rhs = self._rhs_without_capacitor
+            elif source is None:
+                self.set_outputs = self._set_capacitor_without_source
+                self.rhs = self._rhs_with_capacitor
+            elif isinstance(source, DCVoltageSource):
+                self.set_outputs = self._set_capacitor_with_voltage_source
+                self.rhs = self._rhs_with_capacitor
+            else:
+                self.set_outputs = self._set_capacitor_with_current_source
+                self.rhs = self._rhs_with_capacitor
 
     def open_breaker(self) -> None:
         """Disconnect the source from the capacitor; a link without capacitor is unchanged."""
@@ -421,6 +439,7 @@ class DCLink:
             source.u_dc, source.R = float(v), float(r)
 
     def set_outputs(self, t: float) -> None:
+        """Generic topology dispatch retained for subclasses."""
         cap, source, i_dc = self.capacitor, self.source, self.inp.i_dc
         if cap is None:
             self.out.u_dc = self.out.u_C = source.terminal_voltage(i_dc)
@@ -437,10 +456,43 @@ class DCLink:
         self.out.u_C = cap.state.u_C
         self.out.u_dc = cap.terminal_voltage(i_src - i_dc)
 
+    def _set_voltage_source_without_capacitor(self, t: float) -> None:
+        source, i_dc, out = self.source, self.inp.i_dc, self.out
+        out.u_dc = out.u_C = source.u_dc - source.R * i_dc
+        out.i_src = i_dc
+
+    def _set_capacitor_without_source(self, t: float) -> None:
+        cap, i_dc, out = self.capacitor, self.inp.i_dc, self.out
+        out.i_src = 0.0
+        out.u_C = cap.state.u_C
+        out.u_dc = cap.state.u_C - cap.R_esr * i_dc
+
+    def _set_capacitor_with_voltage_source(self, t: float) -> None:
+        cap, source, i_dc, out = self.capacitor, self.source, self.inp.i_dc, self.out
+        i_src = (0.0 if self.tripped else
+                 (source.u_dc - cap.state.u_C + cap.R_esr * i_dc) /
+                 (source.R + cap.R_esr))
+        out.i_src = i_src
+        out.u_C = cap.state.u_C
+        out.u_dc = cap.state.u_C + cap.R_esr * (i_src - i_dc)
+
+    def _set_capacitor_with_current_source(self, t: float) -> None:
+        cap, source, i_dc, out = self.capacitor, self.source, self.inp.i_dc, self.out
+        i_src = 0.0 if self.tripped else source(t, cap.state.u_C)
+        out.i_src = i_src
+        out.u_C = cap.state.u_C
+        out.u_dc = cap.state.u_C + cap.R_esr * (i_src - i_dc)
+
     def rhs(self, t: float):
         if self.capacitor is None:
             return ()
         return (self.capacitor.derivative(self.out.i_src - self.inp.i_dc),)
+
+    def _rhs_without_capacitor(self, t: float):
+        return ()
+
+    def _rhs_with_capacitor(self, t: float):
+        return ((self.out.i_src - self.inp.i_dc) / self.capacitor.C,)
 
     def dissipated_power(self) -> float:
         loss = (self.capacitor.dissipated_power(self.out.i_src - self.inp.i_dc)

@@ -1,7 +1,6 @@
 """The refactored power-circuit and converter-hardware components."""
 
 import ast
-import math
 from pathlib import Path
 
 import numpy as np
@@ -107,7 +106,8 @@ def test_ideal_averaging_holds_its_initial_value_until_the_delayed_output_arrive
     bridge.write(period, command)
     assert bridge.delay(period) == pytest.approx(1.5 * period)
     assert bridge.t_load == pytest.approx(2.0 * period)
-    assert bridge.next_switch == math.inf
+    assert not hasattr(bridge, "next_switch")
+    assert not hasattr(bridge, "switches")
     assert abc2complex(bridge.active) == abc2complex(initial)
     assert bridge.load(2.0 * period) == abc2complex(command)
 

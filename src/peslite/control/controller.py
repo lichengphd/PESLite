@@ -18,7 +18,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from ..solver.model import ConfigError, gather, scatter
-from .blocks import peak_abs
+from .blocks import peak_abs, phases
 from .loops import (ANGLE, CURRENT, DC_VOLTAGE, FREQUENCY, I_AB, LOOP_TYPES, POWER_PU, V_AB, V_DQ, VOLTAGE)
 from .modulation import CONFIGURED, OutputStage
 from .protection import Protection
@@ -479,6 +479,13 @@ class UniteType:
     def fast_check(self, t, i_abc):
         """Check the instantaneous over-current criterion between samples; ``i_abc`` in A."""
         return self.protection.check_current(t, peak_abs(i_abc) / self.i_base)
+
+    def fast_check_space_vector(self, t, i_ab):
+        """Equivalent fast check from the space vector, without a temporary phase array."""
+        i_a, i_b, i_c = phases(i_ab)
+        return self.protection.check_current(
+            t, max(abs(i_a), abs(i_b), abs(i_c)) / self.i_base
+        )
 
     # ------------------------------------------------------------ one sample
     def _pu(self, meas: Measurement) -> ControlMeasurement:

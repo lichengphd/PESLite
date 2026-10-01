@@ -126,13 +126,20 @@ class PWM:
         """Load shadow into active registers and schedule switching until the next load."""
         completed = self.interrupt(self.k - 1) + self.computation
         if completed <= t + TIME_EPS:
-            self.active = self.shadow.copy()
+            # write_shadow() replaces its array, so the loaded register can safely take ownership
+            # of the previous shadow value without allocating another three-element copy.
+            self.active = self.shadow
         q = self._switching(t, self.active, t)
         self.j += 1
         self.t_load = self.load_time(self.j)
         return q
 
     def _switching(self, t_l: float, d: NDArray[np.float64], t_now: float) -> complex:
+        if type(self.modulator) is ZOH:
+            self.load_end = t_l + self.load_period
+            self.schedule.clear()
+            self.next_switch = math.inf
+            return self.modulator.value(d)
         theta, omega = self.sync
         if theta is not None and omega is not None and t_l != self.t_sync:
             theta = theta + omega * (t_l - self.t_sync)
@@ -153,8 +160,10 @@ class PWM:
         self.next_switch = schedule[0][0] if schedule else math.inf
         return q_now
 
-    def edge(self, t: float) -> bool:
-        return abs(self.next_switch - t) < TIME_EPS or abs(self.load_end - t) < TIME_EPS
+    @property
+    def next_edge(self) -> float:
+        """Next switching or held-input edge relevant to fast protection."""
+        return min(self.next_switch, self.load_end)
 
     def switches(self, t: float) -> list[complex]:
         """Return switching states due at ``t`` in order."""
@@ -303,6 +312,14 @@ class SynchronousCarrier:
 
 class ZOH:
     """PWM-period averaging: hold the duty ratios as the switching state for the period."""
+
+    @staticmethod
+    def value(d_abc: NDArray[np.float64]) -> complex:
+        """Return the held space vector without constructing a one-segment schedule."""
+        d_a = min(1.0, max(0.0, float(d_abc[0])))
+        d_b = min(1.0, max(0.0, float(d_abc[1])))
+        d_c = min(1.0, max(0.0, float(d_abc[2])))
+        return abc2complex((d_a, d_b, d_c))
 
     def __call__(self, t: float, T_s: float, d_abc: NDArray[np.float64],
                  theta: float | None = None, omega: float | None = None) -> SwitchingSequence:

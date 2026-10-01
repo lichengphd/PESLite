@@ -104,6 +104,8 @@ class OutputStage:
             raise TypeError("pwm_method must be callable")
         if self.limiter is not None and not callable(self.limiter):
             raise TypeError("limiter must be callable or None")
+        self._trusted_pwm = any(self.pwm_method is method for method in PWM_METHODS.values())
+        self._standard_limiter = type(self.limiter) is ModulationLimiter
         self.n_updates = 0
         self.n_saturated = 0
         self.first_saturation_t: float | None = None
@@ -132,13 +134,21 @@ class OutputStage:
             return memo[2], memo[3]
         u_ab = command * rot * self.v_base
         if u_dc > 0.0:
-            m = _signals(self.pwm_method(u_ab, u_dc), "pwm_method")
+            raw = self.pwm_method(u_ab, u_dc)
+            m = raw if self._trusted_pwm else _signals(raw, "pwm_method")
         else:
             u = complex2abc(u_ab)
             peak = float(np.max(np.abs(u)))
             m = u / peak if peak > 0.0 else np.zeros(3)
         saturated = False
-        if self.limiter is not None:
+        if self._standard_limiter:
+            max_abs = max(abs(float(m[0])), abs(float(m[1])), abs(float(m[2])))
+            if max_abs > self.limiter.limit:
+                m *= self.limiter.limit / max_abs
+                saturated = True
+            elif u_dc <= 0.0 and u_ab != 0j:
+                saturated = True
+        elif self.limiter is not None:
             limited = _signals(self.limiter(m.copy()), "limiter")
             saturated = limited.tolist() != m.tolist() or (u_dc <= 0.0 and u_ab != 0j)  # both finite, shape (3,)
             m = limited

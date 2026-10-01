@@ -116,6 +116,17 @@ def test_changing_bridge_model_keeps_the_same_power_and_modulation_connections(g
     assert len(switching.connections()) == len(averaging.connections())
 
 
+def test_only_exact_switching_bridge_enters_the_switching_event_loop(gfl):
+    bridges = {
+        model: peslite.Simulation(gfl(**{"units.vsc.bridge.model": model})).unit().bridge
+        for model in ("switching", "pwm_averaging", "averaging")
+    }
+    assert bridges["switching"].has_switching_events
+    assert not bridges["pwm_averaging"].has_switching_events
+    assert not bridges["averaging"].has_switching_events
+    assert not hasattr(bridges["averaging"], "next_switch")
+
+
 def test_pwm_averaging_flag_is_the_same_as_setting_the_file_value(tmp_path):
     out_flag, out_set = tmp_path / "flag", tmp_path / "set"
     with redirect_stdout(io.StringIO()):
@@ -139,7 +150,12 @@ def test_averaging_flag_wins_over_set():
                        "vsc": "averaging"}
 
 
-@pytest.mark.parametrize("path", ["units.vsc.averaging.enable", "units.vsc.bridge.over"])
+@pytest.mark.parametrize("path", [
+    "simulation.bridge",
+    "units.vsc.averaging",
+    "units.vsc.averaging.enable",
+    "units.vsc.bridge.over",
+])
 def test_removed_averaging_paths_are_rejected(gfl, path):
     with pytest.raises(ConfigError, match="unknown"):
         gfl(**{path: 1})
