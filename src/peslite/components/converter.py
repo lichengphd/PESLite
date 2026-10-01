@@ -200,7 +200,9 @@ class AveragingBridge(Bridge):
 
     def reset(self, d_abc: NDArray[np.float64]) -> None:
         """Fill the bridge output and delay history with its initial duty command."""
-        d = np.clip(np.asarray(d_abc, dtype=float), 0.0, 1.0)
+        # Controller outputs are already limited duty ratios.  Keep an owned snapshot because the
+        # delay history must not follow an array that a custom controller later reuses in place.
+        d = np.array(d_abc, dtype=float, copy=True)
         self.active = d.copy()
         self.history = [d.copy() for _ in range(self.history_length)]
         self._queue.clear()
@@ -240,7 +242,10 @@ class AveragingBridge(Bridge):
     def write(self, t: float, d_abc: NDArray[np.float64], theta: float | None = None,
               omega: float | None = None) -> bool:
         """Schedule one delayed bridge input; no deferred completion stage is needed."""
-        d = np.clip(np.asarray(d_abc, dtype=float), 0.0, 1.0)
+        # OutputStage (and the Controller protocol) already guarantees [0, 1].  Re-clipping three
+        # values here only adds a NumPy dispatch on every control interrupt; an owned copy is the
+        # actual requirement for the delayed history.
+        d = np.array(d_abc, dtype=float, copy=True)
         if self.history_length == 1:
             self.history[0] = d
         else:
