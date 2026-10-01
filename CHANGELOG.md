@@ -29,14 +29,14 @@
 ### Per-unit bridge models (#3)
 
 - The bridge model is selected independently for each converter. A unit uses exact switching by
-  default; `units.<u>.averaging: {enable: 1, over: pwm_period}` averages over each PWM period, and
-  `over: time_step` averages the carrier comparison over each fixed solver step.
-- `--pwm-averaging` enables averaging for every unit for one run and takes precedence over `--set` of
-  its `enable` switch. When it changes a model, the default result directory gains the
-  `-averaging` suffix. Different units in the same system may use different models.
-- Time-step averaging requires a fixed-step solver and an asynchronous carrier. Carrier phase and
-  synchronisation settings are ignored by PWM-period averaging. `StepAveragedCarrier` is renamed
-  to `TimeStepAveragedCarrier`.
+  default; `units.<u>.bridge.model: pwm_averaging` holds the active duty ratios continuously until
+  the next PWM register load. Different units in the same system may use different models.
+- `--pwm-averaging` selects PWM averaging for every unit, takes precedence over `--set` of
+  `bridge.model`, and uses the `-pwm-averaging` output-directory suffix.
+- PWM averaging keeps the timer, active/shadow registers, computation eligibility and
+  single/double update timing of switching and supports fixed/adaptive solvers and
+  asynchronous/synchronous PWM. The former solver-time-step averaging mode and its `over`
+  parameter are removed.
 
 ### Progress lines and watched quantities (#3)
 
@@ -59,7 +59,7 @@
 - Project version is 0.1.4. The root `examples/` directory remains data-only, keeps the
   `*-example.pes` names and is included in the wheel. The PEP 639 `AGPL-3.0-only` metadata is
   unchanged.
-- Added Issue #3 acceptance coverage for every bundled file under all three bridge models,
+- Added Issue #3 acceptance coverage for every bundled file under both completed bridge models,
   mixed-model systems, CLI precedence and output paths, solver/PWM compatibility, progress values,
   aliases, complex magnitudes and run invariance.
 
@@ -163,7 +163,7 @@
   integrator (`integrator`, used by `make_solver` and the multirate windows), the check of a
   multirate step (`parse_step`, used by the solver and the validation), the multirate split's groups
   (`MultirateSolver.groups`, used by the energy check), `Re(e conj(f))` (`energy.re_product`), the
-  walk along the carrier (duty fraction and carrier comparison), the four timed protection criteria,
+  walk along the carrier comparison, the four timed protection criteria,
   the reading of YAML and JSON files, the high-pass filter (a `LowPass1`), the check of the
   controller's input (once, where it is scaled to pu).
 - Removed, having no use: `GFMParams`, `PSCParams`, `PLLParams`, `CurrentLoopParams`,

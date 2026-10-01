@@ -15,8 +15,7 @@ from numpy.typing import NDArray
 from ..control.blocks import abc2complex
 
 __all__ = ["PWM", "TIME_EPS", "SwitchingSequence", "Modulator", "CarrierComparison",
-           "SynchronousCarrier", "ZOH", "TimeStepAveragedCarrier", "carrier", "carrier_position", "duty_fraction",
-           "make_modulator"]
+           "SynchronousCarrier", "ZOH", "carrier", "carrier_position", "make_modulator"]
 
 
 @dataclass
@@ -227,15 +226,6 @@ def _pieces(t0: float, span: float, f_sw: float, phase: float, tol: float,
         covered += seg
 
 
-def duty_fraction(m: float, t0: float, dt: float, f_sw: float, phase: float = 0.0) -> float:
-    """Return the fraction of ``[t0, t0 + dt]`` during which ``m`` is at or above the carrier."""
-    duty_time = 0.0
-    for _start, seg, rising, c0, slope in _pieces(t0, dt, f_sw, phase, 1e-18, 8):
-        crossing = min(seg, max(0.0, (m - c0) / slope))
-        duty_time += crossing if rising else seg - crossing
-    return duty_time / dt
-
-
 # ------------------------------------------------------------------ modulators
 
 _EPS = 1e-13
@@ -320,35 +310,10 @@ class ZOH:
         return SwitchingSequence(np.array([T_s]), d.reshape(1, 3))
 
 
-class TimeStepAveragedCarrier:
-    """Time-step averaging: per solver step, the on-fraction of the carrier comparison."""
-
-    def __init__(self, f_sw: float, dt: float, phase: float = 0.0) -> None:
-        self.f_sw, self.dt, self.phase = float(f_sw), float(dt), float(phase)
-
-    def __call__(self, t: float, T_s: float, d_abc: NDArray[np.float64],
-                 theta: float | None = None, omega: float | None = None) -> SwitchingSequence:
-        n = max(1, int(round(T_s / self.dt)))
-        h = T_s / n
-        m = np.clip(2.0 * np.asarray(d_abc, dtype=float) - 1.0, -1.0, 1.0)
-        states = np.empty((n, 3))
-        for i in range(n):
-            t0 = t + i * h
-            for k in range(3):
-                states[i, k] = duty_fraction(m[k], t0, h, self.f_sw, self.phase)
-        return SwitchingSequence(np.full(n, h), states)
-
-
-def make_modulator(pwm: Any, f0: float, averaging: Any, sim: Any) -> Modulator:
-    """Return the modulator selected by one unit's ``averaging`` and ``pwm.sync``.
-
-    A disabled averaging section uses carrier comparison. PWM-period averaging holds the duty
-    ratios continuously; time-step averaging uses the carrier's on-fraction per solver step.
-    """
-    if not averaging.enable:
+def make_modulator(pwm: Any, f0: float, bridge: Any) -> Modulator:
+    """Return the exact-switching or PWM-period-averaged modulator selected by one unit."""
+    if bridge.model == "switching":
         if pwm.sync == "synchronous":
             return SynchronousCarrier(round(pwm.f_sw / f0), pwm.carrier_phase)
         return CarrierComparison(pwm.f_sw, pwm.carrier_phase)
-    if averaging.over == "time_step":
-        return TimeStepAveragedCarrier(pwm.f_sw, sim.solver.dt, pwm.carrier_phase)
     return ZOH()

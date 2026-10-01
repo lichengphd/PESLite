@@ -66,7 +66,7 @@ class Unit:
         pwm = cfg.pwm
         self.pwm = PWM(
             T_c, pwm.load_period, pwm.grid_offset, cfg.ctrl.computation, pwm.switching_period,
-            modulator if modulator is not None else make_modulator(pwm, cfg.base.f0, cfg.averaging, sim),
+            modulator if modulator is not None else make_modulator(pwm, cfg.base.f0, cfg.bridge),
         )
         self.zoh = f"{name}.q"                   # model label of the bridge's held switching state
 

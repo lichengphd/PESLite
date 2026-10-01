@@ -48,7 +48,7 @@ peslite gfm-droop-example
 # override any parameter by its dotted path
 peslite gfl-example --set simulation.t_end=1 --set units.vsc.ctrl.computation=2e-6
 peslite gfl-example --set simulation.solver.type=adaptive --set simulation.solver.method=DP45
-peslite gfm-droop-example --set units.vsc.averaging.enable=0
+peslite gfm-droop-example --set units.vsc.bridge.model=switching
 
 # average every converter for this run; print progress with selected quantities
 peslite gfl-example --pwm-averaging
@@ -114,29 +114,29 @@ disconnected or retuned by events; a small impedance can be used to model a faul
 
 ## Bridge models
 
-Each converter uses a switching bridge unless its `averaging` section is enabled. This permits a
-system to mix switching and averaging converters:
+Each converter selects its own bridge model, so switching and PWM-averaged converters can share a
+system:
 
 ```yaml
 units:
   vsc:
-    averaging: {enable: 1, over: pwm_period}  # pwm_period | time_step
+    bridge: {model: pwm_averaging}  # switching | pwm_averaging
 ```
 
-| Setting | Model |
+| `model` | Behaviour |
 |---|---|
-| `enable: 0` | ideal switches at the exact carrier-comparison instants |
-| `enable: 1, over: pwm_period` | duty ratios held as continuous bridge values over each PWM period; no carrier ripple |
-| `enable: 1, over: time_step` | carrier on-fraction averaged over each fixed solver step |
+| `switching` | ideal switches at the exact carrier-comparison instants |
+| `pwm_averaging` | the active duty ratios are continuous bridge values until the next PWM register load; no carrier ripple |
 
-`--pwm-averaging` enables averaging for every converter for one run without editing the file, while
-preserving each converter's configured `over` value. It takes precedence over an `enable: 0`
-command-line override. If the option changes at least one model, the default result directory is
-`output/<name>-averaging`.
+`--pwm-averaging` selects `pwm_averaging` for every converter for one run without editing the file.
+It takes precedence over a `bridge.model` command-line override, and uses
+`output/<name>-pwm-averaging` as the default result directory.
 
-Time-step averaging requires a fixed-step solver and an asynchronous carrier. PWM-period
-averaging has no carrier ripple, but the carrier phase still shifts that unit's control interrupts
-and PWM loads.
+PWM averaging supports fixed and adaptive solvers and asynchronous or synchronous PWM. It keeps
+the same timer, active/shadow registers, computation eligibility and single/double register-load
+timing as switching. With single update a duty is held for one carrier period; with double update
+it may load at each carrier valley and peak. An asynchronous carrier phase still shifts that
+unit's control interrupts and loads, although the carrier waveform itself is not evaluated.
 
 ## Example configurations
 
@@ -161,7 +161,7 @@ and PWM loads.
 | `simulation.output.period` | snapshot interval, s |
 | `simulation.energy_check` | `warn` \| `strict` \| `off` |
 | `simulation.progress` | `{enable: 1, period: 0.1, watch: [...]}`; CLI: `--progress`, `--watch` |
-| `units.<u>.averaging` | `{enable: 1, over: pwm_period \| time_step}`; CLI: `--pwm-averaging` |
+| `units.<u>.bridge.model` | `switching` \| `pwm_averaging`; CLI: `--pwm-averaging` |
 | `units.<u>.ctrl.type` | `gfl` \| `gfm` \| `custom` |
 | `units.<u>.ctrl.period` / `.computation` | control-interrupt period and computation time, s |
 | `units.<u>.ctrl.loops.<loop>.period` | loop period, an integer multiple of `ctrl.period` |

@@ -118,7 +118,7 @@ def test_timing_follows_an_asynchronous_carrier_phase(gfl, tmp_path):
     phase = 0.3
     _result, interrupts, loads = _record(gfl(**{
         "units.vsc.pwm.carrier_phase": phase,
-        "units.vsc.averaging.enable": 0,
+        "units.vsc.bridge.model": "switching",
     }), tmp_path)
     assert interrupts[0][0] == pytest.approx((1.0 - phase) * T)
     assert all(carrier_position(t, 1 / T, phase) == 0.0 for t, _period, _duty in loads)
@@ -190,10 +190,10 @@ def test_duty_registers_are_states_and_loop_clocks_are_not(gfl):
 @pytest.mark.parametrize("over, t0", [
     ({"units.vsc.pwm.update": "double", "units.vsc.ctrl.computation": 3e-5},
      0.003005),  # computation is in progress
-    ({"units.vsc.pwm.carrier_phase": 0.3, "units.vsc.averaging.enable": 0},
+    ({"units.vsc.pwm.carrier_phase": 0.3, "units.vsc.bridge.model": "switching"},
      0.003010),  # between timer points
     ({"units.vsc.meas.average": "window", "units.vsc.meas.u_dc": "window",
-      "units.vsc.meas.window": 2.5e-5, "units.vsc.averaging.enable": 0},
+      "units.vsc.meas.window": 2.5e-5, "units.vsc.bridge.model": "switching"},
      0.003025),  # an ADC window is open
 ])
 def test_a_run_continues_exactly_from_any_output_row(gfl, tmp_path, over, t0):

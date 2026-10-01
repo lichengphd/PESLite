@@ -37,7 +37,7 @@ __all__ = [
     "ACFilterParams", "DCLinkParams", "DCCapacitorParams", "DCSourceParams", "PWMParams",
     "MeasurementParams", "ReferenceParams", "ControlParams", "OvercurrentParams", "VoltageLimitParams",
     "FrequencyLimitParams", "DCVoltageLimitParams", "RocofParams", "ProtectionParams",
-    "AveragingParams", "UnitParams", "RUNTIME", "Change", "runtime_changeable", "set_changes",
+    "BridgeParams", "UnitParams", "RUNTIME", "Change", "runtime_changeable", "set_changes",
     "SolverParams", "SimulationParams", "InitialParams", "OutputParams", "ProgressParams",
     "MetaParams", "Params",
 ]
@@ -423,17 +423,17 @@ class ProtectionParams:
 
 
 @dataclass(frozen=True)
-class AveragingParams:
-    """The bridge model of one unit.
+class BridgeParams:
+    """Bridge model used by one unit.
 
-    With ``enable`` set to 0, the bridge switches at the exact carrier-comparison instants.
-    With it set to 1, ``over`` selects averaging over a ``pwm_period`` or a solver ``time_step``.
+    ``"switching"`` follows the exact carrier-comparison edges. ``"pwm_averaging"`` keeps the
+    PWM timer, duty registers and load timing but applies each active duty ratio continuously until
+    the next compare-register load.
     """
 
-    enable: bool = False
-    over: str = "pwm_period"
+    model: str = "switching"
 
-    _choices = {"over": ("pwm_period", "time_step")}
+    _choices = {"model": ("switching", "pwm_averaging")}
 
 
 @dataclass(frozen=True)
@@ -449,7 +449,7 @@ class UnitParams:
     dclink: DCLinkParams
     pwm: PWMParams
     ctrl: ControlParams
-    averaging: AveragingParams = field(default_factory=AveragingParams)
+    bridge: BridgeParams = field(default_factory=BridgeParams)
     s_base: Optional[float] = None  # rating (VA); default: the system base
     meas: MeasurementParams = field(default_factory=MeasurementParams)
     protection: ProtectionParams = field(default_factory=ProtectionParams)

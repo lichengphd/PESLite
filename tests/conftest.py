@@ -26,7 +26,7 @@ CASE = {
                    "capacitor": {"c_pu": 35.0, "r_esr_pu": 0.001},
                    "source": {"type": "current", "i_pu": 0.9}},
         "pwm": {"f_sw": 20000.0, "modulation_limit": 0.95},
-        "averaging": {"enable": 1},
+        "bridge": {"model": "pwm_averaging"},
         "ctrl": {"type": "gfl", "loops": {
             "pll": {"type": "srf_pll", "period": 5e-5, "kp_pu": 20.0, "ki_pu": 1200.0},
             "cc": {"type": "dq_current_pi", "period": 5e-5, "bandwidth": 200.0},
@@ -61,7 +61,7 @@ def gfl():
     def make(**over):
         return peslite.load(
             EXAMPLES / "gfl-example.pes",
-            **{**QUIET, "simulation.t_end": 0.004, "units.vsc.averaging.enable": 1,
+            **{**QUIET, "simulation.t_end": 0.004, "units.vsc.bridge.model": "pwm_averaging",
                "events.connect_vsc.t": 0.0, **over},
         )
     return make
