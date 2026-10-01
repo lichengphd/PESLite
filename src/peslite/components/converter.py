@@ -6,6 +6,7 @@ implementation only changes how its modulation value is produced.
 from __future__ import annotations
 
 import math
+from collections import deque
 from typing import Any, Callable, ClassVar, Mapping, Optional
 
 import numpy as np
@@ -127,10 +128,11 @@ class AveragingBridge(Bridge):
 
     It has the same power equations and the same ``q``, AC and DC connections as every other
     bridge. It differs only in how ``q`` is produced: no carrier, PWM modulator or duty registers
-    are constructed, and a controller command sampled at ``t`` reaches ``q`` at the centre of the
-    first equivalent PWM update interval whose load is not earlier than ``t + computation``. The
-    current duty and recent command history are discrete bridge states so a saved simulation can
-    reconstruct commands that are still in flight.
+    are constructed. A controller command sampled at ``t`` drives the averaged source from the
+    first equivalent PWM load not earlier than ``t + computation``. Holding that value for the
+    update interval contributes the usual half-interval PWM delay; it must not be shifted by that
+    half interval a second time. The current duty and recent command history are discrete bridge
+    states so a saved simulation can reconstruct commands that are still in flight.
     """
 
     def __init__(self, period: float, load_period: float, offset: float,
@@ -152,16 +154,16 @@ class AveragingBridge(Bridge):
             raise ValueError(
                 f"the computation time must be finite and nonnegative, got {computation}"
             )
-        delays = [self.delay(self.interrupt(k)) for k in range(4)]
+        pending = [self.apply_time(self.interrupt(k)) - self.interrupt(k) for k in range(4)]
         self.history_length = max(
-            1, int(math.ceil(max(delays) / self.period - 1e-12))
+            1, int(math.ceil(max(pending) / self.period - 1e-12))
         )
         zero = np.zeros(3)
         self.active = zero.copy()
         self.history = [zero.copy() for _ in range(self.history_length)]  # newest first
         self.k = 0
         self.t_interrupt = self.interrupt(0)
-        self._queue: list[tuple[float, int, NDArray[np.float64]]] = []
+        self._queue: deque[tuple[float, int, NDArray[np.float64]]] = deque()
         self.t_load = math.inf
         self.next_switch = math.inf
         self.load_end = math.inf
@@ -181,12 +183,12 @@ class AveragingBridge(Bridge):
         return self.offset + j * self.load_period
 
     def apply_time(self, t: float) -> float:
-        """Time at which the command sampled at ``t`` reaches this bridge."""
-        load = self._load_at_or_after(t + self.computation)
-        return load + 0.5 * self.load_period
+        """Start of the held average produced by the command sampled at ``t``."""
+        return self._load_at_or_after(t + self.computation)
 
     def delay(self, t: float) -> float:
-        return self.apply_time(t) - t
+        """Effective command-to-output delay, including half of the held interval."""
+        return self.apply_time(t) + 0.5 * self.load_period - t
 
     def describe(self) -> str:
         delays = [self.delay(self.interrupt(k)) for k in range(8)]
@@ -201,52 +203,65 @@ class AveragingBridge(Bridge):
         self.active = d.copy()
         self.history = [d.copy() for _ in range(self.history_length)]
         self._queue.clear()
-        self.next_switch = self.load_end = math.inf
+        self.t_load = self.load_end = math.inf
+        self.next_switch = math.inf
 
     def start(self, t: float, sync: tuple[float | None, float | None],
               continued: bool) -> complex:
         """Resume the command grid and rebuild delayed commands from saved bridge history."""
         self.k = self.after(t)
         self.t_interrupt = self.interrupt(self.k)
-        self._queue = []
+        pending = []
         if continued:
             for age, duty in enumerate(self.history):
                 index = self.k - 1 - age
                 due = self.apply_time(self.interrupt(index))
                 if due > t + _TIME_EPS:
-                    self._queue.append((due, index, duty.copy()))
-            self._queue.sort(key=lambda item: item[:2])
-        self.next_switch = self.load_end = self._queue[0][0] if self._queue else math.inf
+                    pending.append((due, index, duty))
+        self._queue = deque()
+        for due, index, duty in sorted(pending, key=lambda item: item[:2]):
+            self._enqueue(due, index, duty)
+        self.t_load = self.load_end = self._queue[0][0] if self._queue else math.inf
+        self.next_switch = math.inf
         return abc2complex(self.active)
+
+    def _enqueue(self, due: float, index: int, duty: NDArray[np.float64]) -> None:
+        """Keep the last command when several interrupts feed the same equivalent load."""
+        item = (due, index, duty)
+        if self._queue and abs(self._queue[-1][0] - due) < _TIME_EPS:
+            self._queue[-1] = item
+        else:
+            self._queue.append(item)
 
     def write(self, t: float, d_abc: NDArray[np.float64], theta: float | None = None,
               omega: float | None = None) -> bool:
         """Schedule one delayed bridge input; no deferred completion stage is needed."""
         d = np.clip(np.asarray(d_abc, dtype=float), 0.0, 1.0)
-        self.history = [d.copy(), *self.history[:-1]]
-        self._queue.append((self.apply_time(t), self.k, d.copy()))
+        self.history.insert(0, d)
+        self.history.pop()
+        self._enqueue(self.apply_time(t), self.k, d)
         self.k += 1
         self.t_interrupt = self.interrupt(self.k)
-        self.next_switch = self.load_end = self._queue[0][0]
+        self.t_load = self.load_end = self._queue[0][0]
         return False
 
     def apply(self, t: float) -> complex:
         """Apply all controller commands that reach the bridge at ``t`` and return its new ``q``."""
         while self._queue and self._queue[0][0] <= t + _TIME_EPS:
-            self.active = self._queue.pop(0)[2]
-        self.next_switch = self.load_end = self._queue[0][0] if self._queue else math.inf
+            self.active = self._queue.popleft()[2]
+        self.t_load = self.load_end = self._queue[0][0] if self._queue else math.inf
         return abc2complex(self.active)
 
     def finish_control(self) -> None:
         """The ideal bridge schedules its command immediately; nothing remains to commit."""
 
     def load(self, t: float) -> complex:
-        """An ideal averaged bridge never schedules a register-load event."""
-        raise RuntimeError("an averaging bridge has no register-load event")
+        """Apply the delayed command at its equivalent load instant."""
+        return self.apply(t)
 
     def switches(self, t: float) -> list[complex]:
-        """Return the delayed ideal-source update due at ``t``, if any."""
-        return [self.apply(t)] if abs(self.next_switch - t) < _TIME_EPS else []
+        """An ideal averaged bridge has no switching instants."""
+        return []
 
     def get_state(self) -> dict[str, Any]:
         out = {f"d_{phase}": float(self.active[k]) for k, phase in enumerate("abc")}

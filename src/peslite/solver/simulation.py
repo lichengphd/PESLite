@@ -850,7 +850,8 @@ class Simulation:
                     bridge.finish_control()
                 snapshot(t_local, final=True)
                 break
-            # 1a. PWM compare-register loads due here, after coincident interrupts
+            # 1a. held-input updates due here, after coincident interrupts: a PWM register load or
+            # the single delayed update of an ideal averaged source
             if t_stop < t_final - _EPS:
                 for unit in units:
                     if abs(unit.bridge.t_load - t_stop) < _EPS:

@@ -1,6 +1,7 @@
 """The refactored power-circuit and converter-hardware components."""
 
 import ast
+import math
 from pathlib import Path
 
 import numpy as np
@@ -98,22 +99,43 @@ def test_ideal_averaging_holds_its_initial_value_until_the_delayed_output_arrive
     period = 50e-6
     initial = np.array([0.2, 0.4, 0.6])
     command = np.array([0.8, 0.7, 0.6])
+    assert type(abc2complex(initial)) is complex
     bridge = AveragingBridge(period, period, 0.0, computation=1e-6)
     bridge.reset(initial)
     assert bridge.start(0.0, (None, None), continued=False) == abc2complex(initial)
 
     bridge.write(period, command)
     assert bridge.delay(period) == pytest.approx(1.5 * period)
-    assert bridge.next_switch == pytest.approx(2.5 * period)
+    assert bridge.t_load == pytest.approx(2.0 * period)
+    assert bridge.next_switch == math.inf
     assert abc2complex(bridge.active) == abc2complex(initial)
-    assert bridge.apply(2.5 * period) == abc2complex(command)
+    assert bridge.load(2.0 * period) == abc2complex(command)
 
 
 def test_ideal_averaging_delay_follows_computation_and_pwm_update():
     period = 50e-6
-    assert AveragingBridge(period, period, 0.0, 0.0).delay(period) == pytest.approx(0.5 * period)
-    assert AveragingBridge(period, period / 2, 0.0, 1e-6).delay(period) == pytest.approx(0.75 * period)
-    assert AveragingBridge(period, period / 2, 0.0, 30e-6).delay(period) == pytest.approx(1.25 * period)
+    zero = AveragingBridge(period, period, 0.0, 0.0)
+    assert zero.apply_time(period) == pytest.approx(period)
+    assert zero.delay(period) == pytest.approx(0.5 * period)
+    double = AveragingBridge(period, period / 2, 0.0, 1e-6)
+    assert double.apply_time(period) == pytest.approx(1.5 * period)
+    assert double.delay(period) == pytest.approx(0.75 * period)
+    slow = AveragingBridge(period, period / 2, 0.0, 30e-6)
+    assert slow.apply_time(period) == pytest.approx(2.0 * period)
+    assert slow.delay(period) == pytest.approx(1.25 * period)
+
+
+def test_ideal_averaging_keeps_only_the_last_command_for_one_equivalent_load():
+    load_period = 50e-6
+    bridge = AveragingBridge(load_period / 2, load_period, 0.0, computation=1e-6)
+    bridge.reset(np.array([0.2, 0.4, 0.6]))
+    bridge.start(0.0, (None, None), continued=False)
+    first = np.array([0.3, 0.4, 0.5])
+    last = np.array([0.7, 0.6, 0.5])
+    bridge.write(0.0, first)
+    bridge.write(load_period / 2, last)
+    assert len(bridge._queue) == 1
+    assert bridge.apply(load_period) == abc2complex(last)
 
 
 def test_duty_register_states_are_owned_by_pwm():

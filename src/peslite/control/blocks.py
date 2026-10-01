@@ -27,7 +27,10 @@ _A120_CONJ = A120.conjugate()
 
 def abc2complex(u_abc) -> complex:
     """Convert phase quantities to a peak-scaled space vector (zero sequence dropped)."""
-    return (2.0 / 3.0) * (u_abc[0] + A120 * u_abc[1] + _A240 * u_abc[2])
+    u_a = float(u_abc[0])
+    u_b = float(u_abc[1])
+    u_c = float(u_abc[2])
+    return (2.0 / 3.0) * (u_a + A120 * u_b + _A240 * u_c)
 
 
 def phases(u: complex) -> tuple[float, float, float]:

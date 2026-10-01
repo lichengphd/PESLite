@@ -38,9 +38,10 @@
   asynchronous/synchronous PWM. The former solver-time-step averaging mode and its `over`
   parameter are removed.
 - `units.<u>.bridge.model: averaging` and CLI `--averaging` select a separate ideal controlled
-  voltage source with no PWM peripheral. Each controller output is delayed to the centre of the
-  first equivalent PWM update interval available after `ctrl.computation`; this gives `1.5 Ts`
-  with the defaults and follows `pwm.update`, carrier timing and computation parameters otherwise.
+  voltage source with no PWM peripheral. Each controller output is held from the first equivalent
+  PWM update interval available after `ctrl.computation`; the centre of that held interval gives
+  the effective delay (`1.5 Ts` with the defaults) and follows `pwm.update`, carrier timing and
+  computation parameters otherwise.
   The bridge keeps the same AC/DC/modulation connections in every model. The initial output fills
   the delay history automatically, and `<unit>.bridge.*` states make
   continuation from any saved output row exact. `--averaging` uses the `-averaging` result suffix
