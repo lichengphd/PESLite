@@ -17,7 +17,8 @@ from numpy.typing import NDArray
 
 from ..control.blocks import abc2complex
 
-__all__ = ["PWM", "SwitchingSequence", "Modulator", "Delay", "ComputationDelay", "CarrierComparison",
+__all__ = ["PWM", "SwitchingSequence", "Modulator", "ComputationDelayProtocol", "ComputationDelay",
+           "CarrierComparison",
            "SynchronousCarrier", "ZOH", "TimeStepAveragedCarrier", "carrier", "carrier_position", "duty_fraction",
            "make_modulator"]
 
@@ -46,8 +47,8 @@ class Modulator(Protocol):
 
 
 @runtime_checkable
-class Delay(Protocol):
-    """An N-sample delay line for the duty ratios (computation delay)."""
+class ComputationDelayProtocol(Protocol):
+    """An N-sample delay line for PWM duty-ratio publications."""
 
     n_samples: int
 
@@ -88,22 +89,24 @@ class ComputationDelay:
         for key, value in values.items():
             j_str, _, name = key.partition(".")
             if not j_str.isdigit() or name not in ("d_a", "d_b", "d_c") or int(j_str) >= len(self._buf):
-                raise KeyError(f"computation delay: no state {key!r} (pipeline length {len(self._buf)})")
+                raise KeyError(f"PWM delay: no state {key!r} (pipeline length {len(self._buf)})")
             self._buf[int(j_str)]["abc".index(name[-1])] = float(value)
 
 
 class PWM:
     """The PWM peripheral of a unit: at each publication, every ``period`` (s), the controller's duty
-    ratios pass the computation delay ``delay``, and ``modulator`` turns the duty ratios in force into
+    ratios pass the computation delay, and ``modulator`` turns the duty ratios in force into
     the switching instants of the period.
 
     Named states: ``d_a``, ``d_b``, ``d_c``, the duty ratios in force, and
-    ``shadow.<j>.d_a``/``d_b``/``d_c`` for pending computation-delay publications. Shadow register
+    ``computation_delay.<j>.d_a``/``d_b``/``d_c`` for pending publications. Entry
     ``j = 0`` is applied next.
     """
 
-    def __init__(self, period: float, modulator: Modulator, delay: Delay) -> None:
-        self.period, self.modulator, self.delay = period, modulator, delay
+    def __init__(self, period: float, modulator: Modulator,
+                 computation_delay: ComputationDelayProtocol) -> None:
+        self.period, self.modulator = period, modulator
+        self.computation_delay = computation_delay
         self.k = 0  # the next publication, at k * period
         self.d = np.zeros(3)
         self.sync: tuple[float | None, float | None] = (None, None)  # controller angle, frequency
@@ -117,8 +120,8 @@ class PWM:
         return self.k * self.period
 
     def publish(self, d_abc: NDArray[np.float64], theta: float | None = None, omega: float | None = None) -> None:
-        """Take the controller's duty ratios (and angle and frequency) through the computation delay."""
-        self.d = self.delay(d_abc)
+        """Publish the controller's duty ratios through the PWM computation delay."""
+        self.d = self.computation_delay(d_abc)
         self.sync = (theta, omega)
 
     def modulate(self, t: float) -> complex:
@@ -146,9 +149,9 @@ class PWM:
 
     def get_state(self) -> dict[str, Any]:
         state = {f"d_{ph}": float(self.d[k]) for k, ph in enumerate("abc")}
-        delayed = getattr(self.delay, "get_state", None)
-        if delayed is not None and getattr(self.delay, "set_state", None) is not None:
-            state.update({f"shadow.{name}": value for name, value in delayed().items()})
+        delayed = getattr(self.computation_delay, "get_state", None)
+        if delayed is not None and getattr(self.computation_delay, "set_state", None) is not None:
+            state.update({f"computation_delay.{name}": value for name, value in delayed().items()})
         return state
 
     def set_state(self, values: Mapping[str, Any]) -> None:
@@ -157,11 +160,11 @@ class PWM:
             if f"d_{ph}" in values:
                 d[k] = values[f"d_{ph}"]
         self.d = d
-        shadow = {name[len("shadow."):]: value for name, value in values.items()
-                  if name.startswith("shadow.")}
-        restore = getattr(self.delay, "set_state", None)
-        if shadow and restore is not None:
-            restore(shadow)
+        delayed = {name[len("computation_delay."):]: value for name, value in values.items()
+                   if name.startswith("computation_delay.")}
+        restore = getattr(self.computation_delay, "set_state", None)
+        if delayed and restore is not None:
+            restore(delayed)
 
 
 # ------------------------------------------------------------------ the triangular carrier

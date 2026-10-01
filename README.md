@@ -46,7 +46,7 @@ peslite gfm-psc-example
 peslite gfm-droop-example
 
 # override any parameter by its dotted path
-peslite gfl-example --set simulation.t_end=1 --set units.vsc.delay.steps=1
+peslite gfl-example --set simulation.t_end=1 --set units.vsc.pwm.computation_delay.steps=1
 peslite gfl-example --set simulation.solver.type=adaptive --set simulation.solver.method=DP45
 peslite gfm-droop-example --set units.vsc.averaging.enable=0
 
@@ -73,7 +73,7 @@ import peslite
 p = peslite.load("case.pes", **{"simulation.t_end": 1.0})
 r = peslite.Simulation(p).run()
 
-r.states["plant.vsc.dclink.u_C"]   # a state over time
+r.states["vsc.dclink.u_C"]         # a state over time
 r.plant["vsc.i_c"]                 # plant signals (complex space vectors)
 r.control["vsc.id_pu"]             # controller log of unit "vsc"
 r.final_states()                   # last row, usable as an initial state
@@ -98,7 +98,7 @@ Events use one common top-level mapping:
 ```yaml
 events:
   connect_vsc: {type: connect, target: vsc, t: 0.2, ramp: 1.0}
-  p_step: {type: set, t: 2.0, set: {units.vsc.control.references.p_ref_pu: 0.8}}
+  p_step: {type: set, t: 2.0, set: {units.vsc.ctrl.references.p_ref_pu: 0.8}}
   load_on: {type: connect, target: load, t: 3.0}
   line_trip: {type: disconnect, target: line, t: 4.0}
 ```
@@ -161,11 +161,11 @@ averaging there is no carrier, so carrier phase and synchronisation settings hav
 | `simulation.energy_check` | `warn` \| `strict` \| `off` |
 | `simulation.progress` | `{enable: 1, period: 0.1, watch: [...]}`; CLI: `--progress`, `--watch` |
 | `units.<u>.averaging` | `{enable: 1, over: pwm_period \| time_step}`; CLI: `--averaging` |
-| `units.<u>.control.type` | `gfl` \| `gfm` \| `custom` |
-| `units.<u>.control.loops.<loop>.period` | loop period, s |
-| `units.<u>.measurement.average` | `instantaneous` \| `window` (with `window`) |
+| `units.<u>.ctrl.type` | `gfl` \| `gfm` \| `custom` |
+| `units.<u>.ctrl.loops.<loop>.period` | loop period, s |
+| `units.<u>.meas.average` | `instantaneous` \| `window` (with `window`) |
 | `units.<u>.pwm.method` / `.sync` | `spwm` \| `svpwm`; `asynchronous` \| `synchronous` |
-| `units.<u>.delay.steps` | computation delay in PWM updates |
+| `units.<u>.pwm.computation_delay.steps` | duty-ratio computation delay, in PWM updates |
 | `simulation.output.states` / `.signals` / `.energy` | which files are written |
 
 ## Output
@@ -179,17 +179,18 @@ averaging there is no carrier, so carrier phase and synchronisation settings hav
 | `simulation.pes` | complete resolved simulation file; loading it repeats the run |
 
 Output names use the same unit convention as input parameters: an SI value has no unit suffix,
-while a per-unit value ends in `_pu`. Controller columns are named `ctrl.<unit>.<signal>`. In the
-summary, switches such as `tripped` are 0 or 1, events that did not occur are `null`, and alarms,
-port-Hamiltonian defaults and energy problems are lists.
+while a per-unit value ends in `_pu`. Runtime state paths are entity-first: physical states are
+`<entity>.*`, while converter internals are `<unit>.ctrl.*`, `<unit>.pwm.*` and `<unit>.meas.*`.
+The global solver keeps `solver.*`. In the summary, switches such as `tripped` are 0 or 1, events
+that did not occur are `null`, and alarms, port-Hamiltonian defaults and energy problems are lists.
 
 `--progress SECONDS` prints simulated time and wall time at the configured interval.
 `--watch NAME` appends a value to each line and may be repeated or given comma-separated names.
 A watched name may be a `states.csv` column, a `plant.csv`/controller column, a state alias, or a
 complex state without `.re`/`.im` to print its magnitude. Converters with the same signal use their
-unit prefix, for example `vsc_m.vdc_pu` and `vsc_l.vdc_pu`. For physical-plant states the `plant.`
-domain prefix is optional in watch expressions: `vsc_m.i_c` and `plant.vsc_m.i_c` identify the same
-state. Existing public result columns take precedence for a short name. For example:
+unit prefix, for example `vsc_m.vdc_pu` and `vsc_l.vdc_pu`. State names use the same entity-first
+paths as `states.csv`; there is no separate `plant.*` domain. Existing public result columns take
+precedence when a signal and a state have the same name. For example:
 
 ```bash
 peslite gfl-example --progress 0.1 \
@@ -226,7 +227,7 @@ class MyLaw(SyncLaw):
         self.v_mag = v_ref_pu
 ```
 
-The registered name can then be used at `units.<u>.control.loops.<loop>.type`. Circuit element
+The registered name can then be used at `units.<u>.ctrl.loops.<loop>.type`. Circuit element
 types can likewise be registered with `register_element_type`, and event types with
 `register_event_type`; each type owns a frozen parameter dataclass, so its file parameters use the
 same parsing and validation as built-in types. A user solver may implement the normal solver call
@@ -234,7 +235,7 @@ alone; event-aware solvers may additionally provide `settle()` and `parameters_c
 
 A custom controller output stage can also be built with
 `UniteType(cfg, scenario, pwm_method=..., limiter=...)`. Other replaceable parts are
-`<unit>.modulator`, `<unit>.delay` and `solver`. Executable examples of a custom loop, element,
+`<unit>.modulator`, `<unit>.pwm.computation_delay` and `solver`. Executable examples of a custom loop, element,
 event and user solver live in `tests/test_custom_parts.py`; the root `examples/` directory remains
 simulation-data-only.
 

@@ -65,7 +65,7 @@ class System:
         """Build the system described by ``p``, including registered ``elements`` entries.
 
         parts: replacement units or unit parts keyed ``"<unit>"``, ``"<unit>.ctrl"``, ``"<unit>.modulator"``,
-        ``"<unit>.delay"``.
+        ``"<unit>.pwm.computation_delay"``.
         """
         self.p = p
         parts = dict(parts or {})
@@ -86,7 +86,7 @@ class System:
             self.units[name] = parts.get(name) or Unit(
                 name, cfg, p.simulation, self.buses[cfg.bus],
                 ctrl=parts.get(f"{name}.ctrl"), modulator=parts.get(f"{name}.modulator"),
-                delay=parts.get(f"{name}.delay"))
+                computation_delay=parts.get(f"{name}.pwm.computation_delay"))
 
         # ---------------------------------------------------------- the wiring
         subsystems: dict[str, Any] = dict(self.buses)

@@ -14,9 +14,9 @@ units:
     dclink:
       vdc_ref: 1500.0
       source: {type: voltage}
-    pwm: {f_sw: 20000.0, modulation_limit: 0.95}
+    pwm: {f_sw: 20000.0, modulation_limit: 0.95, computation_delay: {steps: 1}}
     averaging: {enable: 1}
-    control:
+    ctrl:
       type: gfm
       loops:
         power: {type: power, period: 5.0e-5}
@@ -24,11 +24,10 @@ units:
         impedance: {type: virtual_impedance}
         damp: {type: active_damping, period: 5.0e-5, r_a_pu: 0.2, alpha_d: 40.0}
       references: {p_ref_pu: 0.5}
-    delay: {steps: 1}
     protection: {overcurrent: {enable: 1, limit_pu: 1.5}}
 events:
   connect_vsc: {type: connect, target: vsc, t: 0.2, ramp: 1.0}
-  p_step: {type: set, t: 2.0, set: {units.vsc.control.references.p_ref_pu: 0.8}}
+  p_step: {type: set, t: 2.0, set: {units.vsc.ctrl.references.p_ref_pu: 0.8}}
   grid_f: {type: set, t: 4.0, set: {sources.grid.f: 49.8}}
 simulation:
   t_end: 6.0

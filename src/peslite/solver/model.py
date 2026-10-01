@@ -4,8 +4,8 @@ named states.
 A subsystem has ``state``, ``inp`` and ``out`` records (:class:`Bag`) and state derivatives; the
 :class:`Model` packs the states of its subsystems into a flat real vector (two entries per complex
 state) named ``<subsystem>.<state>`` and evaluates their outputs and connections in signal order.
-Every part with a state (a model, a controller, a delay line, a solver) is :class:`Stateful`: it
-gives its state by name, parts are composed by dotted names (``ctrl.vsc.pll``), flattened to the
+Every part with a state (a model, a controller, a PWM peripheral, a solver) is :class:`Stateful`: it
+gives its state by name, parts are composed by dotted names (``vsc.ctrl.pll``), flattened to the
 real columns of ``states.csv`` and resolved from ``initial.states`` values.
 """
 
@@ -113,15 +113,19 @@ def gather(parts: Mapping[str, Any]) -> dict[str, Any]:
     Parts without ``get_state`` are skipped; an empty part name adds no prefix.
     """
     out: dict[str, Any] = {}
+    owners: dict[str, str] = {}
     for pname, part in parts.items():
         get = getattr(part, "get_state", None)
         if get is None:
             continue
-        if pname:
-            for key, value in get().items():
-                out[f"{pname}.{key}" if key else pname] = value
-        else:
-            out.update(get())
+        for key, value in get().items():
+            name = join(pname, key)
+            if name in out:
+                raise ConfigError(
+                    f"state name {name!r} is produced by both {owners[name]!r} and {pname!r}"
+                )
+            out[name] = value
+            owners[name] = pname
     return out
 
 

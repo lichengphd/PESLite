@@ -34,8 +34,8 @@ __all__ = [
     "ConfigError", "load", "dump", "dumps", "read_tree", "read_initial", "from_dict", "to_dict",
     "BaseValues", "DCBase",
     "BusParams", "BranchParams", "SourceParams",
-    "ACFilterParams", "DCLinkParams", "DCCapacitorParams", "DCSourceParams", "PWMParams", "MeasurementParams",
-    "ReferenceParams", "ControlParams", "DelayParams", "OvercurrentParams", "VoltageLimitParams",
+    "ACFilterParams", "DCLinkParams", "DCCapacitorParams", "DCSourceParams", "PWMParams", "ComputationDelayParams",
+    "MeasurementParams", "ReferenceParams", "ControlParams", "OvercurrentParams", "VoltageLimitParams",
     "FrequencyLimitParams", "DCVoltageLimitParams", "RocofParams", "ProtectionParams",
     "AveragingParams", "UnitParams", "RUNTIME", "Change", "runtime_changeable", "set_changes",
     "SolverParams", "SimulationParams", "InitialParams", "OutputParams", "ProgressParams",
@@ -279,6 +279,13 @@ class DCLinkParams:
 
 
 @dataclass(frozen=True)
+class ComputationDelayParams:
+    """Integer-period delay of PWM duty-ratio publications."""
+
+    steps: int = 0  # one step is one PWM output update
+
+
+@dataclass(frozen=True)
 class PWMParams:
     """PWM settings: carrier, modulation method and duty-cycle update period.
 
@@ -292,6 +299,7 @@ class PWMParams:
     method: str = "spwm"  # "spwm" | "svpwm"
     sync: str = "asynchronous"  # "asynchronous" | "synchronous"
     update_period: Optional[float] = None  # s; default: one carrier period
+    computation_delay: ComputationDelayParams = field(default_factory=ComputationDelayParams)
 
     _choices = {"method": ("spwm", "svpwm"), "sync": ("asynchronous", "synchronous")}
 
@@ -356,11 +364,6 @@ class ControlParams:
     samples_per_update: int = field(init=False, default=1)
 
     _choices = {"type": ("gfl", "gfm", "custom")}
-
-
-@dataclass(frozen=True)
-class DelayParams:
-    steps: int = 0  # one step is one PWM output update
 
 
 @dataclass(frozen=True)
@@ -429,7 +432,7 @@ class AveragingParams:
 
 @dataclass(frozen=True)
 class UnitParams:
-    """One converter unit: rating, plant components, control and protection.
+    """One converter unit: rating, plant components, controller and protection.
 
     ``bus``: terminal bus. Plant fields are stored in SI; controller parameters are
     pu on the unit's rating ``s_base`` (VA) and DC base (``dclink.vdc_ref``).
@@ -439,11 +442,10 @@ class UnitParams:
     ac_filter: ACFilterParams
     dclink: DCLinkParams
     pwm: PWMParams
-    control: ControlParams
+    ctrl: ControlParams
     averaging: AveragingParams = field(default_factory=AveragingParams)
-    delay: DelayParams = field(default_factory=DelayParams)
     s_base: Optional[float] = None  # rating (VA); default: the system base
-    measurement: MeasurementParams = field(default_factory=MeasurementParams)
+    meas: MeasurementParams = field(default_factory=MeasurementParams)
     protection: ProtectionParams = field(default_factory=ProtectionParams)
     base: BaseValues = field(init=False, default=None)  # set by resolved()
     derived_defaults: frozenset = field(init=False, default=frozenset(), compare=False)
@@ -471,15 +473,15 @@ class UnitParams:
         if pwm.update_period is None:
             pwm = replace(pwm, update_period=pwm.switching_period)
             derived.add("pwm.update_period")
-        references = self.control.references
+        references = self.ctrl.references
         if references.omega is None:
             references = replace(references, omega=system_base.w0)
-            derived.add("control.references.omega")
-        control = replace(self.control, references=references)
-        sampling_period = control.sampling_period if control.sampling_period is not None else pwm.update_period
-        object.__setattr__(control, "samples_per_update",
+            derived.add("ctrl.references.omega")
+        ctrl = replace(self.ctrl, references=references)
+        sampling_period = ctrl.sampling_period if ctrl.sampling_period is not None else pwm.update_period
+        object.__setattr__(ctrl, "samples_per_update",
                            max(1, int(round(pwm.update_period / sampling_period))))
-        unit = replace(self, pwm=pwm, control=control)
+        unit = replace(self, pwm=pwm, ctrl=ctrl)
         base = system_base if self.s_base is None else BaseValues(
             self.s_base, system_base.v_ll_rms, system_base.f0)
         object.__setattr__(unit, "base", base)
@@ -628,7 +630,7 @@ class Params:
         return base, base.parameter_scales()
 
     def replace(self, **path_values: Any) -> "Params":
-        """Return a copy with dotted paths replaced, e.g. ``replace(**{"units.vsc.control.loops.pll.kp_pu": 20})``."""
+        """Return a copy with dotted paths replaced, e.g. ``replace(**{"units.vsc.ctrl.loops.pll.kp_pu": 20})``."""
         d = to_dict(self)
         assigned = set()
         free = ("simulation.initial.states.", "simulation.solver.subsystems.")  # dotted keys themselves
@@ -895,8 +897,8 @@ RUNTIME = (
     "buses.*.c", "buses.*.r_d",
     "branches.*.l", "branches.*.r",
     "sources.*.v", "sources.*.f", "sources.*.angle", "sources.*.l", "sources.*.r",
-    "units.*.control.references.*",
-    "units.*.control.loops.*.** (not type, period)",
+    "units.*.ctrl.references.*",
+    "units.*.ctrl.loops.*.** (not type, period)",
     "units.*.protection.**",
     "units.*.dclink.source.* (not type)",
     "elements.*.* (not type, bus)",
@@ -928,9 +930,9 @@ def runtime_changeable(path: str, p: Params) -> bool:
     if section == "sources":
         return len(keys) == 1 and keys[0] in ("v", "f", "angle", "l", "r")
     if section == "units":
-        if keys[:2] == ["control", "references"]:
+        if keys[:2] == ["ctrl", "references"]:
             return len(keys) == 3
-        if keys[:2] == ["control", "loops"]:
+        if keys[:2] == ["ctrl", "loops"]:
             return len(keys) >= 4 and keys[3] not in ("type", "period")
         if keys[0] == "protection":
             return True
@@ -1076,11 +1078,11 @@ def _written_out(p: Params) -> dict:
         unit = d["units"][name]
         if unit["s_base"] is None:
             unit["s_base"] = u.base.s_base
-        if unit["control"]["sampling_period"] is None:
-            unit["control"]["sampling_period"] = u.pwm.update_period
-        measurement = unit["measurement"]
-        if measurement["window"] is None and "window" in (measurement["average"], measurement["u_dc"]):
-            measurement["window"] = u.pwm.update_period
+        if unit["ctrl"]["sampling_period"] is None:
+            unit["ctrl"]["sampling_period"] = u.pwm.update_period
+        meas = unit["meas"]
+        if meas["window"] is None and "window" in (meas["average"], meas["u_dc"]):
+            meas["window"] = u.pwm.update_period
     for name, source in d["sources"].items():
         if source["f"] is None:
             source["f"] = p.base.f0

@@ -60,21 +60,23 @@ def test_controller_states_in_pu_are_named_as_pu(examples):
     gfl_names = peslite.Simulation(peslite.load(examples / "gfl-example.pes")).state_names()
     psc_names = peslite.Simulation(peslite.load(examples / "gfm-psc-example.pes")).state_names()
     assert {
-        "ctrl.vsc.pll.integral_pu",
-        "ctrl.vsc.dvc.integral_pu",
-        "ctrl.vsc.cc.integral_pu.re",
-        "plant.vsc.tripped",
+        "vsc.ctrl.pll.integral_pu",
+        "vsc.ctrl.dvc.integral_pu",
+        "vsc.ctrl.cc.integral_pu.re",
+        "vsc.tripped",
     } <= set(gfl_names)
     assert {
-        "ctrl.vsc.power.p_pu",
-        "ctrl.vsc.power.q_pu",
-        "ctrl.vsc.sync.v_int_pu",
+        "vsc.ctrl.power.p_pu",
+        "vsc.ctrl.power.q_pu",
+        "vsc.ctrl.sync.v_int_pu",
     } <= set(psc_names)
     assert not {
-        "ctrl.vsc.pll.integral",
-        "ctrl.vsc.power.p",
-        "plant.vsc.breaker_open",
+        "vsc.ctrl.pll.integral",
+        "vsc.ctrl.power.p",
+        "vsc.breaker_open",
     } & set(gfl_names + psc_names)
+    assert not any(name.startswith(("plant.", "ctrl.", "pwm.", "meas."))
+                   for name in gfl_names + psc_names)
 
 
 def test_grid_following_and_grid_forming_logs_share_names(gfl, examples):
@@ -101,6 +103,6 @@ def test_continuation_uses_the_renamed_states(gfl, tmp_path):
     continued = _run(restarted)
     index = int(np.argmin(abs(result.states["t"] - 0.003)))
     continued_index = int(np.argmin(abs(continued.states["t"] - 0.003)))
-    assert continued.states["ctrl.vsc.pll.integral_pu"][continued_index] == pytest.approx(
-        result.states["ctrl.vsc.pll.integral_pu"][index], rel=1e-9
+    assert continued.states["vsc.ctrl.pll.integral_pu"][continued_index] == pytest.approx(
+        result.states["vsc.ctrl.pll.integral_pu"][index], rel=1e-9
     )

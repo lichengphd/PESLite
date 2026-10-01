@@ -27,7 +27,7 @@ CASE = {
                    "source": {"type": "current", "i_pu": 0.9}},
         "pwm": {"f_sw": 20000.0, "modulation_limit": 0.95},
         "averaging": {"enable": 1},
-        "control": {"type": "gfl", "loops": {
+        "ctrl": {"type": "gfl", "loops": {
             "pll": {"type": "srf_pll", "period": 5e-5, "kp_pu": 20.0, "ki_pu": 1200.0},
             "cc": {"type": "dq_current_pi", "period": 5e-5, "bandwidth": 200.0},
             "dvc": {"type": "dc_voltage_pi", "period": 5e-5, "kp_pu": 0.8,

@@ -7,7 +7,7 @@ from peslite.assembly.params import from_dict
 
 
 def _current(result, name):
-    return np.abs(result.states[f"plant.{name}.re"] + 1j * result.states[f"plant.{name}.im"])
+    return np.abs(result.states[f"{name}.re"] + 1j * result.states[f"{name}.im"])
 
 
 def _two_buses(case, events):

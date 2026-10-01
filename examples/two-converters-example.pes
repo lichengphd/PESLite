@@ -20,8 +20,8 @@ units:
     dclink:
       vdc_ref: 1500.0
       source: {type: voltage}
-    pwm: {f_sw: 20000.0, modulation_limit: 0.95}
-    control:
+    pwm: {f_sw: 20000.0, modulation_limit: 0.95, computation_delay: {steps: 1}}
+    ctrl:
       type: gfm
       loops:
         power: {type: power, period: 5.0e-5}
@@ -29,7 +29,6 @@ units:
         impedance: {type: virtual_impedance}
         damp: {type: active_damping, period: 5.0e-5, r_a_pu: 0.2, alpha_d: 40.0}
       references: {p_ref_pu: 0.5}
-    delay: {steps: 1}
     protection: {overcurrent: {enable: 1, limit_pu: 1.5}}
   vsc_l:
     bus: bus2
@@ -40,7 +39,7 @@ units:
       capacitor: {c_pu: 35.0, r_esr_pu: 0.001}
       source: {type: current, i_pu: 0.9}
     pwm: {f_sw: 10000.0, modulation_limit: 0.95}
-    control:
+    ctrl:
       type: gfl
       loops:
         pll: {type: srf_pll, period: 1.0e-4, kp_pu: 20.0, ki_pu: 1200.0}
@@ -54,7 +53,7 @@ units:
 events:
   connect_vsc_m: {type: connect, target: vsc_m, t: 0.05, ramp: 0.3}
   connect_vsc_l: {type: connect, target: vsc_l, t: 0.05, ramp: 0.3}
-  p_step: {type: set, t: 0.5, set: {units.vsc_m.control.references.p_ref_pu: 0.3}}
+  p_step: {type: set, t: 0.5, set: {units.vsc_m.ctrl.references.p_ref_pu: 0.3}}
   grid_f: {type: set, t: 0.75, set: {sources.grid.f: 49.8}}
 simulation:
   t_end: 1.0

@@ -20,14 +20,21 @@
   `--progress SECONDS` enables the lines; repeatable `--watch NAME` arguments, including
   comma-separated names, replace the file's watch list.
 - Watched names may be state-table columns, plant/controller result columns, state aliases, or a
-  complex state without `.re`/`.im` to report its magnitude. The `plant.` prefix is optional in
-  watch expressions. Unknown names report the known set at the first progress line, and observing
+  complex state without `.re`/`.im` to report its magnitude. State paths are entity-first, with no
+  `plant.*` domain. Unknown names report the known set at the first progress line, and observing
   values does not change the simulation trajectory.
 
 ### Packaging and verification
 
-- Computation-delay queue states are PWM shadow registers named
-  `pwm.<unit>.shadow.<index>.d_a/d_b/d_c`; there is no separate `delay.*` state domain.
+- Runtime states use entity-first paths: `<entity>.*`, `<unit>.ctrl.*`, `<unit>.pwm.*` and
+  `<unit>.meas.*`; global solver bookkeeping remains `solver.*`. Unit configuration uses the same
+  abbreviations under `units.<unit>.ctrl` and `units.<unit>.meas`; old functional-first state names
+  and the `control`/`measurement` configuration keys are not aliases.
+- Computation-delay queue states are owned by PWM and named
+  `<unit>.pwm.computation_delay.<index>.d_a/d_b/d_c`; there is no generic top-level `delay.*`
+  state domain. Their configuration is `units.<unit>.pwm.computation_delay.steps`, and the
+  replaceable Python part is `<unit>.pwm.computation_delay`; other kinds of latency keep their own
+  names and owners.
 - Project version is 0.1.3. The root `examples/` directory remains data-only, keeps the
   `*-example.pes` names and is included in the wheel. The PEP 639 `AGPL-3.0-only` metadata is
   unchanged.
@@ -57,7 +64,7 @@
 ### Output, examples and packaging
 
 - State, control-signal and summary names use the same SI/per-unit convention as inputs.
-  Controller columns use `ctrl.<unit>.<signal>`. Missing events are `None`/JSON `null`, switches
+  Controller states use `<unit>.ctrl.<state>`. Missing events are `None`/JSON `null`, switches
   are 0 or 1, and alarms, port-Hamiltonian defaults and energy problems are lists.
 - Results save the fully resolved configuration as `simulation.pes`; `--resolved` prints the same
   representation, and both resolved and result-saved files can be run again.

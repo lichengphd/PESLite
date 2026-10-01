@@ -127,7 +127,7 @@ def _custom_case(case):
     tree = case()
     unit = tree["units"]["vsc"]
     unit["dclink"] = {"vdc_ref": 1500.0, "source": {"type": "voltage"}}
-    unit["control"] = {
+    unit["ctrl"] = {
         "type": "gfm",
         "loops": {
             "power": {"type": "power", "period": 5e-5},
@@ -158,7 +158,7 @@ def test_registered_custom_parts_and_user_solver_work_together(case):
     original_resistance = load.R
     result = simulation.run()
 
-    assert "ctrl.vsc.sync.p_f_pu" in result.states
+    assert "vsc.ctrl.sync.p_f_pu" in result.states
     assert load.R == pytest.approx(0.5 * original_resistance)
     assert any(abs(end - 0.002) < 1e-14 for end in solver.ends)
     assert result.n_rhs > 0
@@ -167,7 +167,7 @@ def test_registered_custom_parts_and_user_solver_work_together(case):
 @pytest.mark.parametrize(
     ("path", "value", "message"),
     [
-        ("units.vsc.control.loops.sync.tau", 0.0, "tau must be > 0"),
+        ("units.vsc.ctrl.loops.sync.tau", 0.0, "tau must be > 0"),
         ("elements.load.bus", "missing", "unknown bus"),
         ("events.load_step.factor", -1.0, "factor must be > 0"),
     ],

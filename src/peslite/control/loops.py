@@ -418,11 +418,11 @@ class SyncLaw(Loop):
         super().__init__(cfg, unit, scenario)
         self.w0, self.T = unit.base.w0, cfg.period
         self.theta, self.omega = 0.0, self.w0
-        self.v_mag = unit.control.references.v_ref_pu
+        self.v_mag = unit.ctrl.references.v_ref_pu
 
     def initial_outputs(self):
         return {"theta": float(self.theta), "frame": float(self.theta), "omega": float(self.omega),
-                "v_ref": self.unit.control.references.v_ref_pu}
+                "v_ref": self.unit.ctrl.references.v_ref_pu}
 
     def update(self, t, inputs):
         frame = float(self.theta)
@@ -587,7 +587,7 @@ class Matching(SyncLaw):
 
     def __init__(self, cfg, unit, scenario):
         super().__init__(cfg, unit, scenario)
-        vdc_ref_pu = unit.control.references.vdc_ref_pu
+        vdc_ref_pu = unit.ctrl.references.vdc_ref_pu
         self.k_theta = cfg.k_theta_pu if cfg.k_theta_pu is not None else self.w0 / vdc_ref_pu
         self.k_q = cfg.k_q_pu
 

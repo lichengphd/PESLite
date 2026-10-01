@@ -122,25 +122,25 @@ def _control(c, dclink, where: str) -> None:
 def _sampling(c, m, T_pwm: float, where: str) -> None:
     """Check the ADC sampling period and averaging window."""
     if c.sampling_period is not None and (not math.isfinite(c.sampling_period) or c.sampling_period <= 0):
-        raise ConfigError(f"{where}.control.sampling_period must be positive")
+        raise ConfigError(f"{where}.ctrl.sampling_period must be positive")
     if c.sampling_period is not None and c.sampling_period > T_pwm * (1 + 1e-9):
-        raise ConfigError(f"{where}.control.sampling_period is longer than pwm.update_period")
+        raise ConfigError(f"{where}.ctrl.sampling_period is longer than pwm.update_period")
     sampling_period = c.sampling_period if c.sampling_period is not None else T_pwm
     _misaligned("pwm.update_period / control.sampling_period", T_pwm / sampling_period,
-                f"{where}.control.sampling_period")
+                f"{where}.ctrl.sampling_period")
     if m.window is not None and m.window <= 0.0:
-        raise ConfigError(f"{where}.measurement.window must be > 0, got {m.window}")
+        raise ConfigError(f"{where}.meas.window must be > 0, got {m.window}")
     if m.average == "window" or m.u_dc == "window":
         window = m.window if m.window is not None else T_pwm
         if window > T_pwm * (1.0 + 1e-9):
             raise ConfigError(
-                f"{where}.measurement.window = {window} is longer than the PWM update period {T_pwm}")
+                f"{where}.meas.window = {window} is longer than the PWM update period {T_pwm}")
         if sampling_period < T_pwm * (1.0 - 1e-9):
             raise ConfigError(
-                f"{where}: measurement.average = 'window' cannot be combined with a sampling period "
+                f"{where}: meas.average = 'window' cannot be combined with a sampling period "
                 f"shorter than the PWM update period")
     elif m.window is not None:
-        warnings.warn(f"{where}.measurement.window has no effect: no quantity is window-averaged",
+        warnings.warn(f"{where}.meas.window has no effect: no quantity is window-averaged",
                       stacklevel=4)
 
 
@@ -152,10 +152,10 @@ def _unit(u, base, where: str) -> None:
         raise ConfigError(f"{where}.ac_filter.l_f must be > 0")
     _dclink(u.dclink, f"{where}.dclink")
     _pwm(u.pwm, base, f"{where}.pwm")
-    _control(u.control, u.dclink, f"{where}.control")
-    _sampling(u.control, u.measurement, u.pwm.effective_update_period, where)
-    if u.delay.steps < 0:
-        raise ConfigError(f"{where}.delay.steps must be >= 0")
+    _control(u.ctrl, u.dclink, f"{where}.ctrl")
+    _sampling(u.ctrl, u.meas, u.pwm.effective_update_period, where)
+    if u.pwm.computation_delay.steps < 0:
+        raise ConfigError(f"{where}.pwm.computation_delay.steps must be >= 0")
     protection = u.protection
     for name in ("overcurrent", "undervoltage", "overvoltage", "frequency", "dc_voltage", "rocof"):
         _switched(getattr(protection, name), f"{where}.protection.{name}")

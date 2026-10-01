@@ -33,7 +33,7 @@ def test_hold_zero_trips_only_while_the_criterion_is_met(gfl):
         "events.vdc_reference": {
             "type": "set",
             "t": 0.001,
-            "set": {"units.vsc.control.references.vdc_ref_pu": 1.1},
+            "set": {"units.vsc.ctrl.references.vdc_ref_pu": 1.1},
         }
     })
     result = _run(with_event)

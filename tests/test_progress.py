@@ -27,19 +27,19 @@ def test_watch_prints_quantities_on_each_progress_line(tmp_path):
     lines = _progress(
         "--progress", "0.002",
         "--watch", "vsc.vdc_pu",
-        "--watch", "plant.vsc.i_c,plant.vsc.u_dc",
+        "--watch", "vsc.i_c,vsc.u_dc",
         "--out", str(tmp_path),
     )
     assert len(lines) == 4
     for line in lines:
         values = dict(re.findall(r"   (\S+) = (\S+)", line))
-        assert list(values) == ["vsc.vdc_pu", "plant.vsc.i_c", "plant.vsc.u_dc"]
-        assert float(values["plant.vsc.u_dc"]) == pytest.approx(
+        assert list(values) == ["vsc.vdc_pu", "vsc.i_c", "vsc.u_dc"]
+        assert float(values["vsc.u_dc"]) == pytest.approx(
             1500 * float(values["vsc.vdc_pu"]), rel=0.02
         )
     progress = peslite.load(tmp_path / "simulation.pes").simulation.progress
     assert (progress.enable, progress.period) == (True, 0.002)
-    assert progress.watch == ["vsc.vdc_pu", "plant.vsc.i_c", "plant.vsc.u_dc"]
+    assert progress.watch == ["vsc.vdc_pu", "vsc.i_c", "vsc.u_dc"]
 
 
 def test_watch_values_match_result_columns_and_states(gfl, monkeypatch):
@@ -66,25 +66,23 @@ def test_watch_values_match_result_columns_and_states(gfl, monkeypatch):
     columns = result.columns()
     for name in ("pcc.v_a", "vsc.u_dc", "vsc.id_pu", "grid.angle"):
         assert values[name] == pytest.approx(columns[name][index]), name
-    state = complex(result.states["plant.pcc.u_C.re"][index],
-                    result.states["plant.pcc.u_C.im"][index])
-    assert values["plant.pcc.u_C"] == pytest.approx(abs(state))
+    state = complex(result.states["pcc.u_C.re"][index],
+                    result.states["pcc.u_C.im"][index])
     assert values["pcc.u_C"] == pytest.approx(abs(state))
-    assert values["plant.pcc.u_C.re"] == pytest.approx(state.real)
     assert values["pcc.u_C.re"] == pytest.approx(state.real)
-    assert values["plant.vsc.u_dc"] == result.states["plant.vsc.dclink.u_C"][index]
-    assert values["vsc.u_dc"] == pytest.approx(values["plant.vsc.u_dc"])
+    assert values["vsc.u_dc"] == result.states["vsc.dclink.u_C"][index]
 
 
-def test_plant_prefix_is_optional_for_watched_state_names(gfl):
+def test_watch_uses_entity_first_state_names(gfl):
     params = gfl(**{"simulation.progress.enable": 1,
                     "simulation.progress.period": 1e-3})
     simulation = peslite.Simulation(params)
     with redirect_stdout(io.StringIO()):
         simulation.run()
     values = simulation.watch_values(0.002, {})
-    assert values["vsc.i_c"] == pytest.approx(values["plant.vsc.i_c"])
-    assert values["vsc.dclink.u_C"] == pytest.approx(values["plant.vsc.dclink.u_C"])
+    assert "vsc.i_c" in values
+    assert "vsc.dclink.u_C" in values
+    assert not any(name.startswith("plant.") for name in values)
 
 
 def test_watching_does_not_change_the_run(gfl):
@@ -93,7 +91,7 @@ def test_watching_does_not_change_the_run(gfl):
     with redirect_stdout(io.StringIO()):
         first = peslite.Simulation(base).run()
         second = peslite.Simulation(base.replace(**{
-            "simulation.progress.watch": ["vsc.vdc_pu", "plant.pcc.u_C"]
+            "simulation.progress.watch": ["vsc.vdc_pu", "pcc.u_C"]
         })).run()
     for name in first.states:
         assert np.array_equal(first.states[name], second.states[name], equal_nan=True), name

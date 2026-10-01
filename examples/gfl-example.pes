@@ -48,7 +48,7 @@ units:                     # converters, one entry each
         # k_pu: 0.2        # current-source droop: k_pu * (1 - u_C_pu)
         # voltage source: v_pu (emf, default 1), r_pu (series R)
 
-    # measurement:         # the ADC, sampled at every PWM update
+    # meas:                # the ADC, sampled at every PWM update
     #   average: instantaneous  # ac voltage and current: instantaneous | window (mean over (t_k - window, t_k])
     #   u_dc: instantaneous     # the same choice for the dc voltage
     #   window: 50.0e-6    # averaging window, s (default: the PWM update period)
@@ -60,12 +60,13 @@ units:                     # converters, one entry each
       # method: spwm       # spwm | svpwm
       # sync: asynchronous # asynchronous | synchronous (carrier locked to the controller angle)
       # carrier_phase: 0.0 # carrier position at t = 0, in periods
+      # computation_delay: {steps: 0}  # duty-ratio computation delay, in PWM updates
 
     # averaging: {enable: 0, over: pwm_period}  # bridge model: 0 switching; 1 averaging
     #                     # over each pwm_period (no carrier) or each solver time_step (fixed solver)
     #                     # --averaging sets enable 1 for every unit
 
-    control:
+    ctrl:
       type: gfl            # default wiring: gfl | gfm | custom (explicit connections and outputs)
       loops:               # each loop runs every `period` (s) on its own clock
         pll:
@@ -106,9 +107,6 @@ units:                     # converters, one entry each
       # A custom loop type, registered with peslite.register_loop_type, is written here
       # like the built-in ones and its parameters are checked the same way.
 
-    # delay:
-    #   steps: 0           # delay of the duty ratios, in PWM updates
-
     protection:            # trips only this converter; each criterion is switched by enable (1/0)
       overcurrent: {enable: 1, limit_pu: 1.15}   # instantaneous phase current: trips at once
       undervoltage: {enable: 1, limit_pu: 0.50}  # ac voltage magnitude, held for hold
@@ -130,7 +128,7 @@ events:                    # what happens during the run, by name; written only 
   #                        # its protection at the end; other targets have nothing to ramp
   # trip_line: {type: disconnect, target: line1, t: 3.0}
   # load_on: {type: connect, target: load1, t: 1.0}                # load1 starts disconnected
-  # p_step: {type: set, t: 2.0, set: {units.vsc.control.references.p_ref_pu: 0.8}}
+  # p_step: {type: set, t: 2.0, set: {units.vsc.ctrl.references.p_ref_pu: 0.8}}
   #                        # set: new values from t on, paths as for --set: references, loop parameters
   #                        # (not type, period), protection, dc source; a source's v, f, angle, l, r;
   #                        # l, r of lines and elements; c, r_d of buses
@@ -152,7 +150,7 @@ simulation:                # how the model is simulated
     # linearisations: 3    # points of the split error bound (0: none)
   # initial:               # default: buses at their source's emf, dc capacitors at vdc_ref, the rest at zero
   #   t: 0.0
-  #   states: {plant.vsc.u_dc: 1450.0}  # names as in states.csv (--list-states); keywords: source, rated
+  #   states: {vsc.u_dc: 1450.0}  # names as in states.csv (--list-states); keywords: source, rated
   output:
     control_every: 10      # keep every 10th controller sample
     # period: 0.5e-3       # snapshot interval, s
@@ -163,7 +161,7 @@ simulation:                # how the model is simulated
   # progress:              # console lines (--progress SECONDS, --watch NAME)
   #   enable: 0
   #   period: 0.1          # simulated seconds between lines
-  #   watch: [vsc.vdc_pu, vsc.i_c]  # states/outputs; plant. is optional; complex state -> magnitude
+  #   watch: [vsc.vdc_pu, vsc.i_c]  # states/outputs; complex state -> magnitude
   # energy_check: warn     # warn | strict | off
 
 # meta:                    # notes only, text; they do not change the simulation

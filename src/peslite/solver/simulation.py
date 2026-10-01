@@ -29,7 +29,7 @@ from ..assembly.events import EVENT_TYPES, SWITCHING, connected_at, switching_sc
 from ..assembly.params import Change, Params, dump, dumps, load
 from ..assembly.system import System
 from ..assembly.unit import Unit
-from ..components.pwm import Delay, Modulator
+from ..components.pwm import ComputationDelayProtocol, Modulator
 from ..control.blocks import abc2complex, complex2abc
 from ..control.controller import Controller
 from .integrators import Solver
@@ -89,9 +89,11 @@ class SimulationResult:
         for name in self.params.sources:
             if f"{name}.angle" in self.plant:
                 cols[f"{name}.angle"] = self.plant[f"{name}.angle"]
-        for key, arr in self.plant.items():
-            if key.startswith("ctrl."):
-                cols[key[5:]] = arr
+        for unit in self.params.units:
+            prefix = f"{unit}.ctrl."
+            for key, arr in self.plant.items():
+                if key.startswith(prefix):
+                    cols[f"{unit}.{key[len(prefix):]}"] = arr
         return cols
 
     def to_csv(self, path: str | Path) -> None:
@@ -207,7 +209,7 @@ class Recorder:
             self.plant.setdefault(k, []).append(v)
         for unit, log in self.last_ctrl_log.items():
             for k, v in log.items():
-                key = f"ctrl.{unit}.{k}"
+                key = f"{unit}.ctrl.{k}"
                 if key not in self.plant:  # controller signal appearing after the first snapshots
                     self.plant[key] = [math.nan] * n_before
                 self.plant[key].append(v)
@@ -281,7 +283,8 @@ class Simulation:
         """Build every part from ``p`` unless replaced through ``parts`` or ``instances``.
 
         parts: factories keyed ``"system"`` or ``"solver"`` (called with ``p``), or ``"<unit>"``,
-        ``"<unit>.ctrl"``, ``"<unit>.modulator"``, ``"<unit>.delay"`` (called with the unit's section).
+        ``"<unit>.ctrl"`, ``"<unit>.modulator"`, ``"<unit>.pwm.computation_delay"``
+        (called with the unit's section).
         instances: ready objects under the same keys (also ``system=``, ``solver=``); with any
         instance the split error bound is not computed.
         """
@@ -294,7 +297,7 @@ class Simulation:
             given["solver"] = solver
         known = {"system", "solver"}
         for name in p.units:
-            known |= {name, f"{name}.ctrl", f"{name}.modulator", f"{name}.delay"}
+            known |= {name, f"{name}.ctrl", f"{name}.modulator", f"{name}.pwm.computation_delay"}
         for label, what in (("parts", self._factories), ("instances", given)):
             unknown = set(what) - known
             if unknown:
@@ -306,7 +309,7 @@ class Simulation:
 
         unit_parts = {}
         for name, cfg in p.units.items():
-            for key in (name, f"{name}.ctrl", f"{name}.modulator", f"{name}.delay"):
+            for key in (name, f"{name}.ctrl", f"{name}.modulator", f"{name}.pwm.computation_delay"):
                 if key in self._factories:
                     unit_parts[key] = self._factories[key](cfg)
                 elif key in given:
@@ -325,7 +328,8 @@ class Simulation:
             self.solver = make_solver(p.simulation.solver, model=self.system.model,
                                       ratings=self._ratings())
         for unit in self.system.units.values():
-            for obj, proto in ((unit.ctrl, Controller), (unit.pwm.modulator, Modulator), (unit.pwm.delay, Delay)):
+            for obj, proto in ((unit.ctrl, Controller), (unit.pwm.modulator, Modulator),
+                               (unit.pwm.computation_delay, ComputationDelayProtocol)):
                 if not isinstance(obj, proto):
                     raise TypeError(f"{unit.name}: {type(obj).__name__} does not satisfy the "
                                     f"{proto.__name__} protocol")
@@ -419,12 +423,12 @@ class Simulation:
     # ------------------------------------------------------------ states
     def _parts(self) -> dict[str, Any]:
         """The parts that have named states, by their prefix in the state table, in its order."""
-        parts: dict[str, Any] = {"plant": self.system}
+        parts: dict[str, Any] = {"": self.system}
         for name, unit in self.system.units.items():
-            parts[f"ctrl.{name}"] = unit.ctrl
-            parts[f"pwm.{name}"] = unit.pwm
+            parts[f"{name}.ctrl"] = unit.ctrl
+            parts[f"{name}.pwm"] = unit.pwm
             if unit.adc.averaging:
-                parts[f"meas.{name}"] = unit.adc
+                parts[f"{name}.meas"] = unit.adc
         parts["solver"] = self.solver
         return parts
 
@@ -432,7 +436,7 @@ class Simulation:
         """Put the controllers' start-up duty ratios in force and fill the delay pipelines with them."""
         for unit in self.system.units.values():
             unit.pwm.d = np.array(unit.ctrl.initial_duty(), dtype=float)
-            unit.pwm.delay.reset(unit.pwm.d)
+            unit.pwm.computation_delay.reset(unit.pwm.d)
 
     def watch_values(self, t: float,
                      ctrl_logs: Mapping[str, Mapping[str, float]]) -> dict[str, float]:
@@ -443,24 +447,19 @@ class Simulation:
         """
         system = self.system
         plant = {key: np.asarray([value]) for key, value in system.signals(t).items()}
-        plant.update({f"ctrl.{unit}.{key}": np.asarray([value])
+        plant.update({f"{unit}.ctrl.{key}": np.asarray([value])
                       for unit, log in ctrl_logs.items() for key, value in log.items()})
         row = SimulationResult(params=self.p, t=np.asarray([t]), plant=plant, control={}).columns()
         values = {key: float(value[0]) for key, value in row.items() if key != "t"}
         state = gather(self._parts())
         for alias, name in getattr(system, "state_aliases", {}).items():
-            if f"plant.{name}" in state:
-                state[f"plant.{alias}"] = state[f"plant.{name}"]
+            if name in state:
+                state[alias] = state[name]
         complex_values = {key: abs(value) for key, value in state.items()
                           if isinstance(value, complex)}
         flat_values = flatten(state)
         values.update(complex_values)
         values.update(flat_values)
-        # For watch expressions, physical-plant states also have a device-first shorthand.
-        # Public plant/controller result columns keep precedence if the shorthand already exists.
-        for key, value in {**complex_values, **flat_values}.items():
-            if key.startswith("plant."):
-                values.setdefault(key[len("plant."):], value)
         return values
 
     def state_names(self) -> list[str]:
@@ -472,19 +471,16 @@ class Simulation:
     def _apply_initial(self, t0: float) -> np.ndarray:
         """Load ``initial.states`` into the parts; return the solver vector."""
         system = self.system
-        aliases = {f"plant.{a}": f"plant.{c}" for a, c in getattr(system, "state_aliases", {}).items()}
+        aliases = dict(getattr(system, "state_aliases", {}))
         presets_of = getattr(system, "state_presets", None)
         presets = presets_of(t0) if presets_of is not None else {}
-        if callable(presets):  # state-dependent keywords: strip the "plant." prefix
-            inner = presets
-            presets = lambda key, word: inner(key[6:] if key.startswith("plant.") else key, word)  # noqa: E731
         self._start_duty()  # so that the duty ratios and shadow registers have their states
         template = gather(self._parts())
         try:
             given = expand_aliases(self.p.simulation.initial.states, aliases)
             if callable(presets):
                 for bus in getattr(system, "buses", {}):
-                    key = f"plant.{bus}.u_C"
+                    key = f"{bus}.u_C"
                     if key not in template or any(name == key or name.startswith(key + ".") for name in given):
                         continue
                     try:
@@ -498,7 +494,7 @@ class Simulation:
                 msg += f". Aliases: {', '.join(f'{a} -> {c}' for a, c in aliases.items())}"
             raise ConfigError(msg) from None
         # 1. power stage (unset states stay zero), events up to t0, then the solver vector
-        scatter({"plant": system}, values)
+        scatter({"": system}, values)
         if hasattr(system, "switch"):
             for name, steps in switching_schedule(self.p.events).items():
                 if not connected_at(steps, t0):
@@ -515,13 +511,13 @@ class Simulation:
                 align(unit.ports.u_g(), unit.ports.u_dc())
             unit.adc.seed()  # averaging window starts at t0
             unit.pwm.d = np.array(unit.ctrl.initial_duty(), dtype=float)
-            unit.pwm.delay.reset(unit.pwm.d)
-            scatter({f"pwm.{name}": unit.pwm}, values)
+            unit.pwm.computation_delay.reset(unit.pwm.d)
+            scatter({f"{name}.pwm": unit.pwm}, values)
         # 3. controllers, measurement windows, solver
         for name, unit in system.units.items():
-            scatter({f"ctrl.{name}": unit.ctrl}, values)
+            scatter({f"{name}.ctrl": unit.ctrl}, values)
             if unit.adc.averaging:
-                scatter({f"meas.{name}": unit.adc}, values)
+                scatter({f"{name}.meas": unit.adc}, values)
         scatter({"solver": self.solver}, values)
         return y
 
@@ -802,7 +798,7 @@ class Simulation:
                 else:
                     summary.update(split_error_bound(
                         solver, loop, t_arr, state_arrays, p.simulation.solver.linearisations,
-                        labels=mdl.state_labels(), prefix="plant."))
+                        labels=mdl.state_labels(), prefix=""))
             else:  # parts given as instances
                 summary["split_bound"] = ("the loop has custom parts given as instances, so it cannot be "
                                           "rebuilt for the linearisation: pass them as factories of the "
@@ -839,6 +835,7 @@ class SystemLoop:
         self.period = macro_period(self.periods)
         self.w0 = 2.0 * math.pi * sim.p.base.f0
         self._flags = {k for k, v in gather(sim._parts()).items() if isinstance(v, bool)}
+        self._plant_columns = set(flatten(gather({"": sim.system})))
         rated = sim.solver.rated_effort
         self._rated = ({lab: float(r) for lab, r in zip(sim.system.model.state_labels(), rated)}
                        if rated is not None else {})
@@ -867,15 +864,15 @@ class SystemLoop:
                 used.add(c)
             elif c.endswith(".re") and c[:-3] + ".im" in names:
                 base = c[:-3]
-                turns = base.startswith("plant.")  # alpha-beta; a controller vector is already in dq
-                scale = self._rated.get(base[len("plant."):] + ".re", 0.0) if turns else 0.0
+                turns = c in self._plant_columns  # physical alpha-beta; controller vectors are already dq
+                scale = self._rated.get(base + ".re", 0.0) if turns else 0.0
                 cols.append(("vector" if turns else "fixed", [c, base + ".im"], scale if scale > 0 else 1.0))
                 used.update(cols[-1][1])
             elif c.endswith(".d_a") and c[:-4] + ".d_b" in names and c[:-4] + ".d_c" in names:
                 cols.append(("triple", [c[:-4] + f".d_{ph}" for ph in "abc"], 1.0))
                 used.update(cols[-1][1])
             else:
-                scale = self._rated.get(c[len("plant."):], 0.0) if c.startswith("plant.") else 0.0
+                scale = self._rated.get(c, 0.0) if c in self._plant_columns else 0.0
                 cols.append(("scalar", [c], scale if scale > 0 else 1.0))
                 used.add(c)
         return cols
@@ -947,7 +944,7 @@ class SystemLoop:
         res = sim.run()
         out = {k: float(v[-1]) for k, v in res.states.items() if k != "t"}
         if view is not None and view[2] == "c":
-            out["plant." + view[0]] -= view[1]
+            out[view[0]] -= view[1]
         return out
 
 
@@ -1081,8 +1078,9 @@ def main(argv=None) -> int:
         return (f"averaging over the {unit.averaging.over.replace('_', ' ')}"
                 if unit.averaging.enable else "switching")
 
-    units = ", ".join(f"{n} ({u.control.type}, {bridge_model(u)}, "
-                      f"PWM {1e-3 / u.pwm.update_period:.0f} kHz, delay {u.delay.steps})"
+    units = ", ".join(f"{n} ({u.ctrl.type}, {bridge_model(u)}, "
+                      f"PWM {1e-3 / u.pwm.update_period:.0f} kHz, computation delay "
+                      f"{u.pwm.computation_delay.steps})"
                       for n, u in p.units.items())
     print(f"peslite: {config}  units={units}  "
           f"solver={p.simulation.solver.type}/{p.simulation.solver.method}  "

@@ -10,7 +10,7 @@ from typing import Any, Mapping, Optional
 from ..components.adc import ADC, MeasurementPorts
 from ..components.converter import Bridge, make_dclink
 from ..components.network import RLBranch
-from ..components.pwm import PWM, ComputationDelay, Delay, Modulator, make_modulator
+from ..components.pwm import PWM, ComputationDelay, ComputationDelayProtocol, Modulator, make_modulator
 from ..control.controller import Controller, make_controller
 from .events import UnitScenario
 from .params import SimulationParams, UnitParams
@@ -21,14 +21,14 @@ __all__ = ["Unit"]
 class Unit:
     """One converter unit built from its parameter section, connected to ``bus``.
 
-    ``ctrl``, ``modulator``, ``delay``: replacements of the parts built from the section. The unit
+    ``ctrl``, ``modulator``, ``computation_delay``: replacements of the parts built from the section. The unit
     samples with ``adc``, controls with ``ctrl`` and switches its bridge through ``pwm``.
     Events connect or disconnect its filter and DC source and may retune runtime parameters.
     """
 
     def __init__(self, name: str, cfg: UnitParams, sim: SimulationParams, bus: Any,
                  ctrl: Optional[Controller] = None, modulator: Optional[Modulator] = None,
-                 delay: Optional[Delay] = None) -> None:
+                 computation_delay: Optional[ComputationDelayProtocol] = None) -> None:
         self.name = name
         self.cfg = cfg
         self.bus = bus
@@ -46,7 +46,7 @@ class Unit:
 
         # ------------------------------------------------------------ ADC
         # instantaneous samples or window means; the window holds only the averaged channels
-        meas = cfg.measurement
+        meas = cfg.meas
         channels: dict[str, complex | float] = {}
         if meas.average == "window":
             channels["v"], channels["i"] = 0j, 0j
@@ -57,14 +57,18 @@ class Unit:
             i_c_state=lambda: self.branch_f.state.i, u_dc=lambda: self.dclink.out.u_dc,
             i_dc=lambda: self.dclink.inp.i_dc)
         T_s = cfg.pwm.update_period  # PWM publication interval
-        self.adc = ADC(self.ports, T_s, int(cfg.control.samples_per_update),
+        self.adc = ADC(self.ports, T_s, int(cfg.ctrl.samples_per_update),
                        meas.window if meas.window is not None else T_s, channels)
 
         # ------------------------------------------------------------ control
         self.ctrl = ctrl if ctrl is not None else make_controller(cfg, sc)
-        self.pwm = PWM(T_s, modulator if modulator is not None else
-                       make_modulator(cfg.pwm, cfg.base.f0, cfg.averaging, sim),
-                       delay if delay is not None else ComputationDelay(cfg.delay.steps))
+        self.pwm = PWM(
+            T_s,
+            modulator if modulator is not None else
+            make_modulator(cfg.pwm, cfg.base.f0, cfg.averaging, sim),
+            computation_delay if computation_delay is not None else
+            ComputationDelay(cfg.pwm.computation_delay.steps),
+        )
         self.zoh = f"{name}.q"                   # model label of the bridge's held switching state
 
     # ---------------------------------------------------------------- assembly

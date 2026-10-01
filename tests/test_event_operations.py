@@ -91,7 +91,7 @@ def test_builtin_load_is_typed_scaled_built_and_written():
         "simulation.energy_check": "off",
     })
     result = peslite.Simulation(quick).run()
-    assert "plant.load.branch.i.re" in result.states
+    assert "load.branch.i.re" in result.states
 
 
 @pytest.mark.parametrize(
@@ -201,9 +201,9 @@ def test_system_applies_retunes_and_control_loops_keep_their_state():
         "branches.line.r_pu": 0.02,
         "elements.load.r_pu": 1.0,
         "units.vsc.dclink.source.i_pu": 0.5,
-        "units.vsc.control.references.p_ref_pu": 0.4,
-        "units.vsc.control.loops.pll.kp_pu": 10.0,
-        "units.vsc.control.loops.dvc.kp_pu": 0.4,
+        "units.vsc.ctrl.references.p_ref_pu": 0.4,
+        "units.vsc.ctrl.loops.pll.kp_pu": 10.0,
+        "units.vsc.ctrl.loops.dvc.kp_pu": 0.4,
         "units.vsc.protection.hold": 0.01,
         "units.vsc.protection.rocof.window": 0.2,
     }}

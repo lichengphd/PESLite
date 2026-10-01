@@ -111,7 +111,7 @@ def test_time_step_averaging_follows_carrier_within_each_period(gfl):
     for over in ("pwm_period", "time_step"):
         params = gfl(**{"units.vsc.averaging.over": over,
                         "simulation.output.period": 12.5e-6})
-        runs[over] = peslite.Simulation(params).run().states["plant.vsc.branch_f.i.re"]
+        runs[over] = peslite.Simulation(params).run().states["vsc.branch_f.i.re"]
     ripple = {name: np.ptp(np.diff(values[-40:], 2)) for name, values in runs.items()}
     assert ripple["time_step"] > 10 * ripple["pwm_period"]
 

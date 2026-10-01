@@ -100,18 +100,18 @@ class Controller(Protocol):
 
 # kinds of input source
 _HELD, _MEASURED, _CONSTANT = 0, 1, 2
-_MEASUREMENTS = {"measurement.u_g": "u_g", "measurement.i_c": "i_c", "measurement.u_dc": "u_dc"}
+_MEASUREMENTS = {"meas.u_g": "u_g", "meas.i_c": "i_c", "meas.u_dc": "u_dc"}
 _REFERENCES = {"id_ref_pu": CURRENT, "iq_ref_pu": CURRENT, "theta": ANGLE, "omega": FREQUENCY,
                "p_ref_pu": POWER_PU, "q_ref_pu": POWER_PU, "v_ref_pu": VOLTAGE,
                "vdc_ref_pu": DC_VOLTAGE, "zero_v_pu": V_DQ}
 
 
 class ControlGraph:
-    """The loops of ``cfg.control.loops`` wired by typed ports, each run on its own clock.
+    """The loops of ``cfg.ctrl.loops`` wired by typed ports, each run on its own clock.
 
-    Loop inputs are held outputs of other loops, the pu measurement (``measurement.u_g``, ``.i_c``,
+    Loop inputs are held outputs of other loops, the pu measurement (``meas.u_g``, ``.i_c``,
     ``.u_dc``) or the references (``references.<name>``); ``connections`` and ``outputs`` are the
-    default wiring, which ``cfg.control.connections`` and ``.outputs`` override. Loops run in signal
+    default wiring, which ``cfg.ctrl.connections`` and ``.outputs`` override. Loops run in signal
     order; a loop without a period runs whenever the loops before it do.
 
     Retuned parameters are queued by :meth:`schedule` and take effect at the next update. Changed
@@ -122,19 +122,19 @@ class ControlGraph:
         self.cfg, self.scenario = cfg, scenario
         self._pending: list[Any] = []
         self.on_retune = None
-        self.connections = {**connections, **cfg.control.connections}
-        self.outputs = {**outputs, **cfg.control.outputs}
+        self.connections = {**connections, **cfg.ctrl.connections}
+        self.outputs = {**outputs, **cfg.ctrl.outputs}
         self.nodes = {}
         self.periods = {}
         self.ticks = {}
         self.values: dict[str, Any] = {}
         self._out_specs: dict[str, tuple] = {}
         self.updated = set()
-        refs = cfg.control.references
+        refs = cfg.ctrl.references
         self.references = {f.name: getattr(refs, f.name) for f in fields(refs)}
-        types = {"measurement.u_g": V_AB, "measurement.i_c": I_AB, "measurement.u_dc": DC_VOLTAGE,
+        types = {"meas.u_g": V_AB, "meas.i_c": I_AB, "meas.u_dc": DC_VOLTAGE,
                  **{f"references.{k}": v for k, v in _REFERENCES.items()}}
-        for name, loop in cfg.control.loops.items():
+        for name, loop in cfg.ctrl.loops.items():
             cls = LOOP_TYPES.get(loop.type)
             if cls is None:
                 raise ConfigError(f"control.loops.{name}: no loop type {loop.type!r} is registered")
@@ -207,13 +207,13 @@ class ControlGraph:
         """Apply queued references and rebuild loops whose parameters changed."""
         while self._pending:
             cfg = self._pending.pop(0)
-            control = cfg.control
-            if control.references != self.cfg.control.references:
-                self.references = {f.name: getattr(control.references, f.name)
-                                   for f in fields(control.references)}
+            ctrl = cfg.ctrl
+            if ctrl.references != self.cfg.ctrl.references:
+                self.references = {f.name: getattr(ctrl.references, f.name)
+                                   for f in fields(ctrl.references)}
                 self._rewire()
-            changed = [name for name, params in control.loops.items()
-                       if params != self.cfg.control.loops[name]]
+            changed = [name for name, params in ctrl.loops.items()
+                       if params != self.cfg.ctrl.loops[name]]
             self.cfg = cfg
             for name in changed:
                 self._retune(name)
@@ -221,13 +221,13 @@ class ControlGraph:
     def _retune(self, name):
         """Rebuild one loop and continue from the old instance's state."""
         old = self.nodes[name]
-        params = self.cfg.control.loops[name]
+        params = self.cfg.ctrl.loops[name]
         fresh = LOOP_TYPES[params.type](params, self.cfg, self.scenario)
         try:
             fresh.set_state(old.get_state())
         except (KeyError, ValueError) as exc:
             raise ConfigError(
-                f"control.loops.{name}: with the parameters of a set event it has other "
+                f"ctrl.loops.{name}: with the parameters of a set event it has other "
                 f"states than before ({exc}), so it cannot continue from them") from None
         fresh.retuned(old)
         self.nodes[name] = fresh
@@ -334,7 +334,7 @@ class ControlGraph:
         return self._read(*self._output_source[port], meas)
 
     def describe(self):
-        return {"loops": {n: {"type": self.cfg.control.loops[n].type, "period": self.periods[n]}
+        return {"loops": {n: {"type": self.cfg.ctrl.loops[n].type, "period": self.periods[n]}
                           for n in self.order}, "connections": dict(self.connections), "outputs": dict(self.outputs)}
 
     # ------------------------------------------------------------ states
@@ -384,13 +384,13 @@ def default_wiring(cfg, family):
     """
     if family == "custom":
         return {}, {}
-    loops = cfg.control.loops
+    loops = cfg.ctrl.loops
     roles = {name: getattr(LOOP_TYPES.get(p.type), "role", None) for name, p in loops.items()}
 
     def find(role):
         found = [n for n, r in roles.items() if r == role]
         if len(found) > 1:
-            raise ConfigError(f"control.loops: ambiguous {family} role {found}; use control.type = 'custom' "
+            raise ConfigError(f"ctrl.loops: ambiguous {family} role {found}; use ctrl.type = 'custom' "
                               "and explicit connections/outputs for multiple instances of this role")
         return found[0] if len(found) == 1 else None
     pll, sync = find("pll"), find("sync")
@@ -402,19 +402,19 @@ def default_wiring(cfg, family):
     va, vi, damping = find("admittance"), find("impedance"), find("damping")
     extra = f"{damping}.extra" if damping else "references.zero_v_pu"
     ports_of = {
-        "pll": {"v": "measurement.u_g"},
-        "dc_voltage": {"u_dc": "measurement.u_dc", "vdc_ref": "references.vdc_ref_pu"},
-        "current": {"v": "measurement.u_g", "i": "measurement.i_c", "frame": frame, "omega": omega,
+        "pll": {"v": "meas.u_g"},
+        "dc_voltage": {"u_dc": "meas.u_dc", "vdc_ref": "references.vdc_ref_pu"},
+        "current": {"v": "meas.u_g", "i": "meas.i_c", "frame": frame, "omega": omega,
                     "extra": extra, "id_ref": f"{va or dc}.id_ref" if va or dc else "references.id_ref_pu",
                     "iq_ref": f"{va}.iq_ref" if va else "references.iq_ref_pu"},
-        "power": {"v": "measurement.u_g", "i": "measurement.i_c"},
-        "sync": {"p": f"{power}.p", "q": f"{power}.q", "v": "measurement.u_g", "i": "measurement.i_c",
-                 "u_dc": "measurement.u_dc", "p_ref": "references.p_ref_pu", "q_ref": "references.q_ref_pu",
+        "power": {"v": "meas.u_g", "i": "meas.i_c"},
+        "sync": {"p": f"{power}.p", "q": f"{power}.q", "v": "meas.u_g", "i": "meas.i_c",
+                 "u_dc": "meas.u_dc", "p_ref": "references.p_ref_pu", "q_ref": "references.q_ref_pu",
                  "v_ref": "references.v_ref_pu"},
-        "impedance": {"v_ref": f"{sync}.v_ref", "frame": frame, "omega": omega, "i": "measurement.i_c",
+        "impedance": {"v_ref": f"{sync}.v_ref", "frame": frame, "omega": omega, "i": "meas.i_c",
                       "extra": extra},
-        "admittance": {"v_ref": f"{sync}.v_ref", "frame": frame, "omega": omega, "v": "measurement.u_g"},
-        "damping": {"i": "measurement.i_c", "frame": frame},
+        "admittance": {"v_ref": f"{sync}.v_ref", "frame": frame, "omega": omega, "v": "meas.u_g"},
+        "damping": {"i": "meas.i_c", "frame": frame},
     }
     wires = {f"{name}.{port}": source for name, role in roles.items()
              for port, source in ports_of.get(role, {}).items()
@@ -428,7 +428,7 @@ def default_wiring(cfg, family):
 class UniteType:
     """Configurable controller of one unit: its loop network, protection and output stage.
 
-    ``cfg``: the unit's parameters; ``cfg.control.type``: ``"gfl"``, ``"gfm"`` or ``"custom"`` (no
+    ``cfg``: the unit's parameters; ``cfg.ctrl.type``: ``"gfl"``, ``"gfm"`` or ``"custom"`` (no
     default wiring). ``scenario``: the unit's connection state and ramp over time.
     ``pwm_method``, ``limiter``: see :class:`~peslite.control.modulation.OutputStage`.
     ``update()`` advances the due loops; ``__call__`` is the PWM publication. Integrating loops
@@ -438,7 +438,7 @@ class UniteType:
     def __init__(self, cfg, scenario, pwm_method=None, *, limiter=CONFIGURED):
         self.p = cfg
         self.scenario = scenario
-        wires, outputs = default_wiring(cfg, cfg.control.type)
+        wires, outputs = default_wiring(cfg, cfg.ctrl.type)
         self.graph = graph = ControlGraph(cfg, scenario, wires, outputs)
         self.periods = graph.periods
         self.T_s = cfg.pwm.update_period
@@ -466,7 +466,7 @@ class UniteType:
         self._frame_key = f"{graph.outputs['theta'].partition('.')[0]}.frame"
         self._dc, self._sync = first("dc_voltage"), first("sync")
         self._frame_cc, self._log_cc = first("current", "frame"), first("current", "id_ref")
-        self._is_gfl = cfg.control.type == "gfl"
+        self._is_gfl = cfg.ctrl.type == "gfl"
         self._p_key, self._q_key, self._v_ref_key = f"{first('power')}.p", f"{first('power')}.q", f"{self._sync}.v_ref"
 
     def _find_nodes(self, name=None):
@@ -480,7 +480,7 @@ class UniteType:
 
     def retune(self, cfg, paths, t):
         """Queue new control parameters and apply new protection settings."""
-        if any(path.startswith("control.") for path in paths):
+        if any(path.startswith("ctrl.") for path in paths):
             self.graph.schedule(cfg)
         if any(path.startswith("protection.") for path in paths):
             self.protection.retune(cfg.protection)
@@ -643,10 +643,10 @@ class UniteType:
             summary["id_ref_limit_fraction"] = dc.n_clamped / max(1, dc.n_updates)
             summary["id_ref_limit_first_t"] = dc.first_clamp_t
         if self._sync is not None:
-            summary["law"] = self.p.control.loops[self._sync].type
+            summary["law"] = self.p.ctrl.loops[self._sync].type
         return summary
 
 
 def make_controller(cfg, scenario, **kwargs):
-    """Build the :class:`UniteType` controller of a unit from ``cfg.control``."""
+    """Build the :class:`UniteType` controller of a unit from ``cfg.ctrl``."""
     return UniteType(cfg, scenario, **kwargs)

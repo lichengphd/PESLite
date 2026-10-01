@@ -96,8 +96,8 @@ def test_annotated_gfl_example_lists_every_option():
 
 def _bus_start(params, bus):
     result = peslite.Simulation(params).run()
-    voltage = complex(result.states[f"plant.{bus}.u_C.re"][0],
-                      result.states[f"plant.{bus}.u_C.im"][0])
+    voltage = complex(result.states[f"{bus}.u_C.re"][0],
+                      result.states[f"{bus}.u_C.im"][0])
     return voltage / params.base.v_phase_peak
 
 
@@ -106,7 +106,7 @@ def test_initial_states_default_to_source_and_rated_dc(gfl):
     assert params.simulation.initial.states == {}
     assert _bus_start(params, "pcc") == pytest.approx(1.0)
     result = peslite.Simulation(params).run()
-    assert result.states["plant.vsc.dclink.u_C"][0] == 1500.0
+    assert result.states["vsc.dclink.u_C"][0] == 1500.0
     assert _bus_start(gfl(**{"sources.grid.v_pu": 1.05}), "pcc") == pytest.approx(1.05)
 
 
@@ -126,14 +126,20 @@ def test_bus_without_own_source_keeps_default_and_explicit_values_win(case):
     assert [abs(_bus_start(params, bus)) for bus in ("pcc", "b2", "b3")] == pytest.approx(
         [1.05, 0.95, 1.0]
     )
-    explicit = params.replace(**{"simulation.initial.states.plant.pcc.u_C": [500.0, 0.0]})
+    explicit = params.replace(**{"simulation.initial.states.pcc.u_C": [500.0, 0.0]})
     assert _bus_start(explicit, "pcc") * params.base.v_phase_peak == pytest.approx(500.0)
 
 
 def test_dataclass_rebuild_keeps_defaults_following_the_system_base(gfl):
     params = gfl()
+    pwm = dataclasses.replace(
+        params.unit("vsc").pwm,
+        computation_delay=dataclasses.replace(
+            params.unit("vsc").pwm.computation_delay, steps=1
+        ),
+    )
     unit = dataclasses.replace(
-        params.unit("vsc"), delay=dataclasses.replace(params.unit("vsc").delay, steps=1)
+        params.unit("vsc"), pwm=pwm
     )
     rebuilt = dataclasses.replace(params, units={"vsc": unit}).replace(**{"base.s_base": 1.0e6})
     assert rebuilt.unit("vsc").base.s_base == 1.0e6
@@ -141,7 +147,7 @@ def test_dataclass_rebuild_keeps_defaults_following_the_system_base(gfl):
 
 def test_unused_measurement_window_is_warned_about(gfl):
     with pytest.warns(UserWarning, match="window has no effect"):
-        gfl(**{"units.vsc.measurement.window": 25e-6})
+        gfl(**{"units.vsc.meas.window": 25e-6})
 
 
 def test_resolved_cli_prints_a_loadable_complete_file():

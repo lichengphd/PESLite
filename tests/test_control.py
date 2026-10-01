@@ -43,18 +43,18 @@ def test_registered_loop_owns_its_schema_and_uses_default_role_wiring():
         **{"simulation.t_end": 0.01},
     )
     p = p.replace(**{
-        "units.vsc.control.loops.sync": {
+        "units.vsc.ctrl.loops.sync": {
             "type": "test_fixed_frequency",
             "period": 5e-5,
         }
     })
     sim = peslite.Simulation(p)
     ctrl = sim.unit().ctrl
-    assert type(p.unit().control.loops["sync"]) is _FixedFrequency.Params
+    assert type(p.unit().ctrl.loops["sync"]) is _FixedFrequency.Params
     assert ctrl.graph.connections["impedance.v_ref"] == "sync.v_ref"
     result = sim.run()
     assert result.summary["vsc.law"] == "test_fixed_frequency"
-    assert result.states["ctrl.vsc.sync.theta"][-1] == pytest.approx(
+    assert result.states["vsc.ctrl.sync.theta"][-1] == pytest.approx(
         2 * np.pi * 50.0 * 0.01, rel=1e-9
     )
 
@@ -70,7 +70,7 @@ def test_loop_registration_and_loop_owned_validation():
     with pytest.raises(ConfigError, match="loops.va.x_v_pu must be positive"):
         peslite.load(
             EXAMPLES / "gfm-droop-example.pes",
-            **{"units.vsc.control.loops.va.x_v_pu": 0.0},
+            **{"units.vsc.ctrl.loops.va.x_v_pu": 0.0},
         )
 
 
