@@ -170,10 +170,31 @@ def test_numeric_histories_are_streamed_and_energy_history_is_optional(gfl, tmp_
         "simulation.output.period": 5e-5,
         "simulation.output.signals": 1,
         "simulation.output.energy": 1,
+        "simulation.solver.phs_check_step": 1,
     }), tmp_path / "with-energy")
     assert len(with_energy.energy["t"]) == len(with_energy.t)
     assert all(isinstance(values, np.ndarray) for values in with_energy.energy.values())
     assert with_energy._records.plant_table.batch_rows == 1000
 
+    default_energy_checks = _run(gfl(**{
+        "simulation.t_end": 0.002,
+        "simulation.output.period": 1e-6,
+        "simulation.output.energy": 1,
+    }), tmp_path / "default-energy-checks")
+    assert default_energy_checks.energy["t"] == pytest.approx([0.0, 0.001, 0.002])
+
     with pytest.raises(ConfigError, match="solver.write_length must be >= 1"):
         gfl(**{"simulation.solver.write_length": 0})
+    with pytest.raises(ConfigError, match="solver.phs_check_step must be >= 1"):
+        gfl(**{"simulation.solver.phs_check_step": 0})
+
+
+def test_phs_check_step_does_not_change_the_simulation(gfl, tmp_path):
+    base = {"simulation.t_end": 0.002, "simulation.output.period": 5e-6}
+    dense = _run(gfl(**base, **{"simulation.solver.phs_check_step": 1}),
+                 tmp_path / "dense-phs-checks")
+    sparse = _run(gfl(**base, **{"simulation.solver.phs_check_step": 1000}),
+                  tmp_path / "sparse-phs-checks")
+    assert dense.n_rhs == sparse.n_rhs
+    for name, values in dense.states.items():
+        assert np.array_equal(values, sparse.states[name]), name

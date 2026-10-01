@@ -662,12 +662,17 @@ class Simulation:
 
         mode = p.simulation.energy_check
         energy_on = mode != "off" and hasattr(mdl, "energy_balance")
+        phs_check_step = p.simulation.solver.phs_check_step
+        snapshot_index = 0
         worst = {"tellegen": 0.0, "balance": 0.0}
         stop_reason = ""
         coarse_reported = False
         stopped = False
         adc_inputs_changed = False
         def snapshot(t_now: float, final: bool = False) -> None:
+            nonlocal snapshot_index
+            audit_due = energy_on and (snapshot_index % phs_check_step == 0 or final)
+            snapshot_index += 1
             try:
                 with np.errstate(over="raise"):
                     mdl.sync(t_now, y)
@@ -675,7 +680,7 @@ class Simulation:
                     rec.plant_snapshot(t_now, signals)
                     if rec.keep_states or final:
                         rec.state_row(t_now, self._states.read_flat())
-                    if energy_on and _finite(y):
+                    if audit_due and _finite(y):
                         rep = mdl.energy_balance(t_now, y)
                         if rec.keep_energy:
                             rec.energy_row(t_now, rep.columns())

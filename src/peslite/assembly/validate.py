@@ -235,6 +235,8 @@ def _solver(s, time_step_averaging: list[str]) -> None:
         raise ConfigError("simulation.solver.linearisations must be >= 0")
     if s.write_length < 1:
         raise ConfigError("simulation.solver.write_length must be >= 1")
+    if s.phs_check_step < 1:
+        raise ConfigError("simulation.solver.phs_check_step must be >= 1")
     for name, value in s.subsystems.items():
         where = f"simulation.solver.subsystems.{name}"
         if s.type != "fixed":

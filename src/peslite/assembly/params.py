@@ -529,6 +529,7 @@ class SolverParams:
     sweeps: int = 2  # coupling sweeps for sub-stepped subsystems (>= 1)
     linearisations: int = 3  # linearisation points for the split error bound (0: none)
     write_length: int = 1000  # streamed CSV rows per write batch (>= 1)
+    phs_check_step: int = 1000  # snapshots between port-Hamiltonian energy audits (>= 1)
 
     _choices = {"type": ("fixed", "adaptive")}
 

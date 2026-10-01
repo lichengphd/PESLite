@@ -129,7 +129,7 @@ def energy_rate(sub: Any, derivatives: dict[str, Any], spec: EnergySpec) -> floa
 
 def re_product(e: Any, f: Any) -> float:
     """``Re(e conj(f))`` for real or complex signals."""
-    return float((e * np.conj(f)).real) if isinstance(e, complex) or isinstance(f, complex) else float(e * f)
+    return float((e * f.conjugate()).real) if isinstance(e, complex) or isinstance(f, complex) else float(e * f)
 
 
 def port_power(sub: Any, port: PowerPort) -> float:
@@ -231,42 +231,177 @@ class EnergyReport:
         return cols
 
 
+@dataclass(frozen=True)
+class _StorageCheck:
+    """Pre-resolved access to one storage state and its derivative-vector entries."""
+
+    record: Any
+    field: str
+    index: int
+    complex_value: bool
+    coefficient: float
+
+
+@dataclass(frozen=True)
+class _PowerCheck:
+    """Pre-resolved access to one power port."""
+
+    effort_record: Any
+    effort_field: str
+    flow_record: Any
+    flow_field: str
+    coefficient: float
+
+
+@dataclass(frozen=True)
+class _DefaultTransfer:
+    """One declared-port contribution used to infer a default subsystem's injection."""
+
+    default_index: int
+    other_record: Any
+    other_field: str
+    source_record: Any
+    source_field: str
+    coefficient: float
+
+
+@dataclass(frozen=True)
+class _SubsystemCheck:
+    name: str
+    subsystem: Any
+    spec: EnergySpec
+    default_index: Optional[int]
+    storage: tuple[_StorageCheck, ...]
+    ports: tuple[_PowerCheck, ...]
+
+
+@dataclass(frozen=True)
+class _BalancePlan:
+    """Static topology and state-vector accesses for repeated energy audits of one model."""
+
+    model: Any
+    subsystems: tuple[_SubsystemCheck, ...]
+    transfers: tuple[_DefaultTransfer, ...]
+    n_defaults: int
+
+    def __call__(self, t: float, y: np.ndarray) -> EnergyReport:
+        dy = self.model.rhs(t, y)
+        into_default = [0.0] * self.n_defaults
+        for term in self.transfers:
+            other = getattr(term.other_record, term.other_field)
+            source = getattr(term.source_record, term.source_field)
+            into_default[term.default_index] -= term.coefficient * re_product(other, source)
+
+        report = EnergyReport(t)
+        for check in self.subsystems:
+            spec = check.spec
+            if spec.kind == "observer":
+                continue
+            if spec.kind == "dirac":
+                report.dirac.append(check.name)
+                continue
+            if spec.kind == "default":
+                p_in = into_default[check.default_index]  # type: ignore[index]
+                report.subsystems.append(
+                    SubsystemEnergy(check.name, 0.0, p_in, -p_in, 0.0, 0.0, 0.0, "default")
+                )
+                continue
+
+            energy = rate = 0.0
+            for storage in check.storage:
+                x = getattr(storage.record, storage.field)
+                if storage.complex_value:
+                    dx = complex(dy[storage.index], dy[storage.index + 1])
+                    rate += storage.coefficient * (x * dx.conjugate()).real
+                else:
+                    dx = float(dy[storage.index])
+                    rate += storage.coefficient * x * dx
+                energy += 0.5 * storage.coefficient * (abs(x) ** 2)
+            p_in = sum(
+                port.coefficient * re_product(
+                    getattr(port.effort_record, port.effort_field),
+                    getattr(port.flow_record, port.flow_field),
+                )
+                for port in check.ports
+            )
+            supplied = float(spec.supplied(check.subsystem))
+            dissipated = float(spec.dissipated(check.subsystem))
+            report.subsystems.append(SubsystemEnergy(
+                check.name, energy, p_in, supplied, dissipated, rate,
+                p_in + supplied - dissipated - rate,
+            ))
+        return report
+
+
+def compile_balance(model: Any) -> _BalancePlan:
+    """Resolve all static names, connections and state slices used by repeated audits."""
+    specs = model.energy_specs
+    default_index = {
+        id(sub): index
+        for index, sub in enumerate(
+            sub for name, sub in zip(model.names, model.subsystems)
+            if specs[name].kind == "default"
+        )
+    }
+
+    def signal_ref(sub: Any, name: str) -> tuple[Any, str]:
+        where, _, field = name.partition(".")
+        return getattr(sub, where), field
+
+    transfers: list[_DefaultTransfer] = []
+    checks: list[_SubsystemCheck] = []
+    for name, sub in zip(model.names, model.subsystems):
+        spec = specs[name]
+        storage_checks = []
+        for storage in spec.storage:
+            state_slice = model.state_slice(sub, storage.state)
+            storage_checks.append(_StorageCheck(
+                sub.state, storage.state, state_slice.start,
+                state_slice.stop - state_slice.start == 2,
+                storage.scale * storage.value,
+            ))
+        power_checks = []
+        for port in spec.ports:
+            effort_record, effort_field = signal_ref(sub, port.effort)
+            flow_record, flow_field = signal_ref(sub, port.flow)
+            power_checks.append(_PowerCheck(
+                effort_record, effort_field, flow_record, flow_field,
+                port.sign * port.scale,
+            ))
+            for input_name, other_name in ((port.flow, port.effort),
+                                           (port.effort, port.flow)):
+                where, _, input_field = input_name.partition(".")
+                if where != "inp":
+                    continue
+                sources = model.connections.get((sub, input_field))
+                if sources is None:
+                    break
+                entries = sources if isinstance(sources, list) else [sources]
+                other_record, other_field = signal_ref(sub, other_name)
+                for entry in entries:
+                    source, source_field = entry[0], entry[1]
+                    index = default_index.get(id(source))
+                    if index is None:
+                        continue
+                    gain = float(entry[2]) if len(entry) > 2 else 1.0
+                    transfers.append(_DefaultTransfer(
+                        index, other_record, other_field, source.out, source_field,
+                        port.sign * port.scale * gain,
+                    ))
+                break
+        checks.append(_SubsystemCheck(
+            name, sub, spec, default_index.get(id(sub)),
+            tuple(storage_checks), tuple(power_checks),
+        ))
+    return _BalancePlan(model, tuple(checks), tuple(transfers), len(default_index))
+
+
 def balance(model: Any, t: float, y: np.ndarray) -> EnergyReport:
     """Energy accounting of ``model`` at ``(t, y)``; leaves the records synced to ``(t, y)``."""
-    dy = model.rhs(t, y)  # syncs the records and gives the derivatives
-    specs = model.energy_specs
-    report = EnergyReport(t)
-    into_default: dict[int, float] = {}  # power pushed into each defaulted subsystem by declared neighbours
-    for name, sub in zip(model.names, model.subsystems):
-        spec = specs[name]
-        if spec.kind == "declared":
-            for port in spec.ports:
-                for other, p in port_terms(model, sub, port):
-                    if specs[model.name_of(other)].kind == "default":
-                        into_default[id(other)] = into_default.get(id(other), 0.0) - p
-    for name, sub in zip(model.names, model.subsystems):
-        spec = specs[name]
-        if spec.kind == "observer":
-            continue
-        if spec.kind == "dirac":
-            report.dirac.append(name)
-            continue
-        if spec.kind == "default":
-            p_in = into_default.get(id(sub), 0.0)
-            report.subsystems.append(SubsystemEnergy(name, 0.0, p_in, -p_in, 0.0, 0.0, 0.0, "default"))
-            continue
-        derivs: dict[str, Any] = {}
-        for st in spec.storage:
-            sl = model.state_slice(sub, st.state)
-            vals = dy[sl]
-            derivs[st.state] = complex(vals[0], vals[1]) if sl.stop - sl.start == 2 else float(vals[0])
-        p_in = power_in(sub, spec)
-        supplied = float(spec.supplied(sub))
-        dissipated = float(spec.dissipated(sub))
-        rate = energy_rate(sub, derivs, spec)
-        report.subsystems.append(SubsystemEnergy(name, energy_of(sub, spec), p_in, supplied, dissipated, rate,
-                                                 p_in + supplied - dissipated - rate))
-    return report
+    plan = getattr(model, "_energy_balance_plan", None)
+    if plan is None:
+        plan = model._energy_balance_plan = compile_balance(model)
+    return plan(t, y)
 
 
 # ------------------------------------------------------------------ the pH report

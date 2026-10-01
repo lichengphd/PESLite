@@ -19,6 +19,8 @@
 - All enabled result histories are streamed directly to their final CSV files in batches of 1000
   rows instead of accumulating in RAM. `simulation.solver.write_length` changes that batch size;
   Python result columns read those final files on demand and are not part of the write path.
+- Repeated port-Hamiltonian energy audits use a precompiled topology and run at the first, final
+  and every `simulation.solver.phs_check_step`-th snapshot (1000 by default).
 - With `simulation.output.states: 0`, only the terminal state row is retained for
   `final_states()`. Disabled energy output keeps the energy summary checks but no energy history.
 - Controller logs consistently use the abbreviation: `r.ctrl`, `ctrl.<unit>.csv` and
