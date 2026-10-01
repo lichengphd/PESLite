@@ -3,6 +3,7 @@
 import ast
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 import peslite
@@ -37,6 +38,24 @@ def test_make_solver_builds_the_configured_integrator():
     for expected, changes in cases.items():
         configured = settings.__class__(**{**vars(settings), **changes})
         assert type(make_solver(configured, model)) is expected
+
+
+def test_dp45_float_model_path_matches_the_array_path():
+    class Oscillator:
+        @staticmethod
+        def rhs_list(t, y):
+            return [y[1], -4.0 * y[0]]
+
+        def rhs(self, t, y):
+            return np.asarray(self.rhs_list(t, y))
+
+    model = Oscillator()
+    y0 = np.asarray([1.0, 0.0])
+    fast = DormandPrince45(rtol=1e-8, atol=1e-11)(model.rhs, 0.0, 1.0, y0)
+    array = DormandPrince45(rtol=1e-8, atol=1e-11)(
+        lambda t, y: model.rhs(t, y), 0.0, 1.0, y0
+    )
+    np.testing.assert_allclose(fast.y, array.y, rtol=1e-13, atol=1e-14)
 
 
 def test_a_run_continues_exactly_from_a_saved_state(tmp_path):

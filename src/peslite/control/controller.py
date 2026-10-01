@@ -179,6 +179,8 @@ class ControlGraph:
         self._rewire()
         self._every = tuple((name, max(1, int(round(T / self._T))))
                             for name, T in self.periods.items())
+        self._every_interrupt = (frozenset(name for name, every in self._every)
+                                 if all(every == 1 for _name, every in self._every) else None)
 
     def _rewire(self):
         """Resolve loop inputs and graph outputs against the current references."""
@@ -258,8 +260,6 @@ class ControlGraph:
 
     def _store(self, name, outputs):
         specs = self._out_specs[name]
-        if len(outputs) != len(specs) or any(port not in outputs for port, _key, _c in specs):
-            raise ValueError(f"control loop {name}: outputs must be {sorted(self.nodes[name].outputs)}")
         values = self.values
         isfinite = math.isfinite
         for port, key, complex_value in specs:
@@ -276,6 +276,8 @@ class ControlGraph:
 
     def due(self, t):
         """Return the loops that run at the control interrupt at ``t``."""
+        if self._every_interrupt is not None:
+            return self._every_interrupt
         k = int(round((t - self._t0) / self._T))
         return {name for name, every in self._every if k % every == 0}
 
@@ -423,6 +425,7 @@ class UniteType:
         self.command_theta = self.theta
         self.v_dq = self.i_dq = 0j
         self.last_log = {}
+        self.logging = True
         # the loops the controller itself reads, by role
         role = {name: node.role for name, node in graph.nodes.items()}
         def first(r, port=None):
@@ -519,6 +522,10 @@ class UniteType:
                   ["p_pu", "q_pu", "p_ref_pu", "v_ref_pu", "freq_dev", "angle_rel"])
         return tuple(names)
 
+    def set_logging(self, enabled: bool) -> None:
+        """Enable per-interrupt log dictionaries when a run records or watches them."""
+        self.logging = bool(enabled)
+
     def update(self, t, meas):
         """Run the loops due at the control interrupt ``t``, on the SI sample ``meas``."""
         return self._update_pu(t, self._pu(meas))
@@ -563,23 +570,28 @@ class UniteType:
         prot.check_sampled(t, abs(self.v_dq), freq_dev,
                            control_meas.u_dc - refs["vdc_ref_pu"])
         tripped = prot.tripped
-        duty = self.stage.modulate(t, 0j if tripped else self.u_cmd, self.command_theta, control_meas.u_dc)
-        log = {"id_pu": self.i_dq.real, "iq_pu": self.i_dq.imag,
-               "vd_pu": self.v_dq.real, "vq_pu": self.v_dq.imag,
-               "vac_pu": abs(self.v_dq), "vdc_pu": control_meas.u_dc,
-               "m_max": peak_abs(self.stage.m_abc), "in_service": 1.0 if self._in_service(t) else 0.0,
-               **self._raw_log(meas, frame)}
-        angle_rel = (self.theta - self.w0 * t + math.pi) % (2 * math.pi) - math.pi
-        if self._is_gfl:
-            id_ref = self.graph.input(self._log_cc, "id_ref", control_meas) if self._log_cc else 0.0
-            log.update(id_ref_pu=id_ref, freq_dev=freq_dev, angle_rel=angle_rel)
-        else:
-            values = self.graph.values
-            pr, qr, vr = self.scenario.setpoints(t, refs["p_ref_pu"], refs["q_ref_pu"], refs["v_ref_pu"])
-            log.update(p_pu=values.get(self._p_key, 0.0), q_pu=values.get(self._q_key, 0.0),
-                       p_ref_pu=pr, v_ref_pu=values.get(self._v_ref_key, 1.0),
-                       freq_dev=freq_dev, angle_rel=angle_rel)
-        self.last_log = log
+        duty = self.stage.finish(t, 0j if tripped else self.u_cmd,
+                                 self.command_theta, control_meas.u_dc)
+        log = None
+        if self.logging:
+            log = {"id_pu": self.i_dq.real, "iq_pu": self.i_dq.imag,
+                   "vd_pu": self.v_dq.real, "vq_pu": self.v_dq.imag,
+                   "vac_pu": abs(self.v_dq), "vdc_pu": control_meas.u_dc,
+                   "m_max": peak_abs(self.stage.m_abc),
+                   "in_service": 1.0 if self._in_service(t) else 0.0,
+                   **self._raw_log(meas, frame)}
+            angle_rel = (self.theta - self.w0 * t + math.pi) % (2 * math.pi) - math.pi
+            if self._is_gfl:
+                id_ref = self.graph.input(self._log_cc, "id_ref", control_meas) if self._log_cc else 0.0
+                log.update(id_ref_pu=id_ref, freq_dev=freq_dev, angle_rel=angle_rel)
+            else:
+                values = self.graph.values
+                pr, qr, vr = self.scenario.setpoints(
+                    t, refs["p_ref_pu"], refs["q_ref_pu"], refs["v_ref_pu"])
+                log.update(p_pu=values.get(self._p_key, 0.0), q_pu=values.get(self._q_key, 0.0),
+                           p_ref_pu=pr, v_ref_pu=values.get(self._v_ref_key, 1.0),
+                           freq_dev=freq_dev, angle_rel=angle_rel)
+            self.last_log = log
         return ControlOutput(duty, tripped, log, theta=self.theta, omega=self.omega)
 
     # ------------------------------------------------------------ states and summary

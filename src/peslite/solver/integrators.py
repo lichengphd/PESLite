@@ -234,6 +234,9 @@ class DormandPrince45:
         span = t1 - t0
         if span <= 0.0:
             return SolverStep(t1, y0, 0)
+        lists = getattr(getattr(f, "__self__", None), "rhs_list", None)
+        if lists is not None:
+            return self._call_lists(lists, t0, t1, y0)
         a, b, c, e = self._a, self._b, self._c, self._e
         t, y = t0, np.asarray(y0, dtype=float)
         h = self._h if self._h is not None else span
@@ -270,3 +273,67 @@ class DormandPrince45:
                 h = h * max(0.1, self.safety * err ** -0.25)
         self._h = h
         return SolverStep(t1, y, self.n_rhs)
+
+    def _call_lists(self, f, t0: float, t1: float,
+                    y0: NDArray[np.float64]) -> SolverStep:
+        """The same DP5(4) pair on Python floats when the model provides ``rhs_list``."""
+        span = t1 - t0
+        a, b, c, e = self._a, self._b, self._c, self._e
+        c2, c3, c4, c5 = c[1], c[2], c[3], c[4]
+        a21 = a[1][0]
+        a31, a32 = a[2]
+        a41, a42, a43 = a[3]
+        a51, a52, a53, a54 = a[4]
+        a61, a62, a63, a64, a65 = a[5]
+        b1, b3, b4, b5, b6 = b[0], b[2], b[3], b[4], b[5]
+        e1, e3, e4, e5, e6, e7 = e[0], e[2], e[3], e[4], e[5], e[6]
+        atol, rtol = self.atol, self.rtol
+        t, y = t0, y0.tolist()
+        h = self._h if self._h is not None else span
+        h = min(h, span, self.max_step)
+        k1 = f(t, y)
+        self.n_rhs += 1
+        end_eps = 1e-15 * max(1.0, abs(t1))
+        while t < t1 - end_eps:
+            if t + h > t1:
+                h = t1 - t
+            k2 = f(t + c2 * h,
+                   [v + h * a21 * q1 for v, q1 in zip(y, k1)])
+            k3 = f(t + c3 * h,
+                   [v + h * (a31 * q1 + a32 * q2)
+                    for v, q1, q2 in zip(y, k1, k2)])
+            k4 = f(t + c4 * h,
+                   [v + h * (a41 * q1 + a42 * q2 + a43 * q3)
+                    for v, q1, q2, q3 in zip(y, k1, k2, k3)])
+            k5 = f(t + c5 * h,
+                   [v + h * (a51 * q1 + a52 * q2 + a53 * q3 + a54 * q4)
+                    for v, q1, q2, q3, q4 in zip(y, k1, k2, k3, k4)])
+            k6 = f(t + h,
+                   [v + h * (a61 * q1 + a62 * q2 + a63 * q3 + a64 * q4 + a65 * q5)
+                    for v, q1, q2, q3, q4, q5 in zip(y, k1, k2, k3, k4, k5)])
+            y1 = [v + h * (b1 * q1 + b3 * q3 + b4 * q4 + b5 * q5 + b6 * q6)
+                  for v, q1, q3, q4, q5, q6 in zip(y, k1, k3, k4, k5, k6)]
+            k7 = f(t + h, y1)
+            self.n_rhs += 6
+            err = 0.0
+            for v, v1, q1, q3, q4, q5, q6, q7 in zip(y, y1, k1, k3, k4, k5, k6, k7):
+                estimate = abs(h * (e1 * q1 + e3 * q3 + e4 * q4
+                                    + e5 * q5 + e6 * q6 + e7 * q7))
+                ratio = estimate / (atol + rtol * max(abs(v), abs(v1)))
+                if ratio > err:
+                    err = ratio
+            if err <= 1.0 or h <= 1e-15:
+                t += h
+                y, k1 = y1, k7
+                if err == 0.0:
+                    factor = 5.0
+                else:
+                    factor = self.safety * err ** -0.14 * self._err_prev ** 0.08
+                    factor = min(5.0, max(0.2, factor))
+                self._err_prev = max(err, 1e-4)
+                h = min(h * factor, self.max_step)
+            else:
+                self.n_rejected += 1
+                h = h * max(0.1, self.safety * err ** -0.25)
+        self._h = h
+        return SolverStep(t1, np.asarray(y), self.n_rhs)

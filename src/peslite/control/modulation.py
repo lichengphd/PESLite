@@ -111,6 +111,7 @@ class OutputStage:
         self.first_saturation_t: float | None = None
         self.saturated = False
         self._memo = None  # cached evaluation for the current control instant
+        self._prepared = None
         # start-up modulation from u_init_ab and the rated dc voltage
         self.align_startup(u_init_ab, cfg.dclink.vdc_ref)
 
@@ -126,6 +127,7 @@ class OutputStage:
     def new_instant(self) -> None:
         """Start a new control instant (clear the cached evaluation)."""
         self._memo = None
+        self._prepared = None
 
     def _evaluate(self, command: complex, rot: complex, u_dc: float) -> tuple[np.ndarray, bool]:
         """Modulating signals and saturation for a dq command (pu), cached for this control instant."""
@@ -164,6 +166,7 @@ class OutputStage:
         count: ``False`` leaves the controller-update and saturation counters unchanged.
         """
         rot = complex(math.cos(theta), math.sin(theta))
+        u_dc_pu = u_dc
         u_dc = u_dc * self.v_dc_base  # PWM receives DC volts; loop feedback stays pu
         u_dq = u_cmd_dq if extra_dq is None else u_cmd_dq + extra_dq
         m_abc, saturated = self._evaluate(u_dq, rot, u_dc)
@@ -174,10 +177,24 @@ class OutputStage:
             u_lim_dq = abc2complex(m_abc) * u_dc / (2.0 * self.v_base) * complex(math.cos(theta), -math.sin(theta))
             cc.backcalculate(u_dq, u_lim_dq)
         self.m_abc, self.saturated = m_abc, saturated
+        duty = 0.5 * (1.0 + self.m_abc)
+        self._prepared = ((u_dq, theta, u_dc_pu), duty)
         if count:
             self.n_updates += 1
             if saturated:
                 self.n_saturated += 1
                 if self.first_saturation_t is None:
                     self.first_saturation_t = t
-        return 0.5 * (1.0 + self.m_abc)
+        return duty
+
+    def finish(self, t: float, u_cmd_dq: complex, theta: float, u_dc: float) -> np.ndarray:
+        """Count and return a command already prepared at this control instant when possible."""
+        prepared = self._prepared
+        if prepared is None or prepared[0] != (u_cmd_dq, theta, u_dc):
+            return self.modulate(t, u_cmd_dq, theta, u_dc)
+        self.n_updates += 1
+        if self.saturated:
+            self.n_saturated += 1
+            if self.first_saturation_t is None:
+                self.first_saturation_t = t
+        return prepared[1]

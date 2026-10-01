@@ -666,6 +666,10 @@ class Simulation:
         ctrl_names = {
             unit.name: getattr(unit.ctrl, "log_names", lambda: ())() for unit in units
         }
+        for unit in units:
+            set_logging = getattr(unit.ctrl, "set_logging", None)
+            if set_logging is not None:
+                set_logging(output.signals or bool(watch))
         rec = Recorder(p, output_dir, ctrl_names, keep_states=output.states,
                        keep_signals=output.signals, keep_energy=output.energy,
                        batch_rows=p.simulation.solver.write_length)
