@@ -150,6 +150,8 @@ def test_averaging_silently_ignores_all_sampled_timing_semantics(tmp_path):
         "units.vsc.meas.window": 0.2,
         "units.vsc.meas.average": ["u_g", "i_c", "u_dc"],
         "units.vsc.pwm.f_sw": 19_999.0,
+        "units.vsc.pwm.method": "svpwm",
+        "units.vsc.pwm.modulation_limit": 0.2,
         "units.vsc.pwm.sync": "synchronous",
         "units.vsc.pwm.update": "double",
         "units.vsc.pwm.carrier_phase": 0.37,

@@ -96,6 +96,17 @@ class Loop:
             f"loop type {self.type!r} has no continuous-time implementation"
         )
 
+    def continuous_into(self, t: float, inputs: Mapping[str, Any],
+                        outputs: dict[str, Any], derivatives: dict[str, Any]) -> None:
+        """Evaluate into reusable mappings used by the continuous-controller hot path.
+
+        The default preserves the public custom-loop contract. Built-in loops override this to
+        avoid allocating result dictionaries at every ODE stage.
+        """
+        fresh_outputs, fresh_derivatives = self.continuous(t, inputs)
+        outputs.update(fresh_outputs)
+        derivatives.update(fresh_derivatives)
+
     def continuous_state(self) -> dict[str, Any]:
         """States integrated by the continuous controller."""
         return self.get_state()
@@ -204,6 +215,7 @@ class SRFPLL(Loop):
     outputs_from_state = True
     inputs = {"v": V_AB}
     outputs = {"theta": ANGLE, "frame": ANGLE, "omega": FREQUENCY}
+    continuous_path_inputs = ("v",)
 
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
@@ -232,16 +244,29 @@ class SRFPLL(Loop):
         return {"theta": self.theta, "frame": frame, "omega": self.omega}
 
     def continuous(self, t, inputs):
-        v = inputs["v"] * _into(self.theta)
+        outputs, derivatives = {}, {}
+        self.continuous_into(t, inputs, outputs, derivatives)
+        return outputs, derivatives
+
+    def continuous_into(self, t, inputs, outputs, derivatives):
+        result = self.continuous_path(inputs["v"])
+        outputs["theta"], outputs["frame"], outputs["omega"] = result[:3]
+        derivatives["theta"], derivatives["integral_pu"] = result[3:5]
+        if self.u_g is not None:
+            derivatives["u_g_pu"] = result[5]
+
+    def continuous_path(self, voltage):
+        """Positional form used by the construction-time compiled continuous graph."""
+        v = voltage * _into(self.theta)
         if self.u_g is None:
             eps = v.imag
         else:
             eps = v.imag / self.u_g if self.u_g > 0.0 else 0.0
         self.omega = self.w0 + self.kp * eps + self.ki * self.integral
-        derivatives = {"theta": self.omega, "integral_pu": eps}
         if self.u_g is not None:
-            derivatives["u_g_pu"] = self.kp * (v.real - self.u_g)
-        return {"theta": self.theta, "frame": self.theta, "omega": self.omega}, derivatives
+            return (self.theta, self.theta, self.omega, self.omega, eps,
+                    self.kp * (v.real - self.u_g))
+        return self.theta, self.theta, self.omega, self.omega, eps
 
     def reset_integrator(self):
         self.integral = 0.0
@@ -275,6 +300,7 @@ class CurrentLoop(Loop):
     inputs = {"id_ref": CURRENT, "iq_ref": CURRENT, "v": V_AB, "i": I_AB, "frame": ANGLE, "omega": FREQUENCY,
               "extra": V_DQ}
     outputs = {"u_dq": V_DQ, "extra": V_DQ}
+    continuous_path_inputs = ("id_ref", "iq_ref", "v", "i", "frame", "omega", "extra")
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
         x = unit.ac_filter.l_f * unit.base.w0 / unit.base.z_base
@@ -304,15 +330,27 @@ class CurrentLoop(Loop):
         return {"u_dq": self.command(e, i, u_ff, omega) + self.extra, "extra": self.extra}
 
     def continuous(self, t, inputs):
-        rot = _into(inputs["frame"])
-        self.extra = inputs["extra"]
-        i, u_ff, omega = inputs["i"] * rot, inputs["v"] * rot, inputs["omega"]
-        e = 0j if not self.startup.active else complex(inputs["id_ref"], inputs["iq_ref"]) - i
+        outputs, derivatives = {}, {}
+        self.continuous_into(t, inputs, outputs, derivatives)
+        return outputs, derivatives
+
+    def continuous_into(self, t, inputs, outputs, derivatives):
+        u_dq, extra, e = self.continuous_path(
+            inputs["id_ref"], inputs["iq_ref"], inputs["v"], inputs["i"],
+            inputs["frame"], inputs["omega"], inputs["extra"],
+        )
+        outputs["u_dq"], outputs["extra"] = u_dq, extra
+        derivatives["integral_pu"] = e
+
+    def continuous_path(self, id_ref, iq_ref, voltage, current, frame, omega, extra):
+        """Positional form used by the construction-time compiled continuous graph."""
+        rot = _into(frame)
+        self.extra = extra
+        i, u_ff = current * rot, voltage * rot
+        e = 0j if not self.startup.active else complex(id_ref, iq_ref) - i
         self._last = (e, i, u_ff, omega)
         self._continuous_error = e
-        return ({"u_dq": self.command(e, i, u_ff, omega) + self.extra,
-                 "extra": self.extra},
-                {"integral_pu": e})
+        return self.command(e, i, u_ff, omega) + self.extra, self.extra, e
 
     def command(self, e: complex, i: complex, u_ff: complex, omega: float) -> complex:
         """Voltage command (without ``extra``) from the integrator state (no integration)."""
@@ -335,6 +373,9 @@ class CurrentLoop(Loop):
 
     def get_state(self):
         return {"integral_pu": self.integral}
+
+    def continuous_state_bindings(self):
+        return {"integral_pu": (self, "integral")}
 
     def set_state(self, values):
         unknown = set(values) - {"integral_pu"}
@@ -376,6 +417,7 @@ class DCVoltageLoop(Loop):
     role = "dc_voltage"
     inputs = {"u_dc": DC_VOLTAGE, "vdc_ref": DC_VOLTAGE}
     outputs = {"id_ref": CURRENT}
+    continuous_path_inputs = ("u_dc", "vdc_ref")
     carried = ("n_updates", "n_clamped", "n_reverse", "first_clamp_t")
 
     def __init__(self, cfg, unit, startup):
@@ -421,8 +463,19 @@ class DCVoltageLoop(Loop):
         return {"integral_pu": self.integral}
 
     def continuous(self, t, inputs):
+        outputs, derivatives = {}, {}
+        self.continuous_into(t, inputs, outputs, derivatives)
+        return outputs, derivatives
+
+    def continuous_into(self, t, inputs, outputs, derivatives):
+        id_ref, derivative = self.continuous_path(inputs["u_dc"], inputs["vdc_ref"])
+        outputs["id_ref"] = id_ref
+        derivatives["integral_pu"] = derivative
+
+    def continuous_path(self, u_dc, vdc_ref):
+        """Positional form used by the construction-time compiled continuous graph."""
         ff = self.startup.value * self.cfg.id0_export_pu
-        self.error = inputs["u_dc"] - inputs["vdc_ref"]
+        self.error = u_dc - vdc_ref
         self.raw = 0.0 if not self.startup.active else (
             ff + self.kp * self.error + self.ki * self.integral
         )
@@ -435,7 +488,7 @@ class DCVoltageLoop(Loop):
             if ((id_ref >= self.limit and derivative > 0.0)
                     or (id_ref <= self.floor and derivative < 0.0)):
                 derivative = 0.0
-        return {"id_ref": id_ref}, {"integral_pu": derivative}
+        return id_ref, derivative
 
     def reset_integrator(self):
         self.integral = 0.0
@@ -461,6 +514,7 @@ class PowerLoop(Loop):
     role = "power"
     inputs = {"v": V_AB, "i": I_AB}
     outputs = {"p": POWER_PU, "q": POWER_PU}
+    continuous_path_inputs = ("v", "i")
 
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
@@ -487,13 +541,24 @@ class PowerLoop(Loop):
         return {"p_pu": (self.lpf_p, "y"), "q_pu": (self.lpf_q, "y")}
 
     def continuous(self, t, inputs):
-        s = inputs["v"] * inputs["i"].conjugate()
+        outputs, derivatives = {}, {}
+        self.continuous_into(t, inputs, outputs, derivatives)
+        return outputs, derivatives
+
+    def continuous_into(self, t, inputs, outputs, derivatives):
+        result = self.continuous_path(inputs["v"], inputs["i"])
+        outputs["p"], outputs["q"] = result[:2]
+        if self.bandwidth > 0.0:
+            derivatives["p_pu"], derivatives["q_pu"] = result[2:]
+
+    def continuous_path(self, voltage, current):
+        """Positional form used by the construction-time compiled continuous graph."""
+        s = voltage * current.conjugate()
         if self.bandwidth <= 0.0:
-            return {"p": s.real, "q": s.imag}, {}
+            return s.real, s.imag
+        p, q = self.lpf_p.y, self.lpf_q.y
         pole = 2.0 * math.pi * self.bandwidth
-        return ({"p": self.lpf_p.y, "q": self.lpf_q.y},
-                {"p_pu": pole * (s.real - self.lpf_p.y),
-                 "q_pu": pole * (s.imag - self.lpf_q.y)})
+        return p, q, pole * (s.real - p), pole * (s.imag - q)
 
     def get_state(self):
         return gather({"p_pu": self.lpf_p, "q_pu": self.lpf_q})
@@ -567,6 +632,24 @@ class SyncLaw(Loop):
         return ({"theta": self.theta, "frame": frame, "omega": self.omega,
                  "v_ref": self.v_mag}, derivatives)
 
+    def _continuous_path(self, flow_values, p, q, voltage, current, u_dc,
+                         p_ref, q_ref, v_ref, zero_derivatives):
+        """Shared positional continuous evaluation for built-in synchronization laws."""
+        frame = float(self.theta)
+        rot = _into(frame)
+        v, i = voltage * rot, current * rot
+        if not self.startup.active:
+            self.omega = self.w0
+            magnitude = abs(v)
+            if magnitude > 0.1:
+                self.v_mag = magnitude
+            derivatives = zero_derivatives
+        else:
+            derivatives = flow_values(
+                p, q, abs(v), u_dc, self.startup.value * p_ref, q_ref, v_ref, i
+            )
+        return self.theta, frame, self.omega, self.v_mag, *derivatives
+
     def flow(self, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu,
              q_ref_pu, v_ref_pu, i_dq) -> dict[str, Any]:
         """Continuous state derivatives, also refreshing algebraic outputs."""
@@ -605,6 +688,7 @@ class PSC(SyncLaw):
 
     type = "psc"
     state_names = {"theta": "theta", "v_int_pu": "v_int"}
+    continuous_path_inputs = ("p", "q", "v", "i", "u_dc", "p_ref", "q_ref", "v_ref")
 
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
@@ -619,10 +703,23 @@ class PSC(SyncLaw):
         self.v_mag = v_ref_pu + self.k_v * e_v + self.k_vi * self.v_int
 
     def flow(self, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
+        theta, v_int = self.flow_values(
+            p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu, q_ref_pu, v_ref_pu, i_dq
+        )
+        return {"theta": theta, "v_int_pu": v_int}
+
+    def flow_values(self, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu,
+                    q_ref_pu, v_ref_pu, i_dq):
         self.omega = self.w0 + self.k_p * (p_ref_pu - p_pu)
         e_v = v_ref_pu - v_mag_pu
         self.v_mag = v_ref_pu + self.k_v * e_v + self.k_vi * self.v_int
-        return {"theta": self.omega, "v_int_pu": e_v}
+        return self.omega, e_v
+
+    def continuous_path(self, p, q, voltage, current, u_dc, p_ref, q_ref, v_ref):
+        return self._continuous_path(
+            self.flow_values, p, q, voltage, current, u_dc, p_ref, q_ref, v_ref,
+            (self.w0, 0.0),
+        )
 
     def follow(self, theta, v_mag_pu, v_ref_pu):
         super().follow(theta, v_mag_pu, v_ref_pu)
@@ -648,6 +745,7 @@ class Droop(SyncLaw):
         _quantities = {"m_p_pu": "1/power", "n_q_pu": "voltage/power"}
 
     type = "droop"
+    continuous_path_inputs = ("p", "q", "v", "i", "u_dc", "p_ref", "q_ref", "v_ref")
 
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
@@ -659,9 +757,40 @@ class Droop(SyncLaw):
         self.v_mag = v_ref_pu + self.n_q * (q_ref_pu - q_pu)
 
     def flow(self, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
+        return {"theta": self.flow_values(
+            p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu, q_ref_pu, v_ref_pu, i_dq
+        )[0]}
+
+    def flow_values(self, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu,
+                    q_ref_pu, v_ref_pu, i_dq):
         self.omega = self.w0 + self.m_p * (p_ref_pu - p_pu)
         self.v_mag = v_ref_pu + self.n_q * (q_ref_pu - q_pu)
-        return {"theta": self.omega}
+        return (self.omega,)
+
+    def continuous_into(self, t, inputs, outputs, derivatives):
+        result = self.continuous_path(
+            inputs["p"], inputs["q"], inputs["v"], inputs["i"], inputs["u_dc"],
+            inputs["p_ref"], inputs["q_ref"], inputs["v_ref"],
+        )
+        outputs["theta"], outputs["frame"], outputs["omega"], outputs["v_ref"] = result[:4]
+        derivatives["theta"] = result[4]
+
+    def continuous_path(self, p, q, voltage, current, u_dc, p_ref, q_ref, v_ref):
+        """Positional form used by the construction-time compiled continuous graph."""
+        frame = float(self.theta)
+        rot = _into(frame)
+        v, i = voltage * rot, current * rot
+        if not self.startup.active:
+            self.omega = self.w0
+            magnitude = abs(v)
+            if magnitude > 0.1:
+                self.v_mag = magnitude
+            derivative = self.w0
+        else:
+            derivative = self.flow_values(
+                p, q, abs(v), u_dc, self.startup.value * p_ref, q_ref, v_ref, i
+            )[0]
+        return self.theta, frame, self.omega, self.v_mag, derivative
 
 
 @register_loop_type
@@ -683,6 +812,7 @@ class VSG(SyncLaw):
         _quantities = {"d_p_pu": "power/frequency", "k_q_pu": "voltage/power"}
 
     type = "vsg"
+    continuous_path_inputs = ("p", "q", "v", "i", "u_dc", "p_ref", "q_ref", "v_ref")
 
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
@@ -702,15 +832,29 @@ class VSG(SyncLaw):
             self.v_mag = v_cmd
 
     def flow(self, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
+        values = self.flow_values(
+            p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu, q_ref_pu, v_ref_pu, i_dq
+        )
+        derivatives = {"theta": values[0], "dw_pu": values[1]}
+        if self.t_q > 0.0:
+            derivatives["v_mag_pu"] = values[2]
+        return derivatives
+
+    def flow_values(self, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu,
+                    q_ref_pu, v_ref_pu, i_dq):
         d_dw = (p_ref_pu - p_pu - self.d_p * self.dw_pu) / (2.0 * self.h)
         self.omega = self.w0 * (1.0 + self.dw_pu)
         v_cmd = v_ref_pu + self.k_q * (q_ref_pu - q_pu)
-        derivatives = {"theta": self.omega, "dw_pu": d_dw}
         if self.t_q > 0.0:
-            derivatives["v_mag_pu"] = (v_cmd - self.v_mag) / self.t_q
-        else:
-            self.v_mag = v_cmd
-        return derivatives
+            return self.omega, d_dw, (v_cmd - self.v_mag) / self.t_q
+        self.v_mag = v_cmd
+        return self.omega, d_dw
+
+    def continuous_path(self, p, q, voltage, current, u_dc, p_ref, q_ref, v_ref):
+        zeros = ((self.w0, 0.0, 0.0) if self.t_q > 0.0 else (self.w0, 0.0))
+        return self._continuous_path(
+            self.flow_values, p, q, voltage, current, u_dc, p_ref, q_ref, v_ref, zeros
+        )
 
     def follow(self, theta, v_mag_pu, v_ref_pu):
         super().follow(theta, v_mag_pu, v_ref_pu)
@@ -737,6 +881,7 @@ class DVOC(SyncLaw):
 
     type = "dvoc"
     state_names = {"theta": "theta", "v_mag_pu": "v_mag"}
+    continuous_path_inputs = ("p", "q", "v", "i", "u_dc", "p_ref", "q_ref", "v_ref")
 
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
@@ -752,12 +897,25 @@ class DVOC(SyncLaw):
         self.theta += T * self.omega
 
     def flow(self, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
+        theta, v_mag = self.flow_values(
+            p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu, q_ref_pu, v_ref_pu, i_dq
+        )
+        return {"theta": theta, "v_mag_pu": v_mag}
+
+    def flow_values(self, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu,
+                    q_ref_pu, v_ref_pu, i_dq):
         V = max(self.v_mag, 1e-12)
         i_star = complex(p_ref_pu, -q_ref_pu) * V / (v_ref_pu * v_ref_pu)
         w = (self.eta * self.rot * (i_star - i_dq)
              + self.eta * self.alpha * (1.0 - V * V / (v_ref_pu * v_ref_pu)) * V)
         self.omega = self.w0 + w.imag / V
-        return {"theta": self.omega, "v_mag_pu": w.real}
+        return self.omega, w.real
+
+    def continuous_path(self, p, q, voltage, current, u_dc, p_ref, q_ref, v_ref):
+        return self._continuous_path(
+            self.flow_values, p, q, voltage, current, u_dc, p_ref, q_ref, v_ref,
+            (self.w0, 0.0),
+        )
 
 
 @register_loop_type
@@ -777,6 +935,7 @@ class Matching(SyncLaw):
         _quantities = {"k_theta_pu": "1/dc_voltage", "k_q_pu": "voltage/power"}
 
     type = "matching"
+    continuous_path_inputs = ("p", "q", "v", "i", "u_dc", "p_ref", "q_ref", "v_ref")
 
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
@@ -790,9 +949,21 @@ class Matching(SyncLaw):
         self.v_mag = v_ref_pu + self.k_q * (q_ref_pu - q_pu)
 
     def flow(self, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
+        return {"theta": self.flow_values(
+            p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu, q_ref_pu, v_ref_pu, i_dq
+        )[0]}
+
+    def flow_values(self, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu,
+                    q_ref_pu, v_ref_pu, i_dq):
         self.omega = self.k_theta * v_dc_pu
         self.v_mag = v_ref_pu + self.k_q * (q_ref_pu - q_pu)
-        return {"theta": self.omega}
+        return (self.omega,)
+
+    def continuous_path(self, p, q, voltage, current, u_dc, p_ref, q_ref, v_ref):
+        return self._continuous_path(
+            self.flow_values, p, q, voltage, current, u_dc, p_ref, q_ref, v_ref,
+            (self.w0,),
+        )
 
 
 # ------------------------------------------------------------------ voltage-reference shaping
@@ -817,6 +988,7 @@ class VirtualImpedance(Loop):
     role = "impedance"
     inputs = {"v_ref": VOLTAGE, "i": I_AB, "frame": ANGLE, "omega": FREQUENCY, "extra": V_DQ}
     outputs = {"u_dq": V_DQ}
+    continuous_path_inputs = ("v_ref", "i", "frame", "omega", "extra")
 
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
@@ -832,6 +1004,11 @@ class VirtualImpedance(Loop):
 
     def continuous(self, t, inputs):
         return self.update(t, inputs), {}
+
+    def continuous_path(self, v_ref, current, frame, omega, extra):
+        i = current * _into(frame)
+        drop = (self.r_pu + 1j * omega / self.w0 * self.x_pu) * i
+        return (complex(v_ref, 0.0) - drop + extra,)
 
 
 @register_loop_type
@@ -857,6 +1034,7 @@ class VirtualAdmittance(Loop):
     role = "admittance"
     inputs = {"v_ref": VOLTAGE, "v": V_AB, "frame": ANGLE, "omega": FREQUENCY}
     outputs = {"id_ref": CURRENT, "iq_ref": CURRENT}
+    continuous_path_inputs = ("v_ref", "v", "frame", "omega")
 
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
@@ -878,9 +1056,21 @@ class VirtualAdmittance(Loop):
         return {"id_ref": i_ref.real, "iq_ref": i_ref.imag}
 
     def continuous(self, t, inputs):
-        v_ref_dq = complex(inputs["v_ref"], 0.0)
-        v_dq = inputs["v"] * _into(inputs["frame"])
-        omega = inputs["omega"]
+        outputs, derivatives = {}, {}
+        self.continuous_into(t, inputs, outputs, derivatives)
+        return outputs, derivatives
+
+    def continuous_into(self, t, inputs, outputs, derivatives):
+        id_ref, iq_ref, derivative = self.continuous_path(
+            inputs["v_ref"], inputs["v"], inputs["frame"], inputs["omega"]
+        )
+        outputs["id_ref"], outputs["iq_ref"] = id_ref, iq_ref
+        derivatives["i_ref_pu"] = derivative
+
+    def continuous_path(self, v_ref, voltage, frame, omega):
+        """Positional form used by the construction-time compiled continuous graph."""
+        v_ref_dq = complex(v_ref, 0.0)
+        v_dq = voltage * _into(frame)
         i_ref = self.i_ref
         mag = abs(i_ref)
         i_out = i_ref if mag <= self.i_limit else i_ref * (self.i_limit / mag)
@@ -892,8 +1082,7 @@ class VirtualAdmittance(Loop):
             radial = (derivative * i_out.conjugate()).real
             if radial > 0.0:
                 derivative -= radial / (self.i_limit * self.i_limit) * i_out
-        return ({"id_ref": i_out.real, "iq_ref": i_out.imag},
-                {"i_ref_pu": derivative})
+        return i_out.real, i_out.imag, derivative
 
     def get_state(self):
         return {"i_ref_pu": self.i_ref}
@@ -928,6 +1117,7 @@ class ActiveDamping(Loop):
     role = "damping"
     inputs = {"i": I_AB, "frame": ANGLE}
     outputs = {"extra": V_DQ}
+    continuous_path_inputs = ("i", "frame")
 
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
@@ -945,6 +1135,10 @@ class ActiveDamping(Loop):
         current = inputs["i"] * _into(inputs["frame"])
         low = self.hpf.y
         return {"extra": -self.r_a * (current - low)}, {"hpf_pu": self.alpha_d * (current - low)}
+
+    def continuous_path(self, current, frame):
+        delta = current * _into(frame) - self.hpf.y
+        return -self.r_a * delta, self.alpha_d * delta
 
     def get_state(self):
         return gather({"hpf_pu": self.hpf})
