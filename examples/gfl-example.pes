@@ -48,19 +48,19 @@ units:                     # converters, one entry each
         # k_pu: 0.2        # current-source droop: k_pu * (1 - u_C_pu)
         # voltage source: v_pu (emf, default 1), r_pu (series R)
 
-    # meas:                # the ADC, sampled at every PWM update
+    # meas:                # the ADC, sampled by the control interrupt
     #   average: instantaneous  # ac voltage and current: instantaneous | window (mean over (t_k - window, t_k])
     #   u_dc: instantaneous     # the same choice for the dc voltage
-    #   window: 50.0e-6    # averaging window, s (default: the PWM update period)
+    #   window: 50.0e-6    # averaging window, s (default: ctrl.period)
+    #   period: 25.0e-6    # oversampling period, s; divides ctrl.period (default: one sample)
 
     pwm:
       f_sw: 20000.0        # carrier frequency, Hz
       modulation_limit: 0.95
-      # update_period: 50.0e-6  # ADC sample, control law and new duty ratios (default: one carrier period)
+      # update: single     # compare registers load at valleys: single | double (valleys and peaks)
       # method: spwm       # spwm | svpwm
       # sync: asynchronous # asynchronous | synchronous (carrier locked to the controller angle)
       # carrier_phase: 0.0 # carrier position at t = 0, in periods
-      # computation_delay: {steps: 0}  # duty-ratio computation delay, in PWM updates
 
     # averaging: {enable: 0, over: pwm_period}  # bridge model: 0 switching; 1 averaging
     #                     # over each pwm_period (no carrier) or each solver time_step (fixed solver)
@@ -68,23 +68,23 @@ units:                     # converters, one entry each
 
     ctrl:
       type: gfl            # default wiring: gfl | gfm | custom (explicit connections and outputs)
-      loops:               # each loop runs every `period` (s) on its own clock
+      # period: 50.0e-6    # control interrupt, s; multiple of half the carrier period (default: one period)
+      # computation: 1.0e-6  # sample-to-PWM-load eligibility time, s; 0 is an ideal controller
+      loops:               # run in signal order at every interrupt, or every n-th interrupt
         pll:
           type: srf_pll
-          period: 50.0e-6
+          # period: 50.0e-6  # multiple of ctrl.period (default: every interrupt)
           kp_pu: 20.0
           ki_pu: 1200.0
           # normalisation: rated  # rated | amplitude
         cc:
           type: dq_current_pi
-          period: 50.0e-6
           bandwidth: 200.0 # Hz; gains from the bandwidth unless kp_pu, ki_pu are given
           # decoupling: 1
           # feedforward: 1
           # antiwindup: conditional  # conditional | backcalc | none
         dvc:
           type: dc_voltage_pi
-          period: 50.0e-6
           kp_pu: 0.8
           ki_pu: 90.0
           limit_pu: 1.15
@@ -103,7 +103,6 @@ units:                     # converters, one entry each
       #   theta: 0.0       # rad
       #   omega: 314.159   # rad/s (default: 2 pi f0)
       #   zero_v_pu: 0.0
-      # sampling_period: 25.0e-6  # ADC oversampling (default: the PWM update period)
       # A custom loop type, registered with peslite.register_loop_type, is written here
       # like the built-in ones and its parameters are checked the same way.
 

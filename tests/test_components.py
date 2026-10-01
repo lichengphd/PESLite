@@ -9,11 +9,10 @@ import peslite
 from conftest import EXAMPLES
 from peslite.components import (
     ADC,
-    ComputationDelay,
     MeasurementPorts,
+    PWM,
     ZOH,
 )
-from peslite.components.pwm import PWM
 from peslite.control.blocks import abc2complex
 
 COMPONENTS = Path(peslite.components.__file__).parent
@@ -26,7 +25,7 @@ def test_unit_delegates_sampling_and_modulation_state_to_components():
 
     assert isinstance(unit.adc, ADC)
     assert isinstance(unit.pwm, PWM)
-    assert isinstance(unit.pwm.computation_delay, ComputationDelay)
+    assert peslite.ADC is ADC and peslite.PWM is PWM
     assert not hasattr(unit, "sampler")
     assert not hasattr(unit, "window")
     assert not hasattr(unit, "modulator")
@@ -58,37 +57,33 @@ def test_adc_owns_oversampling_and_averaging_window_state():
     assert set(adc.get_state()) == {"x_v", "x_i", "x_v_open", "x_i_open"}
 
 
-def test_pwm_owns_delay_publications_and_switching_schedule():
-    delay = ComputationDelay(1)
+def test_pwm_owns_timer_registers_and_switching_schedule():
     initial = np.array([0.2, 0.4, 0.6])
-    delay.reset(initial)
-    pwm = PWM(period=1e-3, modulator=ZOH(), computation_delay=delay)
+    pwm = PWM(period=1e-3, load_period=1e-3, offset=0.0, computation=2e-4,
+              carrier_period=1e-3, modulator=ZOH())
+    pwm.reset(initial)
     assert pwm.get_state() == {
-        "d_a": 0.0, "d_b": 0.0, "d_c": 0.0,
-        "computation_delay.0.d_a": 0.2,
-        "computation_delay.0.d_b": 0.4,
-        "computation_delay.0.d_c": 0.6,
+        "d_a": 0.2, "d_b": 0.4, "d_c": 0.6,
+        "shadow.d_a": 0.2, "shadow.d_b": 0.4, "shadow.d_c": 0.6,
     }
 
-    pwm.publish(np.array([0.8, 0.7, 0.6]))
-    assert np.array_equal(pwm.d, initial)
-    q = pwm.modulate(0.0)
+    pwm.write(0.0, np.array([0.8, 0.7, 0.6]))
+    q = pwm.load(0.0)
     assert q == abc2complex(initial)
     assert pwm.k == 1
     assert pwm.t_next == 1e-3
     assert pwm.next_switch == float("inf")
-    assert pwm.get_state()["computation_delay.0.d_a"] == 0.8
+    pwm.load(1e-3)
+    assert pwm.active[0] == 0.8
 
 
-def test_computation_delay_state_is_owned_by_pwm():
-    params = peslite.load(EXAMPLES / "gfl-example.pes", **{"units.vsc.pwm.computation_delay.steps": 2})
+def test_duty_register_states_are_owned_by_pwm():
+    params = peslite.load(EXAMPLES / "gfl-example.pes")
     names = set(peslite.Simulation(params).state_names())
-    assert {
-        "vsc.pwm.computation_delay.0.d_a", "vsc.pwm.computation_delay.0.d_b",
-        "vsc.pwm.computation_delay.0.d_c", "vsc.pwm.computation_delay.1.d_a",
-        "vsc.pwm.computation_delay.1.d_b", "vsc.pwm.computation_delay.1.d_c",
-    } <= names
-    assert not any(name.startswith(("delay.", "pwm.")) for name in names)
+    for part in ("", "shadow."):
+        assert {f"vsc.pwm.{part}d_{phase}" for phase in "abc"} <= names
+    assert not any(".clock." in name or "pending." in name or "computation_delay" in name
+                   for name in names)
 
 
 def test_components_import_only_control_solver_and_themselves():

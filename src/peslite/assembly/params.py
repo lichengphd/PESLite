@@ -34,7 +34,7 @@ __all__ = [
     "ConfigError", "load", "dump", "dumps", "read_tree", "read_initial", "from_dict", "to_dict",
     "BaseValues", "DCBase",
     "BusParams", "BranchParams", "SourceParams",
-    "ACFilterParams", "DCLinkParams", "DCCapacitorParams", "DCSourceParams", "PWMParams", "ComputationDelayParams",
+    "ACFilterParams", "DCLinkParams", "DCCapacitorParams", "DCSourceParams", "PWMParams",
     "MeasurementParams", "ReferenceParams", "ControlParams", "OvercurrentParams", "VoltageLimitParams",
     "FrequencyLimitParams", "DCVoltageLimitParams", "RocofParams", "ProtectionParams",
     "AveragingParams", "UnitParams", "RUNTIME", "Change", "runtime_changeable", "set_changes",
@@ -279,38 +279,40 @@ class DCLinkParams:
 
 
 @dataclass(frozen=True)
-class ComputationDelayParams:
-    """Integer-period delay of PWM duty-ratio publications."""
-
-    steps: int = 0  # one step is one PWM output update
-
-
-@dataclass(frozen=True)
 class PWMParams:
-    """PWM settings: carrier, modulation method and duty-cycle update period.
+    """PWM carrier, modulation method and compare-register update mode.
 
+    ``update``: ``"single"`` loads the compare registers at carrier valleys; ``"double"``
+    loads them at valleys and peaks.
     ``sync``: ``"asynchronous"`` (carrier on absolute time) or ``"synchronous"`` (carrier
     locked to the controller angle; requires an integer ``f_sw / base.f0``).
     """
 
     f_sw: float  # carrier frequency, Hz
     modulation_limit: float = 1.0
+    update: str = "single"  # "single" | "double"
     carrier_phase: float = 0.0  # carrier position at t = 0, in carrier periods
     method: str = "spwm"  # "spwm" | "svpwm"
     sync: str = "asynchronous"  # "asynchronous" | "synchronous"
-    update_period: Optional[float] = None  # s; default: one carrier period
-    computation_delay: ComputationDelayParams = field(default_factory=ComputationDelayParams)
 
-    _choices = {"method": ("spwm", "svpwm"), "sync": ("asynchronous", "synchronous")}
+    _choices = {"update": ("single", "double"), "method": ("spwm", "svpwm"),
+                "sync": ("asynchronous", "synchronous")}
 
     @property
     def switching_period(self) -> float:
         return 1.0 / self.f_sw
 
     @property
-    def effective_update_period(self) -> float:
-        """Return ``update_period`` (s), or one carrier period if it is not set."""
-        return self.update_period if self.update_period is not None else self.switching_period
+    def load_period(self) -> float:
+        """Time between compare-register loads (s)."""
+        return self.switching_period / 2.0 if self.update == "double" else self.switching_period
+
+    @property
+    def grid_offset(self) -> float:
+        """First asynchronous carrier valley at or after t = 0; synchronous timing starts at 0."""
+        if self.sync == "synchronous":
+            return 0.0
+        return ((-self.carrier_phase) % 1.0) * self.switching_period
 
 
 @dataclass(frozen=True)
@@ -318,12 +320,14 @@ class MeasurementParams:
     """ADC measurement settings.
 
     ``average`` (AC) and ``u_dc`` (DC): ``"instantaneous"`` or ``"window"`` (mean over
-    ``window``, s, at most the PWM update period).
+    ``window``, s, at most the control period).
+    ``period`` is the ADC oversampling period; it defaults to the control period.
     """
 
     average: str = "instantaneous"
-    window: Optional[float] = None  # s; default: the PWM update period
+    window: Optional[float] = None  # s; default: the control period
     u_dc: str = "instantaneous"
+    period: Optional[float] = None  # s; default: the control period
 
     _choices = {"average": ("instantaneous", "window"), "u_dc": ("instantaneous", "window")}
 
@@ -347,21 +351,23 @@ class ReferenceParams:
                    "zero_v_pu": "voltage"}
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class ControlParams:
-    """Control configuration: named loops, their signal connections and references.
+    """Digital controller interrupt, computation, loops, wiring and references.
 
+    ``period`` defaults to one carrier period. ``computation`` is the time from its ADC sample
+    until the newly computed shadow duty ratios may be loaded into the active PWM registers.
     ``type`` selects the default wiring; ``connections`` and ``outputs`` override it.
     Each ``loops`` entry is validated against the schema registered for its ``type``.
     """
 
     type: str  # "gfl" | "gfm" | "custom"
+    period: Optional[float] = None  # s; default: one carrier period
+    computation: float = 1.0e-6  # s; 0 <= computation < period
     loops: dict[str, Any] = field(metadata={"entries": "loop"})  # each built with the parameters of its type
     connections: dict = field(default_factory=dict)  # input port -> output port
     outputs: dict = field(default_factory=dict)  # u_dq, theta, omega -> output port
     references: ReferenceParams = field(default_factory=ReferenceParams)
-    sampling_period: Optional[float] = None  # ADC sampling period, s; default: pwm update period
-    samples_per_update: int = field(init=False, default=1)
 
     _choices = {"type": ("gfl", "gfm", "custom")}
 
@@ -467,21 +473,28 @@ class UnitParams:
         return base, base.parameter_scales(vdc_ref)
 
     def resolved(self, system_base: BaseValues, events: tuple = ()) -> UnitParams:
-        """Return a copy with its base, target events and dependent defaults resolved."""
+        """Return a copy with its base, target events and dependent defaults resolved.
+
+        The control period defaults to one carrier period, every loop period to the control
+        period, and the reference frequency to the system frequency. Derived paths stay dependent
+        through :meth:`Params.replace`.
+        """
         derived = set()
-        pwm = self.pwm
-        if pwm.update_period is None:
-            pwm = replace(pwm, update_period=pwm.switching_period)
-            derived.add("pwm.update_period")
-        references = self.ctrl.references
+        ctrl = self.ctrl
+        if ctrl.period is None:
+            ctrl = replace(ctrl, period=self.pwm.switching_period)
+            derived.add("ctrl.period")
+        references = ctrl.references
         if references.omega is None:
             references = replace(references, omega=system_base.w0)
             derived.add("ctrl.references.omega")
-        ctrl = replace(self.ctrl, references=references)
-        sampling_period = ctrl.sampling_period if ctrl.sampling_period is not None else pwm.update_period
-        object.__setattr__(ctrl, "samples_per_update",
-                           max(1, int(round(pwm.update_period / sampling_period))))
-        unit = replace(self, pwm=pwm, ctrl=ctrl)
+        loops = dict(ctrl.loops)
+        for name, loop in loops.items():
+            if loop.period is None:
+                loops[name] = replace(loop, period=ctrl.period)
+                derived.add(f"ctrl.loops.{name}.period")
+        ctrl = replace(ctrl, references=references, loops=loops)
+        unit = replace(self, ctrl=ctrl)
         base = system_base if self.s_base is None else BaseValues(
             self.s_base, system_base.v_ll_rms, system_base.f0)
         object.__setattr__(unit, "base", base)
@@ -1078,11 +1091,11 @@ def _written_out(p: Params) -> dict:
         unit = d["units"][name]
         if unit["s_base"] is None:
             unit["s_base"] = u.base.s_base
-        if unit["ctrl"]["sampling_period"] is None:
-            unit["ctrl"]["sampling_period"] = u.pwm.update_period
         meas = unit["meas"]
+        if meas["period"] is None:
+            meas["period"] = u.ctrl.period
         if meas["window"] is None and "window" in (meas["average"], meas["u_dc"]):
-            meas["window"] = u.pwm.update_period
+            meas["window"] = u.ctrl.period
     for name, source in d["sources"].items():
         if source["f"] is None:
             source["f"] = p.base.f0

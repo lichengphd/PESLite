@@ -15,13 +15,13 @@ units:
       vdc_ref: 1500.0
       capacitor: {c_pu: 350.0, r_esr_pu: 0.001}
       source: {type: current, i_pu: 0.5, k_pu: 9.5}
-    pwm: {f_sw: 20000.0, modulation_limit: 0.95, computation_delay: {steps: 1}}
+    pwm: {f_sw: 20000.0, modulation_limit: 0.95}
     averaging: {enable: 1}
     ctrl:
       type: gfm
       loops:
-        power: {type: power, period: 5.0e-5}
-        sync: {type: matching, period: 5.0e-5, k_q_pu: 0.05}
+        power: {type: power}
+        sync: {type: matching, k_q_pu: 0.05}
         impedance: {type: virtual_impedance}
     protection: {overcurrent: {enable: 1, limit_pu: 1.5}}
 events:

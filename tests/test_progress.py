@@ -70,7 +70,7 @@ def test_watch_values_match_result_columns_and_states(gfl, monkeypatch):
                     result.states["pcc.u_C.im"][index])
     assert values["pcc.u_C"] == pytest.approx(abs(state))
     assert values["pcc.u_C.re"] == pytest.approx(state.real)
-    assert values["vsc.u_dc"] == result.states["vsc.dclink.u_C"][index]
+    assert values["vsc.u_dc"] == result.plant["vsc.u_dc"][index]
 
 
 def test_watch_uses_entity_first_state_names(gfl):

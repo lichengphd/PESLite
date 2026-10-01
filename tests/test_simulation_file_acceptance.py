@@ -132,15 +132,8 @@ def test_bus_without_own_source_keeps_default_and_explicit_values_win(case):
 
 def test_dataclass_rebuild_keeps_defaults_following_the_system_base(gfl):
     params = gfl()
-    pwm = dataclasses.replace(
-        params.unit("vsc").pwm,
-        computation_delay=dataclasses.replace(
-            params.unit("vsc").pwm.computation_delay, steps=1
-        ),
-    )
-    unit = dataclasses.replace(
-        params.unit("vsc"), pwm=pwm
-    )
+    unit = dataclasses.replace(params.unit("vsc"), ctrl=dataclasses.replace(
+        params.unit("vsc").ctrl, computation=2e-6))
     rebuilt = dataclasses.replace(params, units={"vsc": unit}).replace(**{"base.s_base": 1.0e6})
     assert rebuilt.unit("vsc").base.s_base == 1.0e6
 
@@ -160,7 +153,7 @@ def test_resolved_cli_prints_a_loadable_complete_file():
         ]) == 0
     tree = yaml.safe_load(stream.getvalue())
     assert tree["simulation"]["t_end"] == 0.5
-    assert tree["units"]["vsc"]["pwm"]["update_period"] == pytest.approx(1e-4)
+    assert tree["units"]["vsc"]["ctrl"]["period"] == pytest.approx(1e-4)
     from_dict(tree)
 
 

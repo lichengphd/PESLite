@@ -14,15 +14,15 @@ units:
     dclink:
       vdc_ref: 1500.0
       source: {type: voltage}
-    pwm: {f_sw: 20000.0, modulation_limit: 0.95, computation_delay: {steps: 1}}
+    pwm: {f_sw: 20000.0, modulation_limit: 0.95}
     averaging: {enable: 1}
     ctrl:
       type: gfm
       loops:
-        power: {type: power, period: 5.0e-5, filter: {enable: 1, bandwidth: 5.0}}
-        sync: {type: droop, period: 5.0e-5, m_p_pu: 6.2832, n_q_pu: 0.05}
-        va: {type: virtual_admittance, period: 5.0e-5, r_v_pu: 0.05, x_v_pu: 0.25, current_limit: {enable: 1, limit_pu: 1.2}}
-        cc: {type: dq_current_pi, period: 5.0e-5, bandwidth: 200.0}
+        power: {type: power, filter: {enable: 1, bandwidth: 5.0}}
+        sync: {type: droop, m_p_pu: 6.2832, n_q_pu: 0.05}
+        va: {type: virtual_admittance, r_v_pu: 0.05, x_v_pu: 0.25, current_limit: {enable: 1, limit_pu: 1.2}}
+        cc: {type: dq_current_pi, bandwidth: 200.0}
       references: {p_ref_pu: 0.5}
     protection: {overcurrent: {enable: 1, limit_pu: 1.5}}
 events:

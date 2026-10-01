@@ -1,6 +1,6 @@
 """The ADC of a converter: instantaneous samples of its measurement ports, or their means over an
 averaging window ``(X(t) - X(t - length)) / length`` of trapezoidal integrals (SI values), taken at
-each publication of the PWM and, oversampling, between them."""
+each control interrupt and, when oversampling, between interrupts."""
 
 from __future__ import annotations
 
@@ -37,10 +37,10 @@ class MeasurementPorts:
 
 
 class ADC:
-    """Sampler of the measurement ports, ``samples`` times per publication ``period`` (s) of the PWM.
+    """Sampler of the measurement ports, ``samples`` times per control ``period`` (s).
 
     The channels in ``channels`` (``"v"``, ``"i"``, ``"dc"``, each with its zero value) are averaged
-    over a window of ``length`` s ending at the publication, the others are instantaneous.
+    over a window of ``length`` s ending at the interrupt; the others are instantaneous.
     Named states per averaged channel ``c``: ``x_c`` (integral) and ``x_c_open`` (integral at window start).
     """
 
@@ -59,9 +59,9 @@ class ADC:
         self.period, self.samples = period, samples
         self.sample_period = period / samples
         self.peeks: list[Measurement] = []  # the samples taken since the last publication
-        self.n_samp = 1  # sample 0 of a period is its publication
+        self.n_samp = 1  # sample 0 of a period is its control interrupt
         self.latest: Optional[Measurement] = None
-        # the window of the next publication is open (a full-period window opens at the publication itself)
+        # the next interrupt's window is open (a full-period window opens at the interrupt itself)
         self.window_open = self.length is None or self._full
 
     @property
@@ -90,27 +90,27 @@ class ADC:
             self._last[c] = now
 
     def open(self) -> None:
-        """Start the window of the next publication at the current instant."""
+        """Start the window ending at the next control interrupt."""
         self.opened = dict(self.integral)
         self.window_open = True
 
     def t_window(self, t_next: float) -> float:
-        """The opening of the window of the publication at ``t_next`` (s); ``inf`` when it is open."""
+        """The opening of the window ending at interrupt ``t_next`` (s); ``inf`` when open."""
         return math.inf if self.window_open else t_next - self.length
 
     # ------------------------------------------------------------ the samples
     def t_sample(self, start: float) -> float:
-        """The next sample between two publications of the period that started at ``start``; ``inf`` when none."""
+        """The next sample between two interrupts in the period starting at ``start``; ``inf`` if none."""
         return (start + self.n_samp * self.sample_period) if self.n_samp < self.samples else math.inf
 
     def peek(self, t: float) -> None:
-        """Take a sample between two publications (oversampling)."""
+        """Take an oversample between two control interrupts."""
         self.latest = sample = self.measure(t)
         self.peeks.append(sample)
         self.n_samp += 1
 
     def sample(self, t: float) -> Measurement:
-        """Take the sample of the publication at ``t``, with those of the period before it (oversampling),
+        """Take the sample at the control interrupt ``t``, with the preceding oversamples,
         and rearm the averaging window."""
         self.latest = meas = self.measure(t)
         if self.length is not None:

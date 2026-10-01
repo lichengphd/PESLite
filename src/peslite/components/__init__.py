@@ -2,18 +2,18 @@
 
 The power circuit (:mod:`.network`, including registered ``elements``, and :mod:`.converter`) is
 continuous-time, in SI, connected through :class:`peslite.solver.model.Model`; the hardware
-connects it to the controller: the ADC (:mod:`.adc`) and the PWM peripheral with its computation
-delay and modulators (:mod:`.pwm`).
+connects it to the controller: the ADC (:mod:`.adc`) and the PWM timer, registers and modulators
+(:mod:`.pwm`).
 """
 
 from .network import (ELEMENT_TYPES, Element, Load, RCNode, RLBranch, ThreePhaseSource,
                       register_element_type)
 from .converter import Bridge, DCCapacitor, DCCurrentSource, DCLink, DCVoltageSource, make_dclink
 from .adc import ADC, MeasurementPorts
-from .pwm import (ZOH, CarrierComparison, ComputationDelay, SwitchingSequence, TimeStepAveragedCarrier,
+from .pwm import (ZOH, CarrierComparison, PWM, SwitchingSequence, TimeStepAveragedCarrier,
                   SynchronousCarrier, make_modulator)
 
 __all__ = ["ThreePhaseSource", "RLBranch", "RCNode", "Element", "ELEMENT_TYPES",
            "register_element_type", "Load", "Bridge", "DCLink", "DCCapacitor", "DCCurrentSource",
-           "DCVoltageSource", "make_dclink", "ADC", "MeasurementPorts", "ComputationDelay", "SwitchingSequence",
+           "DCVoltageSource", "make_dclink", "ADC", "MeasurementPorts", "PWM", "SwitchingSequence",
            "CarrierComparison", "SynchronousCarrier", "ZOH", "TimeStepAveragedCarrier", "make_modulator"]

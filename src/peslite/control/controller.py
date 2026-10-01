@@ -1,9 +1,9 @@
 """The controller of a converter unit as one block: its interface, and :class:`UniteType`.
 
-At each PWM publication the controller takes an ADC sample (:class:`Measurement`, SI), scales it to
+At each control interrupt the controller takes an ADC sample (:class:`Measurement`, SI), scales it to
 the unit's pu bases, runs its loop network (:class:`ControlGraph`: the loops of :mod:`.loops`
 connected by typed ports) and its protection (:mod:`.protection`), and turns the voltage command
-into duty ratios (:mod:`.modulation`); it returns them in a :class:`ControlOutput`. ``control.type``
+into duty ratios (:mod:`.modulation`); it returns them in a :class:`ControlOutput`. ``ctrl.type``
 (``gfl``, ``gfm``) chooses how its loops are wired by default.
 """
 
@@ -81,14 +81,12 @@ class ControlOutput:
 
 @runtime_checkable
 class Controller(Protocol):
-    """Sampled controller ``(t, Measurement) -> ControlOutput``, called once per PWM publication.
+    """Sampled controller ``(t, Measurement) -> ControlOutput``, called at each control interrupt.
 
     Optional: ``initial_sync() -> (theta, omega)`` seeds a synchronous carrier for the first period;
-    ``next_event``, ``periods``, ``reset_clocks(t)`` and ``update(t, meas)`` for independently clocked
-    loops; ``fast_check(t, i_abc)`` for an over-current check between samples; ``align_startup``.
+    ``fast_check(t, i_abc)`` checks over-current between samples; ``align_startup`` aligns the
+    initial command.
     """
-
-    T_s: float  # PWM publication interval (s), pwm.update_period
 
     def __call__(self, t: float, meas: Measurement) -> ControlOutput: ...
 
@@ -107,12 +105,12 @@ _REFERENCES = {"id_ref_pu": CURRENT, "iq_ref_pu": CURRENT, "theta": ANGLE, "omeg
 
 
 class ControlGraph:
-    """The loops of ``cfg.ctrl.loops`` wired by typed ports, each run on its own clock.
+    """The loops of ``cfg.ctrl.loops`` wired by typed ports and run by the control interrupt.
 
     Loop inputs are held outputs of other loops, the pu measurement (``meas.u_g``, ``.i_c``,
     ``.u_dc``) or the references (``references.<name>``); ``connections`` and ``outputs`` are the
     default wiring, which ``cfg.ctrl.connections`` and ``.outputs`` override. Loops run in signal
-    order; a loop without a period runs whenever the loops before it do.
+    order, every interrupt or every n-th interrupt according to their periods.
 
     Retuned parameters are queued by :meth:`schedule` and take effect at the next update. Changed
     loops are rebuilt from their new parameters and continue from their named states.
@@ -126,7 +124,7 @@ class ControlGraph:
         self.outputs = {**outputs, **cfg.ctrl.outputs}
         self.nodes = {}
         self.periods = {}
-        self.ticks = {}
+        self._T, self._t0 = float(cfg.ctrl.period), cfg.pwm.grid_offset
         self.values: dict[str, Any] = {}
         self._out_specs: dict[str, tuple] = {}
         self.updated = set()
@@ -142,7 +140,6 @@ class ControlGraph:
             self._out_specs[name] = tuple((port, f"{name}.{port}", spec.complex_value)
                                           for port, spec in node.outputs.items())
             self.periods[name] = loop.period
-            self.ticks[name] = 1
             self._store(name, node.initial_outputs())
             types.update({f"{name}.{port}": spec for port, spec in node.outputs.items()})
         dependencies = {name: set() for name in self.nodes}
@@ -180,9 +177,8 @@ class ControlGraph:
             for deps in pending.values():
                 deps.difference_update(ready)
         self._rewire()
-        self._all_clocked = all(T is not None for T in self.periods.values())
-        self._clocked = tuple((n, T) for n, T in self.periods.items() if T)
-        self._retime()
+        self._every = tuple((name, max(1, int(round(T / self._T))))
+                            for name, T in self.periods.items())
 
     def _rewire(self):
         """Resolve loop inputs and graph outputs against the current references."""
@@ -278,21 +274,10 @@ class ControlGraph:
                 raise FloatingPointError(f"control loop {name}.{port} returned a non-finite value")
             values[key] = value
 
-    # ------------------------------------------------------------ clocks
-    def reset_clocks(self, t):
-        self.ticks = {name: int(math.floor(t / T + 1e-9)) + 1 if T else 1
-                      for name, T in self.periods.items()}
-        self._retime()
-
-    def _retime(self):
-        """Recompute :attr:`next_event` from the clocks."""
-        ticks = self.ticks
-        self._next_event = min([ticks[n] * T for n, T in self._clocked], default=math.inf)
-
-    @property
-    def next_event(self):
-        """Earliest time (s) at which a clocked loop is due."""
-        return self._next_event
+    def due(self, t):
+        """Return the loops that run at the control interrupt at ``t``."""
+        k = int(round((t - self._t0) / self._T))
+        return {name for name, every in self._every if k % every == 0}
 
     # ------------------------------------------------------------ running
     def input(self, name, port, meas):
@@ -307,21 +292,15 @@ class ControlGraph:
         if self._pending:
             self._apply_pending()
         self.updated = updated = set()
-        periods, ticks = self.periods, self.ticks
-        due = {n for n, T in self._clocked if ticks[n] * T <= t + 1e-10}
-        if not due and self._all_clocked:
+        due = self.due(t)
+        if not due:
             return updated
         nodes, gather_, immediate = self.nodes, self._gather, self._immediate
         for name in self.order:
-            T = periods[name]
-            if name not in due and T is not None:
+            if name not in due:
                 continue
             self._store(name, nodes[name].update(t, gather_(immediate[name], meas)))
             updated.add(name)
-            if T:
-                ticks[name] += 1
-        if due:
-            self._retime()
         if finalize is not None:
             finalize(t, meas, updated)
         for name in due:
@@ -341,7 +320,6 @@ class ControlGraph:
     def get_state(self):
         state = gather(self.nodes)
         state.update({f"held.{self._state_port(k)}": v for k, v in self.values.items()})
-        state.update({f"clock.{n}": k for n, k in self.ticks.items() if self.periods[n]})
         return state
 
     def set_state(self, values):
@@ -353,14 +331,8 @@ class ControlGraph:
         for key, value in values.items():
             if key.startswith("held."):
                 self.values[state_ports[key[5:]]] = value
-            elif key.startswith("clock."):
-                name = key[6:]
-                if int(value) != value or value < 1:
-                    raise ValueError(f"invalid control clock {key}: {value}")
-                self.ticks[name] = int(value)
             else:
                 rest[key] = value
-        self._retime()
         scatter(self.nodes, rest)
         # held outputs that follow the loaded states, unless given themselves
         for name, node in self.nodes.items():
@@ -431,7 +403,7 @@ class UniteType:
     ``cfg``: the unit's parameters; ``cfg.ctrl.type``: ``"gfl"``, ``"gfm"`` or ``"custom"`` (no
     default wiring). ``scenario``: the unit's connection state and ramp over time.
     ``pwm_method``, ``limiter``: see :class:`~peslite.control.modulation.OutputStage`.
-    ``update()`` advances the due loops; ``__call__`` is the PWM publication. Integrating loops
+    ``__call__`` runs the due loops at a control interrupt and computes duty ratios. Integrating loops
     freeze while the unit is disconnected or tripped.
     """
 
@@ -441,7 +413,7 @@ class UniteType:
         wires, outputs = default_wiring(cfg, cfg.ctrl.type)
         self.graph = graph = ControlGraph(cfg, scenario, wires, outputs)
         self.periods = graph.periods
-        self.T_s = cfg.pwm.update_period
+        self.T_s = cfg.ctrl.period
         self.v_base, self.i_base, self.w0 = cfg.base.v_phase_peak, cfg.base.i_phase_peak, cfg.base.w0
         self.v_dc_base = cfg.dc_base.v
         self.protection = Protection(cfg.protection, self.T_s, scenario.armed)
@@ -486,13 +458,6 @@ class UniteType:
             self.protection.retune(cfg.protection)
         self.p = cfg
 
-    @property
-    def next_event(self):
-        return self.graph.next_event
-
-    def reset_clocks(self, t):
-        self.graph.reset_clocks(t)
-
     def initial_sync(self):
         values = {**self.graph.values, **{f"references.{k}": v for k, v in self.graph.references.items()}}
         return float(values[self.graph.outputs["theta"]]), float(values[self.graph.outputs["omega"]])
@@ -536,7 +501,7 @@ class UniteType:
         return out
 
     def update(self, t, meas):
-        """Run the loops due at ``t`` between publications, on the SI sample ``meas``."""
+        """Run the loops due at the control interrupt ``t``, on the SI sample ``meas``."""
         return self._update_pu(t, self._pu(meas))
 
     def _in_service(self, t):

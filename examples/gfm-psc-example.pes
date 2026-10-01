@@ -14,15 +14,15 @@ units:
     dclink:
       vdc_ref: 1500.0
       source: {type: voltage}
-    pwm: {f_sw: 20000.0, modulation_limit: 0.95, computation_delay: {steps: 1}}
+    pwm: {f_sw: 20000.0, modulation_limit: 0.95}
     averaging: {enable: 1}
     ctrl:
       type: gfm
       loops:
-        power: {type: power, period: 5.0e-5}
-        sync: {type: psc, period: 5.0e-5, k_p_pu: 6.2832, k_vi: 20.0}
+        power: {type: power}
+        sync: {type: psc, k_p_pu: 6.2832, k_vi: 20.0}
         impedance: {type: virtual_impedance}
-        damp: {type: active_damping, period: 5.0e-5, r_a_pu: 0.2, alpha_d: 40.0}
+        damp: {type: active_damping, r_a_pu: 0.2, alpha_d: 40.0}
       references: {p_ref_pu: 0.5}
     protection: {overcurrent: {enable: 1, limit_pu: 1.5}}
 events:

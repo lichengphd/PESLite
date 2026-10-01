@@ -14,13 +14,13 @@ units:
     dclink:
       vdc_ref: 1500.0
       source: {type: voltage}
-    pwm: {f_sw: 20000.0, modulation_limit: 0.95, computation_delay: {steps: 1}}
+    pwm: {f_sw: 20000.0, modulation_limit: 0.95}
     averaging: {enable: 1}
     ctrl:
       type: gfm
       loops:
-        power: {type: power, period: 5.0e-5}
-        sync: {type: vsg, period: 5.0e-5, h: 2.0, d_p_pu: 20.0, k_q_pu: 0.05, t_q: 0.02}
+        power: {type: power}
+        sync: {type: vsg, h: 2.0, d_p_pu: 20.0, k_q_pu: 0.05, t_q: 0.02}
         impedance: {type: virtual_impedance, x_v_pu: 0.1}
       references: {p_ref_pu: 0.5}
     protection: {overcurrent: {enable: 1, limit_pu: 1.5}}

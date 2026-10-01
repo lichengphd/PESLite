@@ -5,11 +5,11 @@ Time-domain simulation of power-electronic converters in Python.
 - Networks of buses, lines, grid sources and any number of converters, defined in YAML
   simulation files, with run-time changes described as events.
 - Grid-following (PLL, current loop, dc-voltage loop) and grid-forming control
-  (PSC, droop, VSG, dVOC, matching), each loop on its own clock.
+  (PSC, droop, VSG, dVOC, matching), with each loop scheduled on control interrupts.
 - Switching bridges (ideal switches at exact instants) and bridges averaged over the PWM period
   or solver step, selected independently for each converter.
 - Fixed-step, adaptive (SciPy or built-in DP45) and multirate integration.
-- ADC sampling (instantaneous or window average), computation delay, PWM, protection.
+- ADC sampling (instantaneous or window average), controller computation time, PWM, protection.
 - Energy accounting of the power circuit and restart from any saved state.
 
 The power circuit works in SI units (V, A, H, F, ohm); controllers work in pu of each
@@ -46,7 +46,7 @@ peslite gfm-psc-example
 peslite gfm-droop-example
 
 # override any parameter by its dotted path
-peslite gfl-example --set simulation.t_end=1 --set units.vsc.pwm.computation_delay.steps=1
+peslite gfl-example --set simulation.t_end=1 --set units.vsc.ctrl.computation=2e-6
 peslite gfl-example --set simulation.solver.type=adaptive --set simulation.solver.method=DP45
 peslite gfm-droop-example --set units.vsc.averaging.enable=0
 
@@ -134,8 +134,9 @@ preserving each converter's configured `over` value. It takes precedence over an
 command-line override. If the option changes at least one model, the default result directory is
 `output/<name>-averaging`.
 
-Time-step averaging requires a fixed-step solver and an asynchronous carrier. With PWM-period
-averaging there is no carrier, so carrier phase and synchronisation settings have no effect.
+Time-step averaging requires a fixed-step solver and an asynchronous carrier. PWM-period
+averaging has no carrier ripple, but the carrier phase still shifts that unit's control interrupts
+and PWM loads.
 
 ## Example configurations
 
@@ -162,10 +163,11 @@ averaging there is no carrier, so carrier phase and synchronisation settings hav
 | `simulation.progress` | `{enable: 1, period: 0.1, watch: [...]}`; CLI: `--progress`, `--watch` |
 | `units.<u>.averaging` | `{enable: 1, over: pwm_period \| time_step}`; CLI: `--averaging` |
 | `units.<u>.ctrl.type` | `gfl` \| `gfm` \| `custom` |
-| `units.<u>.ctrl.loops.<loop>.period` | loop period, s |
-| `units.<u>.meas.average` | `instantaneous` \| `window` (with `window`) |
+| `units.<u>.ctrl.period` / `.computation` | control-interrupt period and computation time, s |
+| `units.<u>.ctrl.loops.<loop>.period` | loop period, an integer multiple of `ctrl.period` |
+| `units.<u>.meas.period` / `.average` | ADC period; `instantaneous` \| `window` (with `window`) |
+| `units.<u>.pwm.update` | `single` (valleys) \| `double` (valleys and peaks) |
 | `units.<u>.pwm.method` / `.sync` | `spwm` \| `svpwm`; `asynchronous` \| `synchronous` |
-| `units.<u>.pwm.computation_delay.steps` | duty-ratio computation delay, in PWM updates |
 | `simulation.output.states` / `.signals` / `.energy` | which files are written |
 
 ## Output
@@ -235,8 +237,8 @@ alone; event-aware solvers may additionally provide `settle()` and `parameters_c
 
 A custom controller output stage can also be built with
 `UniteType(cfg, scenario, pwm_method=..., limiter=...)`. Other replaceable parts are
-`<unit>.modulator`, `<unit>.pwm.computation_delay` and `solver`. Executable examples of a custom loop, element,
-event and user solver live in `tests/test_custom_parts.py`; the root `examples/` directory remains
+`<unit>.modulator` and `solver`. Executable examples of a custom loop, element, event and user
+solver live in `tests/test_custom_parts.py`; the root `examples/` directory remains
 simulation-data-only.
 
 ## Layout
@@ -248,7 +250,7 @@ src/peslite/            the package: __init__.py and four code parts
     network.py            three-phase source, R-L branch, bus (R-C node), element types
     converter.py          bridge, dc link (capacitor, current or voltage source)
     adc.py                sampling of a converter's measurements, averaging window, oversampling
-    pwm.py                PWM peripheral: publications, shadow-register computation delay, carrier, modulators
+    pwm.py                PWM timer, duty registers, carrier and modulators
   control/              the converter's controller
     loops.py              what each loop type computes: its parameters, ports and update
     controller.py         controller interface, loop network, GFL/GFM wiring, UniteType
