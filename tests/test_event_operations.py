@@ -175,13 +175,16 @@ def test_system_switches_units_sources_and_loads():
     source = unit.dclink.source
     system.switch("vsc", False, 0.1)
     assert unit.branch_f.breaker_open and source(0.15, source.u_ref) == 0.0
-    unit.ctrl.update(0.15, _measurement(p, 0.15))
-    assert unit.ctrl.graph.nodes["cc"].frozen and unit.ctrl.graph.nodes["dvc"].frozen
+    cc, dvc = unit.ctrl.graph.nodes["cc"], unit.ctrl.graph.nodes["dvc"]
+    cc.integral, dvc.integral = 0.2 + 0.1j, 0.3
+    unit.ctrl(0.15, _measurement(p, 0.15))
+    assert not unit.ctrl.sequencer.running
+    assert cc.integral == 0.2 + 0.1j and dvc.integral == 0.3
 
     system.switch("vsc", True, 0.2, 0.1)
-    assert not unit.branch_f.breaker_open
+    assert unit.breaker and unit.branch_f.breaker_open  # gates stay blocked until a PWM load enables them
     assert 0.0 < source(0.25, source.u_ref) < source.i_nom
-    unit.trip()
+    unit.trip(0.25, "test")
     system.switch("vsc", True, 0.3)
     assert unit.tripped and unit.branch_f.breaker_open
 
@@ -245,7 +248,7 @@ def test_system_applies_retunes_and_control_loops_keep_their_state():
     assert unit.ctrl.protection._rocof_window == pytest.approx(0.2)
     assert unit.ctrl.graph.nodes["pll"] is old_pll  # queued until the next controller update
 
-    unit.ctrl.update(change.t, _measurement(p, change.t))
+    unit.ctrl(change.t, _measurement(p, change.t))
     pll = unit.ctrl.graph.nodes["pll"]
     assert pll is not old_pll and pll.kp == 10.0
     # The retuned loop first takes over the old state, then performs this interrupt's update.

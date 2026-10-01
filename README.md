@@ -9,7 +9,8 @@ Time-domain simulation of power-electronic converters in Python.
 - Switching bridges (ideal switches at exact instants) and bridges averaged over the PWM period
   or solver step, selected independently for each converter.
 - Fixed-step, adaptive (SciPy or built-in DP45) and multirate integration.
-- ADC sampling (instantaneous or window average), controller computation time, PWM, protection.
+- Closed sampled controllers with interrupt-counted start-up, ADC sampling, computation time,
+  PWM enable and duty registers, and hardware/controller protection.
 - Energy accounting of the power circuit and restart from any saved state.
 
 The power circuit works in SI units (V, A, H, F, ohm); controllers work in pu of each
@@ -106,11 +107,30 @@ events:
 `connect` and `disconnect` operate on units, sources, branches or elements. `set` changes a
 declared run-time parameter path and validates the resulting parameter set before it is used.
 Every event time is an exact integration boundary: the interval ending there uses the old model,
-and integration after it uses the updated model. A disconnected converter pauses its controller;
-a converter that trips remains disconnected.
+and integration after it uses the updated model. A unit connection is a host run command to its
+controller; while stopped, integrating loops hold and the PWM is blocked through its normal
+register path. A converter that trips remains disconnected.
 
 The built-in `load` element is a series R-L load from a bus to ground. It can be connected,
 disconnected or retuned by events; a small impedance can be used to model a fault.
+
+## Controller and converter hardware
+
+A converter controller is a closed discrete-time block. At each control interrupt it receives one
+SI `Measurement` (ADC values plus the gate driver's latched fault) and returns `ControlOutput` with
+duty ratios, PWM enable, synchronization data and any controller trip. Its only plant-independent
+host input is `command(run, ramp)`.
+
+The controller's `Sequencer` counts its own interrupts. A connect command releases PWM with the
+first computed duty word, ramps the active-power setpoint, and arms sampled protection when the
+ramp ends; a disconnect command blocks PWM and resets that ramp. Grid-forming synchronization laws
+track a usable terminal voltage before starting, avoiding an artificial phase jump at connection.
+
+Breakers, gate enable and the instantaneous over-current comparator belong to `Unit`, not to the
+controller. The comparator observes phase current at switching and register-load instants and can
+block the converter immediately; the controller sees the resulting latched digital fault at its
+next sample. Any trip blocks the gates, opens the AC terminal and disconnects the DC source for the
+rest of the run.
 
 ## Bridge models
 
@@ -249,7 +269,7 @@ same parsing and validation as built-in types. A user solver may implement the n
 alone; event-aware solvers may additionally provide `settle()` and `parameters_changed()` hooks.
 
 A custom controller output stage can also be built with
-`UniteType(cfg, scenario, pwm_method=..., limiter=...)`. Other replaceable parts are
+`UniteType(cfg, pwm_method=..., limiter=...)`. Other replaceable parts are
 `<unit>.modulator` and `solver`. Executable examples of a custom loop, element, event and user
 solver live in `tests/test_custom_parts.py`; the root `examples/` directory remains
 simulation-data-only.
@@ -261,20 +281,20 @@ pyproject.toml
 src/peslite/            the package: __init__.py and four code parts
   components/           what the system is made of
     network.py            three-phase source, R-L branch, bus (R-C node), element types
-    converter.py          bridge, dc link (capacitor, current or voltage source)
+    converter.py          bridge, dc link and gate-driver over-current comparator
     adc.py                sampling of a converter's measurements, averaging window, oversampling
     pwm.py                PWM timer, duty registers, carrier and modulators
   control/              the converter's controller
     loops.py              what each loop type computes: its parameters, ports and update
-    controller.py         controller interface, loop network, GFL/GFM wiring, UniteType
+    controller.py         controller interface, Sequencer, loop network, GFL/GFM wiring, UniteType
     protection.py         trip and alarm criteria
     modulation.py         output stage: voltage command to duty ratios, limiter, anti-windup
     blocks.py             transforms, filters and timers
   assembly/             a system built from a simulation file
     params.py             parameter classes, pu bases, runtime changes, file reading and writing
     validate.py           checks across the file's sections
-    events.py             event types, connection ramps, unit setpoints and source scenarios
-    unit.py               a converter unit: power stage, ADC, controller, PWM
+    events.py             event types, connection state/ramp metadata and source scenarios
+    unit.py               power stage, ADC/PWM peripherals, controller, breakers and trips
     system.py             the network, units and elements as one model; applies events
   solver/               the numerical kernel and the run
     model.py              subsystems, their connections and named states

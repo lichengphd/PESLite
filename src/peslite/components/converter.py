@@ -4,13 +4,15 @@ Quantities are SI; ``q`` is the space vector of the phase switching states (or d
 """
 from __future__ import annotations
 
-from typing import Any, Callable, ClassVar, Optional
+import math
+from typing import Any, Callable, ClassVar, Optional, Sequence
 
-from ..control.blocks import smoothstep
+from ..control.blocks import peak_abs, smoothstep
 from ..solver.energy import PowerPort, StoragePort
 from ..solver.model import Bag, Empty, OutputStage
 
-__all__ = ["Bridge", "DCLink", "DCCapacitor", "DCCurrentSource", "DCVoltageSource", "make_dclink"]
+__all__ = ["Bridge", "DCLink", "DCCapacitor", "DCCurrentSource", "DCVoltageSource", "make_dclink",
+           "OvercurrentComparator"]
 
 
 class _BridgeInp(Bag):
@@ -242,3 +244,38 @@ def make_dclink(cfg: Any) -> DCLink:
     else:
         raise ValueError(f"unknown DC source type {p.type!r}")
     return DCLink(capacitor, source)
+
+
+# ------------------------------------------------------------------ the gate driver
+
+class OvercurrentComparator:
+    """Gate-driver over-current comparator, independent of sampled controller protection.
+
+    It observes instantaneous phase currents at bridge switching/load instants, blocks the gates
+    immediately on a limit crossing, and exposes a latched digital ``fault`` to the controller.
+    """
+
+    def __init__(self, cfg: Any, i_base: float) -> None:
+        self.cfg, self.i_base = cfg, float(i_base)
+        self.fault = False
+        self.max_current_pu = 0.0
+        self.first_t: Optional[float] = None
+
+    def retune(self, cfg: Any) -> None:
+        self.cfg = cfg
+
+    def check(self, t: float, i_abc: Sequence[float]) -> bool:
+        """Return ``True`` only when this call first latches the fault."""
+        peak = peak_abs(i_abc) / self.i_base
+        if not math.isfinite(peak):
+            return False
+        self.max_current_pu = max(self.max_current_pu, peak)
+        cfg = self.cfg
+        if not (cfg.enable and peak > cfg.limit_pu):
+            return False
+        if self.first_t is None:
+            self.first_t = t
+        if self.fault:
+            return False
+        self.fault = True
+        return True

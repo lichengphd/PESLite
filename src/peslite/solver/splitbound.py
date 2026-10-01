@@ -28,7 +28,9 @@ class LoopMap(Protocol):
     ``coordinates(names)``: list of ``(kind, names, scale)``; ``kind`` is ``"vector"`` (column pair
     rotated with the frame), ``"fixed"`` (pair already in the frame), ``"triple"``, ``"scalar"`` or
     ``"frozen"`` (not perturbed); ``scale`` is the finite-difference step floor.
-    ``to_frame`` / ``from_frame``: convert a state row to and from the frame vector.
+    ``"frozen"`` is a flag which must be clear and is not perturbed; ``"mode"`` is a mode or
+    counter which is retained but not perturbed. ``to_frame`` / ``from_frame`` convert a state row
+    to and from the frame vector.
     ``advance(row, t, view)``: run one period; ``view = (state label, offset, "b" | "c")`` applies
     the offset to the integration (``"b"``) or the sampler (``"c"``).
     """
@@ -75,7 +77,7 @@ def _period_map(loop: LoopMap, row: dict[str, float], t0: float, cols: list,
     evaluations = 1
     j = 0
     for kind, _names, floor in cols:
-        if kind != "frozen":
+        if kind not in ("frozen", "mode"):
             for w in range(_width(kind)):
                 h = _FD * max(abs(float(x0[j + w])), floor)
                 outs = []

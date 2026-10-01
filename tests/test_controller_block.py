@@ -1,0 +1,199 @@
+"""Issue #1: the controller is a closed sampled block; hardware protection belongs to Unit."""
+
+import cmath
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+import peslite
+from conftest import EXAMPLES
+from peslite.control import Measurement, Sequencer
+from peslite.control.blocks import smoothstep
+from peslite.control.protection import Protection
+
+
+T = 5e-5
+
+
+def _run(params, path):
+    return peslite.Simulation(params).run(out_dir=path)
+
+
+def _event(name, **event):
+    return {f"events.{name}": event}
+
+
+def _current(result):
+    return np.abs(result.states["vsc.branch_f.i.re"]
+                  + 1j * result.states["vsc.branch_f.i.im"])
+
+
+def test_sequencer_counts_startup_on_controller_interrupts():
+    sequence = Sequencer(T=0.25, run=False)
+    sequence.step(False)
+    assert (sequence.running, sequence.ramp_value, sequence.armed) == (False, 0.0, False)
+    sequence.command(True, 1.0)
+    seen = []
+    for _ in range(6):
+        sequence.step(False)
+        seen.append((sequence.running, sequence.ramp_value, sequence.armed, sequence.steps))
+    assert seen == [(True, smoothstep(x), x >= 1.0, min(4, n + 1))
+                    for n, x in enumerate((0.0, 0.25, 0.5, 0.75, 1.0, 1.0))]
+    sequence.set_state({"steps": 100})
+    assert sequence.steps == 4
+    sequence.command(False)
+    sequence.step(False)
+    assert (sequence.running, sequence.steps) == (False, 0)
+
+
+def test_controller_needs_only_samples_and_host_commands(gfl):
+    cfg = gfl().unit("vsc")
+    controller = peslite.UniteType(cfg)
+    assert not hasattr(controller, "scenario")
+    voltage, w0 = cfg.base.v_phase_peak, cfg.base.w0
+
+    def sample(k, **extra):
+        return Measurement(k * T, voltage * cmath.exp(1j * w0 * k * T), 0j,
+                           cfg.dclink.vdc_ref, np.zeros(3), **extra)
+
+    controller.command(False)
+    output = controller(0.0, sample(0))
+    assert not output.gates and output.log["in_service"] == 0.0 and not output.tripped
+    controller.command(True, 4 * T)
+    armed = []
+    for k in range(1, 8):
+        output = controller(k * T, sample(k))
+        armed.append(controller.sequencer.armed)
+        assert output.gates and np.all((0.0 <= output.d_abc) & (output.d_abc <= 1.0))
+    assert armed == [False, False, False, False, True, True, True]
+    output = controller(8 * T, sample(8, fault=True))
+    assert (output.tripped, output.gates, output.trip_cause) == (True, False, "overcurrent")
+    assert not controller(9 * T, sample(9)).gates
+
+
+def test_pwm_stays_blocked_until_first_controller_word_is_loaded(gfl, tmp_path):
+    params = gfl(**{
+        "events.connect_vsc.t": 0.001,
+        "events.connect_vsc.ramp": 0.0,
+        "simulation.t_end": 0.0012,
+        "simulation.output.period": 2.5e-5,
+        "simulation.output.signals": 1,
+    })
+    result = _run(params, tmp_path)
+    t = result.states["t"]
+    active, shadow = result.states["vsc.pwm.on"], result.states["vsc.pwm.shadow.on"]
+    release = 0.001 + T
+    assert np.all(active[t < release - 1e-9] == 0.0)
+    assert np.all(active[t > release - 1e-9] == 1.0)
+    assert shadow[np.argmin(abs(t - 0.001))] == 1.0
+    assert np.all(_current(result)[t <= release + 1e-9] == 0.0)
+
+
+def test_disconnect_stops_sequence_and_connect_restarts_ramp(gfl, tmp_path):
+    params = gfl(
+        **{"events.connect_vsc.ramp": 0.0, "simulation.t_end": 0.003,
+           "simulation.output.period": T},
+        **_event("off", type="disconnect", target="vsc", t=0.001),
+        **_event("on", type="connect", target="vsc", t=0.002, ramp=0.0005),
+    )
+    result = _run(params, tmp_path)
+    t, steps = result.states["t"], result.states["vsc.ctrl.sequence.steps"]
+    assert np.all(steps[(t > 0.001 + 1e-9) & (t < 0.002 - 1e-9)] == 0.0)
+    after = t > 0.002 - 1e-9
+    end = round(0.0005 / T)
+    assert np.array_equal(steps[after], np.minimum(np.arange(1, after.sum() + 1), end))
+
+
+def test_gate_driver_comparator_trips_during_unarmed_ramp(gfl, tmp_path):
+    params = gfl(**{
+        "units.vsc.protection.overcurrent.limit_pu": 0.01,
+        "events.connect_vsc.ramp": 1.0,
+        "simulation.t_end": 0.002,
+        "simulation.stop_on_trip": 0,
+        "simulation.output.period": 2.5e-5,
+    })
+    result = _run(params, tmp_path)
+    summary = result.summary
+    assert summary["vsc.trip_cause"] == "overcurrent"
+    assert summary["vsc.trip_time"] == summary["vsc.overcurrent_first_t"] < 1.0
+    after = result.states["t"] > summary["vsc.trip_time"] + 1e-9
+    assert np.all(_current(result)[after] == 0.0)
+    assert np.all(result.states["vsc.fault"][after] == 1.0)
+    assert {"OVERCURRENT", "TRIP_OVERCURRENT"} <= set(summary["vsc.alarms"])
+
+
+@pytest.mark.parametrize("criterion, cause, alarm, inputs", [
+    ("dc_voltage", "vdc", "VDC_BAND", (1.0, 0.0, 0.2)),
+    ("frequency", "freq", "FREQ_BAND", (1.0, 2.0, 0.0)),
+    ("undervoltage", "vac_uv", "VAC_UNDER", (0.5, 0.0, 0.0)),
+    ("overvoltage", "vac_ov", "VAC_OVER", (1.5, 0.0, 0.0)),
+])
+def test_sampled_protection_arms_and_holds(criterion, cause, alarm, inputs):
+    cfg = SimpleNamespace(
+        hold=0.02,
+        rocof=SimpleNamespace(window=0.1, enable=False),
+        dc_voltage=SimpleNamespace(enable=False, limit_pu=0.1),
+        frequency=SimpleNamespace(enable=False, limit=1.0),
+        undervoltage=SimpleNamespace(enable=False, limit_pu=0.8),
+        overvoltage=SimpleNamespace(enable=False, limit_pu=1.2),
+    )
+    getattr(cfg, criterion).enable = True
+    protection = Protection(cfg, 0.01)
+    protection.check_sampled(0.0, *inputs, armed=False)
+    assert not protection.tripped and protection.stats.alarms == []
+    protection.check_sampled(0.01, *inputs, armed=True)
+    assert not protection.tripped and protection.stats.alarms == [alarm]
+    protection.check_sampled(0.02, *inputs, armed=True)
+    protection.check_sampled(0.03, *inputs, armed=True)
+    assert protection.trip is not None and protection.trip.cause == cause
+
+
+def test_controller_block_states_use_entity_first_names(gfl):
+    names = set(peslite.Simulation(gfl()).state_names())
+    assert {"vsc.ctrl.sequence.run", "vsc.ctrl.sequence.ramp", "vsc.ctrl.sequence.steps",
+            "vsc.tripped", "vsc.fault", "vsc.pwm.on", "vsc.pwm.shadow.on"} <= names
+    assert not any(".pending." in name for name in names)
+
+
+@pytest.mark.parametrize("name", ["gfm-psc-example.pes", "gfm-vsg-example.pes"])
+def test_grid_forming_controller_presynchronises_to_terminal_voltage(name, tmp_path):
+    params = peslite.load(EXAMPLES / name, **{
+        "simulation.t_end": 0.03,
+        "simulation.progress.enable": 0,
+        "simulation.solver.linearisations": 0,
+        "sources.grid.angle": 1.0,
+        "sources.grid.v_pu": 1.05,
+        "events.connect_vsc.t": 0.0,
+    })
+    result = _run(params, tmp_path)
+    assert not result.tripped and result.summary["vsc.max_current_pu"] < 0.3
+
+
+def test_split_bound_holds_sequence_and_pwm_modes(gfl, tmp_path):
+    params = gfl(**{
+        "events.connect_vsc.t": 0.003,
+        "simulation.solver.linearisations": 2,
+        "simulation.solver.subsystems.vsc.dclink": 10,
+    })
+    summary = _run(params, tmp_path).summary
+    assert summary["split_bound"].startswith("linearised loop at t = 0.002, 0.004 s")
+
+
+def test_startup_sequence_and_registers_continue_from_a_saved_row(gfl, tmp_path):
+    params = gfl(**{
+        "events.connect_vsc.t": 0.001,
+        "events.connect_vsc.ramp": 0.001,
+        "simulation.t_end": 0.002,
+        "simulation.output.period": 1e-5,
+    })
+    whole_dir = tmp_path / "whole"
+    whole = _run(params, whole_dir)
+    t0 = 0.00137
+    continued_params = peslite.load(
+        whole_dir / "simulation.pes", initial=whole_dir / "states.csv", initial_time=t0)
+    continued = _run(continued_params, tmp_path / "continued")
+    start = int(np.argmin(abs(whole.t - t0)))
+    assert np.array_equal(continued.t, whole.t[start:])
+    for name, values in continued.states.items():
+        assert np.array_equal(values, whole.states[name][start:]), name

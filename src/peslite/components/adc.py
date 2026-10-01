@@ -23,7 +23,8 @@ class MeasurementPorts:
     """Zero-argument callables that read one converter's quantities from the model (SI).
 
     ``u_g`` terminal voltage, ``i_c`` converter current, ``u_dc`` dc voltage;
-    ``i_c_state`` reads the current from the state vector; ``i_dc`` is recorded only.
+    ``i_c_state`` reads the current from the state vector; ``i_dc`` is recorded only; ``fault``
+    reads the gate driver's latched digital fault.
     """
 
     u_g: Callable[[], complex]
@@ -31,6 +32,7 @@ class MeasurementPorts:
     i_c_state: Callable[[], complex]
     u_dc: Callable[[], float]
     i_dc: Optional[Callable[[], float]] = None
+    fault: Optional[Callable[[], bool]] = None
 
     def read(self) -> dict[str, complex | float]:
         """The instantaneous values of the ADC channels ``v``, ``i`` and ``dc``."""
@@ -38,14 +40,15 @@ class MeasurementPorts:
 
 
 class ADC:
-    """Sampler of the measurement ports, ``samples`` times per control ``period`` (s).
+    """Sampler triggered every control ``period`` and optionally between interrupts.
 
     The channels in ``channels`` (``"v"``, ``"i"``, ``"dc"``, each with its zero value) are averaged
     over a window of ``length`` s ending at the interrupt; the others are instantaneous.
-    Named state per averaged channel ``c``: ``x_c`` (the integral accumulated in the open window).
+    Named state per averaged channel ``c``: ``x_c``, the integral accumulated in the open window.
     """
 
-    def __init__(self, ports: MeasurementPorts, period: float, samples: int = 1, length: Optional[float] = None,
+    def __init__(self, ports: MeasurementPorts, period: float, sample_period: float,
+                 length: Optional[float] = None,
                  channels: Mapping[str, complex | float] | None = None) -> None:
         self.ports = ports
         channels = dict(channels or {})
@@ -54,13 +57,12 @@ class ADC:
         self.length = float(length) if channels else None  # None: instantaneous sampling
         self.channels = tuple(channels)
         self._zero = channels
-        self.accumulated = dict(channels)  # integrals since the current window opened
+        self.accumulated = dict(channels)
         self._last = dict(channels)  # previous sample
-        self.period, self.samples = period, samples
-        self.sample_period = period / samples
-        self.peeks: list[Measurement] = []  # the samples taken since the last publication
+        self.period, self.sample_period = period, sample_period
+        self.samples = max(1, int(round(period / sample_period)))
+        self.peeks: list[Measurement] = []  # samples taken since the last interrupt
         self.n_samp = 1  # sample 0 of a period is its control interrupt
-        self.latest: Optional[Measurement] = None
         # the next interrupt's window is open (a full-period window opens at the interrupt itself)
         self.window_open = self.length is None or self._full
 
@@ -94,9 +96,9 @@ class ADC:
 
     # ------------------------------------------------------------ the window
     def seed(self) -> None:
-        """Take the current values as the start of the integrals (at the start of a run)."""
+        """Start the next integration interval from the values after changes at this instant."""
         values = self.ports.read()
-        self._last = {c: values[c] for c in self.channels}
+        self._last = {channel: values[channel] for channel in self.channels}
 
     def held_before(self, duration: float) -> None:
         """Count the current values as held for ``duration`` seconds before the run starts."""
@@ -109,11 +111,11 @@ class ADC:
             return
         values = self.ports.read()
         half = 0.5 * dt
-        for c in self.channels:
-            now = values[c]
+        for channel in self.channels:
+            now = values[channel]
             if self.window_open:
-                self.accumulated[c] += half * (self._last[c] + now)
-            self._last[c] = now
+                self.accumulated[channel] += half * (self._last[channel] + now)
+            self._last[channel] = now
 
     def open(self) -> None:
         """Start the window ending at the next control interrupt."""
@@ -131,14 +133,13 @@ class ADC:
 
     def peek(self, t: float) -> None:
         """Take an oversample between two control interrupts."""
-        self.latest = sample = self.measure(t)
-        self.peeks.append(sample)
+        self.peeks.append(self.measure(t))
         self.n_samp += 1
 
     def sample(self, t: float) -> Measurement:
         """Take the sample at the control interrupt ``t``, with the preceding oversamples,
         and rearm the averaging window."""
-        self.latest = meas = self.measure(t)
+        meas = self.measure(t)
         if self.length is not None:
             self.window_open = self._full
             if self.window_open:
@@ -154,15 +155,17 @@ class ADC:
         """Return the :class:`Measurement` at ``t``; model outputs must be up to date at ``t``.
 
         ``u_g``, ``i_c``, ``u_dc`` are window means for averaged channels;
-        ``u_g_raw``, ``i_c_raw``, ``u_dc_raw`` and ``i_abc`` are instantaneous.
+        ``u_g_raw``, ``i_c_raw``, ``u_dc_raw`` and ``i_abc`` are instantaneous; ``fault`` is the
+        gate driver's digital input.
         """
         ports = self.ports
         u_raw, i_raw, dc_raw = ports.u_g(), ports.i_c(), ports.u_dc()
-        mean = {c: self.accumulated[c] / self.length for c in self.channels}
+        mean = {channel: self.accumulated[channel] / self.length for channel in self.channels}
         return Measurement(t=t,
                            u_g=mean.get("v", u_raw), i_c=mean.get("i", i_raw),
                            u_dc=mean.get("dc", dc_raw), i_abc=complex2abc(i_raw),
-                           u_g_raw=u_raw, i_c_raw=i_raw, u_dc_raw=dc_raw)
+                           u_g_raw=u_raw, i_c_raw=i_raw, u_dc_raw=dc_raw,
+                           fault=ports.fault() if ports.fault is not None else False)
 
     def phase_currents(self) -> np.ndarray:
         """Return the instantaneous phase currents read from the state vector."""
@@ -170,7 +173,7 @@ class ADC:
 
     # ------------------------------------------------------------ its states
     def get_state(self) -> dict[str, Any]:
-        return {f"x_{c}": value for c, value in self.accumulated.items()}
+        return {f"x_{channel}": value for channel, value in self.accumulated.items()}
 
     def set_state(self, values: Mapping[str, Any]) -> None:
         for channel, zero in self._zero.items():

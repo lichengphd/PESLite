@@ -13,13 +13,12 @@ from bisect import bisect_right
 from dataclasses import dataclass, field, is_dataclass
 from typing import Any, Callable, ClassVar, Iterable, Mapping, Optional
 
-from ..control.blocks import smoothstep
 from ..solver.model import ConfigError
 
 __all__ = [
     "NAMED", "SWITCHABLE", "SWITCHING", "Event", "EVENT_TYPES", "register_event_type",
     "Connect", "Disconnect", "Set", "events_for", "switching_schedule", "connected_at",
-    "Scenario", "UnitScenario", "SourceScenario",
+    "Scenario", "SourceScenario",
 ]
 
 NAMED = ("buses", "branches", "sources", "units", "elements")
@@ -164,28 +163,6 @@ class Scenario:
         """Return the time and ramp of the connection in force at ``t``."""
         return max(((start, ramp) for start, ramp in self._connections if start <= t + 1e-10),
                    default=(-math.inf, 0.0))
-
-    def ramp_value(self, t: float) -> float:
-        """Return 0 while disconnected, otherwise the current connection's smooth ramp in [0, 1]."""
-        if not self.connected(t):
-            return 0.0
-        start, ramp = self.since(t)
-        if ramp <= 0.0 or t >= start + ramp:
-            return 1.0
-        return smoothstep((t - start) / ramp)
-
-    def armed(self, t: float) -> bool:
-        """Whether protection is armed: connected and past the connection ramp."""
-        start, ramp = self.since(t)
-        return self.connected(t) and t >= start + ramp
-
-
-class UnitScenario(Scenario):
-    """A converter unit's connection scenario and ramped active-power reference."""
-
-    def setpoints(self, t: float, p_ref: float, q_ref: float, v_ref: float) -> tuple[float, float, float]:
-        return self.ramp_value(t) * p_ref, q_ref, v_ref
-
 
 class SourceScenario:
     """A source's magnitude, frequency and angle between successive parameter changes."""

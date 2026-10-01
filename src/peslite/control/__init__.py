@@ -11,9 +11,9 @@ solver's kernel: the hardware adapts to its interface (:class:`Measurement`, :cl
 from .loops import LOOP_TYPES, Loop, SignalType, SyncLaw, register_loop_type
 from .protection import Protection
 from .modulation import ModulationLimiter, OutputStage
-from .controller import (ControlGraph, ControlMeasurement, ControlOutput, Controller, Measurement, UniteType,
-                         default_wiring, make_controller)
+from .controller import (ControlGraph, ControlMeasurement, ControlOutput, Controller, Measurement,
+                         Sequencer, UniteType, default_wiring, make_controller)
 
 __all__ = ["Loop", "SyncLaw", "SignalType", "LOOP_TYPES", "register_loop_type", "ControlGraph", "default_wiring",
            "Protection", "ModulationLimiter", "OutputStage", "Measurement", "ControlMeasurement", "ControlOutput",
-           "Controller", "UniteType", "make_controller"]
+           "Controller", "Sequencer", "UniteType", "make_controller"]

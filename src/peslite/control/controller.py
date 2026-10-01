@@ -1,10 +1,10 @@
-"""The controller of a converter unit as one block: its interface, and :class:`UniteType`.
+"""A converter controller as one closed discrete-time block.
 
 At each control interrupt the controller takes an ADC sample (:class:`Measurement`, SI), scales it to
 the unit's pu bases, runs its loop network (:class:`ControlGraph`: the loops of :mod:`.loops`
-connected by typed ports) and its protection (:mod:`.protection`), and turns the voltage command
-into duty ratios (:mod:`.modulation`); it returns them in a :class:`ControlOutput`. ``ctrl.type``
-(``gfl``, ``gfm``) chooses how its loops are wired by default.
+connected by typed ports), its start-up sequencer and sampled protection, and turns the voltage
+command into duty ratios. It sees only its samples, host commands and its own state, and returns
+duty ratios, PWM enable and a latched trip.
 """
 
 from __future__ import annotations
@@ -12,20 +12,19 @@ from __future__ import annotations
 import cmath
 import math
 from dataclasses import dataclass, field, fields
-from typing import Any, Optional, Protocol, runtime_checkable
+from typing import Any, Mapping, Optional, Protocol, runtime_checkable
 
 import numpy as np
 from numpy.typing import NDArray
 
 from ..solver.model import ConfigError, gather, scatter
-from .blocks import peak_abs
+from .blocks import peak_abs, smoothstep
 from .loops import (ANGLE, CURRENT, DC_VOLTAGE, FREQUENCY, I_AB, LOOP_TYPES, POWER_PU, V_AB, V_DQ, VOLTAGE)
 from .modulation import CONFIGURED, OutputStage
 from .protection import Protection
 
-__all__ = ["Measurement", "ControlMeasurement", "ControlOutput", "Controller", "ControlGraph", "default_wiring",
-           "UniteType",
-           "make_controller"]
+__all__ = ["Measurement", "ControlMeasurement", "ControlOutput", "Controller", "Sequencer",
+           "ControlGraph", "default_wiring", "UniteType", "make_controller"]
 
 
 # ------------------------------------------------------------------ the interface
@@ -48,6 +47,7 @@ class Measurement:
     u_dc_raw: Optional[float] = None
     extras: dict[str, float] = field(default_factory=dict)
     samples: tuple["Measurement", ...] = ()
+    fault: bool = False
 
 
 @dataclass
@@ -68,6 +68,7 @@ class ControlMeasurement:
 class ControlOutput:
     """Result of one controller call.
 
+    ``d_abc`` and ``gates`` go through the PWM registers; ``tripped`` opens the unit immediately.
     ``theta`` (rad) and ``omega`` (rad/s): the controller's synchronization angle and frequency,
     required by synchronous modulators; ``None`` allows only asynchronous modulation.
     """
@@ -77,21 +78,81 @@ class ControlOutput:
     log: dict[str, float] | None = None
     theta: float | None = None  # synchronization angle (rad)
     omega: float | None = None  # synchronization frequency (rad/s)
+    gates: bool = True
+    trip_cause: str | None = None
 
 
 @runtime_checkable
 class Controller(Protocol):
-    """Sampled controller ``(t, Measurement) -> ControlOutput``, called at each control interrupt.
+    """Sampled controller ``(t, Measurement) -> ControlOutput``.
 
-    Optional: ``initial_sync() -> (theta, omega)`` seeds a synchronous carrier for the first period;
-    ``fast_check(t, i_abc)`` checks over-current between samples; ``align_startup`` aligns the
-    initial command.
+    Optional host-facing methods are ``command``, ``track``, ``retune``, state access and
+    ``summary``; the required target interface is only the sampled call.
     """
 
     def __call__(self, t: float, meas: Measurement) -> ControlOutput: ...
 
-    def initial_duty(self) -> NDArray[np.float64]:
-        """Duty ratios applied before the first control update."""
+
+# ------------------------------------------------------------------ the start-up sequence
+
+class Sequencer:
+    """Start-up sequence advanced only by the controller's own interrupts."""
+
+    def __init__(self, T: float, run: bool = True, ramp: float = 0.0) -> None:
+        self.T = float(T)
+        self.run = bool(run)
+        self.ramp = float(ramp)
+        self.steps = 0
+        self.running = False
+        self.ramp_value = 0.0
+        self.armed = False
+
+    def command(self, run: bool, ramp: float = 0.0) -> None:
+        """Take a host run/stop command; every new run has its own ramp."""
+        self.run = bool(run)
+        if self.run:
+            self.ramp = float(ramp)
+        else:
+            self.steps = 0
+
+    def step(self, tripped: bool) -> None:
+        self.running = self.run and not tripped
+        if not self.running:
+            self.steps, self.ramp_value, self.armed = 0, 0.0, False
+            return
+        progress = 1.0 if self.ramp <= 0.0 else min(1.0, self.steps * self.T / self.ramp)
+        self.ramp_value = smoothstep(progress)
+        self.armed = progress >= 1.0
+        if not self.armed:
+            self.steps += 1
+
+    def setpoints(self, p_ref: float, q_ref: float, v_ref: float) -> tuple[float, float, float]:
+        return self.ramp_value * p_ref, q_ref, v_ref
+
+    def get_state(self) -> dict[str, Any]:
+        return {"run": self.run, "ramp": self.ramp, "steps": self.steps}
+
+    def set_state(self, values: Mapping[str, Any]) -> None:
+        unknown = set(values) - {"run", "ramp", "steps"}
+        if unknown:
+            raise KeyError(f"the start-up sequence has no state(s) {sorted(unknown)}")
+        if "run" in values:
+            self.run = bool(values["run"])
+        if "ramp" in values:
+            self.ramp = float(values["ramp"])
+        if "steps" in values:
+            steps = float(values["steps"])
+            if steps < 0.0 or steps != int(steps):
+                raise ValueError(f"the start-up sequence: steps must be a whole number >= 0, got {values['steps']}")
+            self.steps = min(int(steps), self._end())
+
+    def _end(self) -> int:
+        if self.ramp <= 0.0:
+            return 0
+        n = max(0, math.ceil(self.ramp / self.T) - 2)
+        while n * self.T / self.ramp < 1.0:
+            n += 1
+        return n
 
 
 # ------------------------------------------------------------------ the loop network
@@ -116,8 +177,8 @@ class ControlGraph:
     loops are rebuilt from their new parameters and continue from their named states.
     """
 
-    def __init__(self, cfg, scenario, connections, outputs):
-        self.cfg, self.scenario = cfg, scenario
+    def __init__(self, cfg, sequencer, connections, outputs):
+        self.cfg, self.sequencer = cfg, sequencer
         self._pending: list[Any] = []
         self.on_retune = None
         self.connections = {**connections, **cfg.ctrl.connections}
@@ -136,7 +197,7 @@ class ControlGraph:
             cls = LOOP_TYPES.get(loop.type)
             if cls is None:
                 raise ConfigError(f"ctrl.loops.{name}: no loop type {loop.type!r} is registered")
-            self.nodes[name] = node = cls(loop, cfg, scenario)
+            self.nodes[name] = node = cls(loop, cfg, sequencer)
             self._out_specs[name] = tuple((port, f"{name}.{port}", spec.complex_value)
                                           for port, spec in node.outputs.items())
             self.periods[name] = loop.period
@@ -218,7 +279,7 @@ class ControlGraph:
         """Rebuild one loop and continue from the old instance's state."""
         old = self.nodes[name]
         params = self.cfg.ctrl.loops[name]
-        fresh = LOOP_TYPES[params.type](params, self.cfg, self.scenario)
+        fresh = LOOP_TYPES[params.type](params, self.cfg, self.sequencer)
         try:
             fresh.set_state(old.get_state())
         except (KeyError, ValueError) as exc:
@@ -280,6 +341,17 @@ class ControlGraph:
         return {name for name, every in self._every if k % every == 0}
 
     # ------------------------------------------------------------ running
+    def track(self, meas):
+        """Pre-synchronise every loop that supports ``track(inputs)``."""
+        done = set()
+        for name in self.order:
+            track = getattr(self.nodes[name], "track", None)
+            out = track(self._gather(self._immediate[name], meas)) if track is not None else None
+            if out is not None:
+                self._store(name, out)
+                done.add(name)
+        return done
+
     def input(self, name, port, meas):
         """Return the input ``port`` of the loop ``name`` for the pu measurement ``meas``."""
         return self._read(*self._port_source[name][port], meas)
@@ -398,26 +470,22 @@ def default_wiring(cfg, family):
 # ------------------------------------------------------------------ the controller
 
 class UniteType:
-    """Configurable controller of one unit: its loop network, protection and output stage.
+    """Configurable closed controller block with loops, start-up, protection and output stage.
 
-    ``cfg``: the unit's parameters; ``cfg.ctrl.type``: ``"gfl"``, ``"gfm"`` or ``"custom"`` (no
-    default wiring). ``scenario``: the unit's connection state and ramp over time.
-    ``pwm_method``, ``limiter``: see :class:`~peslite.control.modulation.OutputStage`.
-    ``__call__`` runs the due loops at a control interrupt and computes duty ratios. Integrating loops
-    freeze while the unit is disconnected or tripped.
+    The host gives it only ``command(run, ramp)`` and parameter updates. At each interrupt it sees
+    one :class:`Measurement` and returns duty ratios, PWM enable and its trip.
     """
 
-    def __init__(self, cfg, scenario, pwm_method=None, *, limiter=CONFIGURED):
+    def __init__(self, cfg, pwm_method=None, *, limiter=CONFIGURED):
         self.p = cfg
-        self.scenario = scenario
+        self.sequencer = Sequencer(cfg.ctrl.period)
         wires, outputs = default_wiring(cfg, cfg.ctrl.type)
-        self.graph = graph = ControlGraph(cfg, scenario, wires, outputs)
+        self.graph = graph = ControlGraph(cfg, self.sequencer, wires, outputs)
         self.periods = graph.periods
-        self.T_s = cfg.ctrl.period
         self.v_base, self.i_base, self.w0 = cfg.base.v_phase_peak, cfg.base.i_phase_peak, cfg.base.w0
         self.v_dc_base = cfg.dc_base.v
-        self.protection = Protection(cfg.protection, self.T_s, scenario.armed)
-        self.stage = OutputStage(cfg, complex(cfg.base.v_phase_peak), pwm_method=pwm_method, limiter=limiter)
+        self.protection = Protection(cfg.protection, cfg.ctrl.period)
+        self.stage = OutputStage(cfg, pwm_method=pwm_method, limiter=limiter)
         self.theta, self.omega = self.initial_sync()
         self.u_cmd = 1.0 + 0j
         self.command_theta = self.theta
@@ -433,18 +501,16 @@ class UniteType:
         self._terminal_key = f"{self._terminal}.u_dq"
         self._terminal_in_graph = self._terminal in graph.nodes
         self._terminal_is_cc = self._terminal_in_graph and role[self._terminal] == "current"
-        self._find_nodes()
-        graph.on_retune = self._find_nodes
+        self._find_terminal()
+        graph.on_retune = self._find_terminal
         self._frame_key = f"{graph.outputs['theta'].partition('.')[0]}.frame"
         self._dc, self._sync = first("dc_voltage"), first("sync")
         self._frame_cc, self._log_cc = first("current", "frame"), first("current", "id_ref")
         self._is_gfl = cfg.ctrl.type == "gfl"
         self._p_key, self._q_key, self._v_ref_key = f"{first('power')}.p", f"{first('power')}.q", f"{self._sync}.v_ref"
 
-    def _find_nodes(self, name=None):
-        """Refresh loop-instance references after a loop is rebuilt."""
-        self._freezable = tuple(node for node in self.graph.nodes.values()
-                               if hasattr(node, "frozen"))
+    def _find_terminal(self, name=None):
+        """Refresh the terminal loop reference after a loop is rebuilt."""
         self._terminal_node = self.graph.nodes.get(self._terminal)
 
     def describe(self):
@@ -462,23 +528,19 @@ class UniteType:
         values = {**self.graph.values, **{f"references.{k}": v for k, v in self.graph.references.items()}}
         return float(values[self.graph.outputs["theta"]]), float(values[self.graph.outputs["omega"]])
 
-    def initial_duty(self):
-        return self.stage.initial_duty()
+    def command(self, run, ramp=0.0):
+        """Take the host's run/stop command."""
+        self.sequencer.command(run, ramp)
 
-    def align_startup(self, u_ab, u_dc):
-        """Start with the modulation that reproduces the terminal voltage ``u_ab`` (V) from ``u_dc`` (V)."""
-        self.stage.align_startup(u_ab, u_dc)
-        self.theta, self.omega = self.initial_sync()
-        self.command_theta = self.theta
-        self.u_cmd = u_ab / self.v_base * cmath.exp(-1j * self.command_theta)
+    def track(self, meas):
+        """Pre-synchronise grid-forming laws to an SI terminal sample."""
+        if self.graph.track(self._pu(meas)):
+            self.theta, self.omega = self.initial_sync()
+            self.command_theta = self.theta
 
     @property
     def tripped(self):
         return self.protection.tripped
-
-    def fast_check(self, t, i_abc):
-        """Check the instantaneous over-current criterion between samples; ``i_abc`` in A."""
-        return self.protection.check_current(t, peak_abs(i_abc) / self.i_base)
 
     # ------------------------------------------------------------ one sample
     def _pu(self, meas: Measurement) -> ControlMeasurement:
@@ -512,20 +574,6 @@ class UniteType:
                   ["p_pu", "q_pu", "p_ref_pu", "v_ref_pu", "freq_dev", "angle_rel"])
         return tuple(names)
 
-    def update(self, t, meas):
-        """Run the loops due at the control interrupt ``t``, on the SI sample ``meas``."""
-        return self._update_pu(t, self._pu(meas))
-
-    def _in_service(self, t):
-        return not self.tripped and self.scenario.connected(t)
-
-    def _update_pu(self, t, control_meas):
-        self.stage.new_instant()
-        idle = not self._in_service(t)
-        for node in self._freezable:
-            node.frozen = idle
-        return self.graph.update(t, control_meas, finalize=self._accept_command)
-
     def _accept_command(self, t, meas, updated):
         """Update the held angle, frequency and voltage command, applying anti-windup feedback."""
         graph = self.graph
@@ -544,7 +592,10 @@ class UniteType:
 
     def __call__(self, t, meas):
         control_meas = self._pu(meas)
-        self._update_pu(t, control_meas)
+        sequence = self.sequencer
+        sequence.step(self.tripped)
+        self.stage.new_instant()
+        self.graph.update(t, control_meas, finalize=self._accept_command)
         frame = self.graph.values.get(self._frame_key, self.theta)
         if self._frame_cc is not None:
             frame = self.graph.input(self._frame_cc, "frame", control_meas)
@@ -552,15 +603,18 @@ class UniteType:
         self.v_dq, self.i_dq = control_meas.u_g * rot, control_meas.i_c * rot
         freq_dev = (self.omega - self.w0) / (2 * math.pi)
         refs, prot = self.graph.references, self.protection
-        prot.check_current(t, peak_abs(control_meas.i_abc))
+        if meas.fault:
+            prot.fault(t)
         prot.check_sampled(t, abs(self.v_dq), freq_dev,
-                           control_meas.u_dc - refs["vdc_ref_pu"])
+                           control_meas.u_dc - refs["vdc_ref_pu"], sequence.armed)
         tripped = prot.tripped
-        duty = self.stage.modulate(t, 0j if tripped else self.u_cmd, self.command_theta, control_meas.u_dc)
+        gates = sequence.running and not tripped
+        duty = self.stage.modulate(t, 0j if tripped else self.u_cmd,
+                                   self.command_theta, control_meas.u_dc, count=gates)
         log = {"id_pu": self.i_dq.real, "iq_pu": self.i_dq.imag,
                "vd_pu": self.v_dq.real, "vq_pu": self.v_dq.imag,
                "vac_pu": abs(self.v_dq), "vdc_pu": control_meas.u_dc,
-               "m_max": peak_abs(self.stage.m_abc), "in_service": 1.0 if self._in_service(t) else 0.0,
+               "m_max": peak_abs(self.stage.m_abc), "in_service": 1.0 if gates else 0.0,
                **self._raw_log(meas, frame)}
         angle_rel = (self.theta - self.w0 * t + math.pi) % (2 * math.pi) - math.pi
         if self._is_gfl:
@@ -568,23 +622,28 @@ class UniteType:
             log.update(id_ref_pu=id_ref, freq_dev=freq_dev, angle_rel=angle_rel)
         else:
             values = self.graph.values
-            pr, qr, vr = self.scenario.setpoints(t, refs["p_ref_pu"], refs["q_ref_pu"], refs["v_ref_pu"])
+            pr, qr, vr = sequence.setpoints(refs["p_ref_pu"], refs["q_ref_pu"], refs["v_ref_pu"])
             log.update(p_pu=values.get(self._p_key, 0.0), q_pu=values.get(self._q_key, 0.0),
                        p_ref_pu=pr, v_ref_pu=values.get(self._v_ref_key, 1.0),
                        freq_dev=freq_dev, angle_rel=angle_rel)
         self.last_log = log
-        return ControlOutput(duty, tripped, log, theta=self.theta, omega=self.omega)
+        trip = prot.trip
+        return ControlOutput(duty, tripped, log, theta=self.theta, omega=self.omega,
+                             gates=gates, trip_cause=trip.cause if trip is not None else None)
 
     # ------------------------------------------------------------ states and summary
     def get_state(self):
         return {**self.graph.get_state(), **gather({"prot": self.protection}), "command.u_dq_pu": self.u_cmd,
-                "command.theta": self.command_theta, "command.omega": self.omega}
+                "command.theta": self.command_theta, "command.omega": self.omega,
+                **gather({"sequence": self.sequencer})}
 
     def set_state(self, values):
-        rest, prot = {}, {}
+        rest, prot, sequence = {}, {}, {}
         for name, value in values.items():
             if name.startswith("prot."):
                 prot[name] = value
+            elif name.startswith("sequence."):
+                sequence[name] = value
             elif name == "command.u_dq_pu":
                 self.u_cmd = complex(value)
             elif name == "command.theta":
@@ -595,25 +654,16 @@ class UniteType:
                 rest[name] = value
         self.graph.set_state(rest)
         scatter({"prot": self.protection}, prot)
+        scatter({"sequence": self.sequencer}, sequence)
         self.theta, self.omega = self.initial_sync()
 
     def summary(self):
-        """Return this unit's summary; values for events which did not occur are ``None``."""
-        st, trip, stage = self.protection.stats, self.protection.trip, self.stage
+        """Return what the sampled controller observed."""
+        stage = self.stage
         summary = {
-            "tripped": int(trip is not None),
-            "trip_time": trip.t if trip and math.isfinite(trip.t) else None,
-            "trip_cause": trip.cause if trip else None,
-            "max_current_pu": st.max_current_pu,
             "modulation_saturation_fraction": stage.n_saturated / max(1, stage.n_updates),
             "modulation_saturation_first_t": stage.first_saturation_t,
-            "rocof_max": st.rocof_max,
-            "vac_min_pu": st.vac_min_pu,
-            "vac_max_pu": st.vac_max_pu,
-            **{f"{criterion}_first_t": getattr(st, f"{criterion}_first_t")
-               for criterion in ("overcurrent", "undervoltage", "overvoltage", "frequency",
-                                 "dc_voltage", "rocof")},
-            "alarms": list(st.alarms),
+            **self.protection.summary(),
         }
         if self._dc is not None:
             dc = self.graph.nodes[self._dc]
@@ -624,6 +674,6 @@ class UniteType:
         return summary
 
 
-def make_controller(cfg, scenario, **kwargs):
+def make_controller(cfg, **kwargs):
     """Build the :class:`UniteType` controller of a unit from ``cfg.ctrl``."""
-    return UniteType(cfg, scenario, **kwargs)
+    return UniteType(cfg, **kwargs)

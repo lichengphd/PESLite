@@ -40,7 +40,7 @@ def test_adc_owns_oversampling_and_averaging_window_state():
         i_c_state=lambda: values["i"],
         u_dc=lambda: values["dc"],
     )
-    adc = ADC(ports, period=1.0, samples=2, length=1.0,
+    adc = ADC(ports, period=1.0, sample_period=0.5, length=1.0,
               channels={"v": 0j, "i": 0j})
     adc.seed()
     values.update(v=3 + 0j, i=4 + 0j)
@@ -64,7 +64,7 @@ def test_adc_reconstructs_its_sampling_position_from_the_start_time():
         i_c_state=lambda: 2 + 0j,
         u_dc=lambda: 3.0,
     )
-    adc = ADC(ports, period=1.0, samples=4)
+    adc = ADC(ports, period=1.0, sample_period=0.25)
     adc.start(0.6, 0.0, 1.0, held=True)
     assert adc.n_samp == 3
     assert [sample.t for sample in adc.peeks] == [0.25, 0.5]
@@ -77,8 +77,9 @@ def test_pwm_owns_timer_registers_and_switching_schedule():
               carrier_period=1e-3, modulator=ZOH())
     pwm.reset(initial)
     assert pwm.get_state() == {
-        "d_a": 0.2, "d_b": 0.4, "d_c": 0.6,
+        "d_a": 0.2, "d_b": 0.4, "d_c": 0.6, "on": False,
         "shadow.d_a": 0.2, "shadow.d_b": 0.4, "shadow.d_c": 0.6,
+        "shadow.on": False,
     }
 
     pwm.write(0.0, np.array([0.8, 0.7, 0.6]))

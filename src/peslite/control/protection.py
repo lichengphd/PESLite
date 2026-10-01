@@ -1,14 +1,14 @@
-"""Protection of a converter unit: over-current, ac-voltage, frequency and dc-voltage trips and a ROCOF alarm.
+"""Sampled controller protection and the gate driver's fault input.
 
-Trips are enabled while ``armed(t)``; timed criteria must hold for ``hold`` (s).
-Named states: ``tripped`` and the hold timers.
+AC-voltage, frequency and DC-voltage criteria and the ROCOF alarm use controller samples. The
+gate-driver over-current comparator is a unit peripheral; the controller sees its latched fault.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Mapping, Optional
 
 from ..solver.model import gather, scatter
 from .blocks import HoldTimer, MovingWindow
@@ -27,25 +27,22 @@ class TripEvent:
 class ProtectionStats:
     """Protection observations; absent crossings and samples are ``None``."""
 
-    overcurrent_first_t: Optional[float] = None
-    overcurrent_steps: int = 0
     undervoltage_first_t: Optional[float] = None
     overvoltage_first_t: Optional[float] = None
     frequency_first_t: Optional[float] = None
     dc_voltage_first_t: Optional[float] = None
     rocof_first_t: Optional[float] = None
     rocof_max: float = 0.0
-    max_current_pu: float = 0.0
     vac_min_pu: Optional[float] = None
     vac_max_pu: Optional[float] = None
     alarms: list[str] = field(default_factory=list)
 
 
 class Protection:
-    """Trip and alarm decisions of one unit from its ``protection`` parameters; ``T``: its sampling period (s)."""
+    """Trip and alarm decisions of one controller; ``T`` is its interrupt period."""
 
-    def __init__(self, cfg: Any, T: float, armed: Callable[[float], bool]) -> None:
-        self.cfg, self.T, self.armed = cfg, T, armed
+    def __init__(self, cfg: Any, T: float) -> None:
+        self.cfg, self.T = cfg, T
         self.trip: TripEvent | None = None
         self.stats = ProtectionStats()
         self._timers = {"hold_uv": HoldTimer(T), "hold_ov": HoldTimer(T), "hold_freq": HoldTimer(T),
@@ -79,6 +76,18 @@ class Protection:
                 self.trip = None
         scatter(self._timers, values)
 
+    def summary(self) -> dict[str, Any]:
+        """Return what the sampled controller protection observed."""
+        stats = self.stats
+        return {
+            "rocof_max": stats.rocof_max,
+            "vac_min_pu": stats.vac_min_pu,
+            "vac_max_pu": stats.vac_max_pu,
+            **{f"{criterion}_first_t": getattr(stats, f"{criterion}_first_t")
+               for criterion in ("undervoltage", "overvoltage", "frequency", "dc_voltage", "rocof")},
+            "alarms": list(stats.alarms),
+        }
+
     def _raise(self, name: str) -> None:
         if name not in self.stats.alarms:
             self.stats.alarms.append(name)
@@ -88,20 +97,11 @@ class Protection:
             self.trip = TripEvent(t, cause, detail)
             self._raise("TRIP_" + cause.upper())
 
-    # ---------------------------------------------------------------- fast
-    def check_current(self, t: float, peak_pu: float) -> bool:
-        """Check the phase-current peak ``peak_pu`` (pu); return ``True`` if this call trips."""
-        stats, overcurrent = self.stats, self.cfg.overcurrent
-        stats.max_current_pu = max(stats.max_current_pu, peak_pu)
-        if overcurrent.enable and peak_pu > overcurrent.limit_pu:
-            if stats.overcurrent_steps == 0:
-                stats.overcurrent_first_t = t
-                self._raise("OVERCURRENT")
-            stats.overcurrent_steps += 1
-            if not self.tripped and self.armed(t):
-                self._do_trip(t, "overcurrent", f"|i|={peak_pu:.4f} pu > {overcurrent.limit_pu} pu")
-                return True
-        return False
+    def fault(self, t: float) -> None:
+        """Latch the trip reported by the gate driver's over-current comparator."""
+        if not self.tripped:
+            self._raise("OVERCURRENT")
+            self._do_trip(t, "overcurrent", "the gate driver's over-current comparator")
 
     # ---------------------------------------------------------- sampled
     def _timed(self, t: float, met: bool, criterion: str, alarm: str, timer: str) -> bool:
@@ -112,13 +112,14 @@ class Protection:
         held = self._timers[timer].update(met)
         return met and held >= self.cfg.hold
 
-    def check_sampled(self, t: float, vac_pu: float, freq_dev: float, vdc_err_pu: float) -> None:
+    def check_sampled(self, t: float, vac_pu: float, freq_dev: float,
+                      vdc_err_pu: float, armed: bool) -> None:
         """Check the timed criteria and the ROCOF alarm; call once per control period.
 
         ``vac_pu`` ac voltage magnitude (pu), ``freq_dev`` frequency deviation (Hz),
-        ``vdc_err_pu`` dc-voltage error (pu).
+        ``vdc_err_pu`` dc-voltage error (pu); ``armed`` comes from the start-up sequencer.
         """
-        cfg, stats, armed = self.cfg, self.stats, self.armed(t)
+        cfg, stats = self.cfg, self.stats
         if not self.tripped:
             old = self._rocof.push(freq_dev)
             if old is not None:
