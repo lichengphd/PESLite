@@ -97,7 +97,9 @@ class PWM:
     ratios pass the computation delay ``delay``, and ``modulator`` turns the duty ratios in force into
     the switching instants of the period.
 
-    Named states: ``d_a``, ``d_b``, ``d_c``, the duty ratios in force.
+    Named states: ``d_a``, ``d_b``, ``d_c``, the duty ratios in force, and
+    ``shadow.<j>.d_a``/``d_b``/``d_c`` for pending computation-delay publications. Shadow register
+    ``j = 0`` is applied next.
     """
 
     def __init__(self, period: float, modulator: Modulator, delay: Delay) -> None:
@@ -143,7 +145,11 @@ class PWM:
         return due
 
     def get_state(self) -> dict[str, Any]:
-        return {f"d_{ph}": float(self.d[k]) for k, ph in enumerate("abc")}
+        state = {f"d_{ph}": float(self.d[k]) for k, ph in enumerate("abc")}
+        delayed = getattr(self.delay, "get_state", None)
+        if delayed is not None and getattr(self.delay, "set_state", None) is not None:
+            state.update({f"shadow.{name}": value for name, value in delayed().items()})
+        return state
 
     def set_state(self, values: Mapping[str, Any]) -> None:
         d = np.array(self.d, dtype=float)
@@ -151,6 +157,11 @@ class PWM:
             if f"d_{ph}" in values:
                 d[k] = values[f"d_{ph}"]
         self.d = d
+        shadow = {name[len("shadow."):]: value for name, value in values.items()
+                  if name.startswith("shadow.")}
+        restore = getattr(self.delay, "set_state", None)
+        if shadow and restore is not None:
+            restore(shadow)
 
 
 # ------------------------------------------------------------------ the triangular carrier

@@ -247,7 +247,7 @@ src/peslite/            the package: __init__.py and four code parts
     network.py            three-phase source, R-L branch, bus (R-C node), element types
     converter.py          bridge, dc link (capacitor, current or voltage source)
     adc.py                sampling of a converter's measurements, averaging window, oversampling
-    pwm.py                PWM peripheral: publications, computation delay, carrier, modulators
+    pwm.py                PWM peripheral: publications, shadow-register computation delay, carrier, modulators
   control/              the converter's controller
     loops.py              what each loop type computes: its parameters, ports and update
     controller.py         controller interface, loop network, GFL/GFM wiring, UniteType

@@ -423,7 +423,6 @@ class Simulation:
         for name, unit in self.system.units.items():
             parts[f"ctrl.{name}"] = unit.ctrl
             parts[f"pwm.{name}"] = unit.pwm
-            parts[f"delay.{name}"] = unit.pwm.delay
             if unit.adc.averaging:
                 parts[f"meas.{name}"] = unit.adc
         parts["solver"] = self.solver
@@ -479,7 +478,7 @@ class Simulation:
         if callable(presets):  # state-dependent keywords: strip the "plant." prefix
             inner = presets
             presets = lambda key, word: inner(key[6:] if key.startswith("plant.") else key, word)  # noqa: E731
-        self._start_duty()  # so that the duty ratios and delay pipelines have their states
+        self._start_duty()  # so that the duty ratios and shadow registers have their states
         template = gather(self._parts())
         try:
             given = expand_aliases(self.p.simulation.initial.states, aliases)
@@ -516,12 +515,11 @@ class Simulation:
                 align(unit.ports.u_g(), unit.ports.u_dc())
             unit.adc.seed()  # averaging window starts at t0
             unit.pwm.d = np.array(unit.ctrl.initial_duty(), dtype=float)
+            unit.pwm.delay.reset(unit.pwm.d)
             scatter({f"pwm.{name}": unit.pwm}, values)
-        # 3. controllers, delay pipelines, measurement windows, solver
+        # 3. controllers, measurement windows, solver
         for name, unit in system.units.items():
             scatter({f"ctrl.{name}": unit.ctrl}, values)
-            unit.pwm.delay.reset(unit.pwm.d)
-            scatter({f"delay.{name}": unit.pwm.delay}, values)
             if unit.adc.averaging:
                 scatter({f"meas.{name}": unit.adc}, values)
         scatter({"solver": self.solver}, values)

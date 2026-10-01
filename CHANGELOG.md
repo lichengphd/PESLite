@@ -26,6 +26,8 @@
 
 ### Packaging and verification
 
+- Computation-delay queue states are PWM shadow registers named
+  `pwm.<unit>.shadow.<index>.d_a/d_b/d_c`; there is no separate `delay.*` state domain.
 - Project version is 0.1.3. The root `examples/` directory remains data-only, keeps the
   `*-example.pes` names and is included in the wheel. The PEP 639 `AGPL-3.0-only` metadata is
   unchanged.

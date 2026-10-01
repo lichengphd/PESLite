@@ -42,7 +42,7 @@ def test_make_solver_builds_the_configured_integrator():
 def test_a_run_continues_exactly_from_a_saved_state(tmp_path):
     def run(t_end, **changes):
         params = peslite.load(EXAMPLES / "gfl-example.pes", **QUIET, **FAST,
-                              **{"simulation.t_end": t_end}, **changes)
+                              **{"simulation.t_end": t_end, "units.vsc.delay.steps": 2}, **changes)
         return peslite.Simulation(params).run()
 
     whole = run(0.004)

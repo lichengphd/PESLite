@@ -63,6 +63,10 @@ def test_pwm_owns_delay_publications_and_switching_schedule():
     initial = np.array([0.2, 0.4, 0.6])
     delay.reset(initial)
     pwm = PWM(period=1e-3, modulator=ZOH(), delay=delay)
+    assert pwm.get_state() == {
+        "d_a": 0.0, "d_b": 0.0, "d_c": 0.0,
+        "shadow.0.d_a": 0.2, "shadow.0.d_b": 0.4, "shadow.0.d_c": 0.6,
+    }
 
     pwm.publish(np.array([0.8, 0.7, 0.6]))
     assert np.array_equal(pwm.d, initial)
@@ -71,6 +75,17 @@ def test_pwm_owns_delay_publications_and_switching_schedule():
     assert pwm.k == 1
     assert pwm.t_next == 1e-3
     assert pwm.next_switch == float("inf")
+    assert pwm.get_state()["shadow.0.d_a"] == 0.8
+
+
+def test_delay_state_is_owned_by_pwm_shadow_registers():
+    params = peslite.load(EXAMPLES / "gfl-example.pes", **{"units.vsc.delay.steps": 2})
+    names = set(peslite.Simulation(params).state_names())
+    assert {
+        "pwm.vsc.shadow.0.d_a", "pwm.vsc.shadow.0.d_b", "pwm.vsc.shadow.0.d_c",
+        "pwm.vsc.shadow.1.d_a", "pwm.vsc.shadow.1.d_b", "pwm.vsc.shadow.1.d_c",
+    } <= names
+    assert not any(name.startswith("delay.") for name in names)
 
 
 def test_components_import_only_control_solver_and_themselves():
