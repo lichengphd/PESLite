@@ -360,6 +360,11 @@ class ControlGraph:
                 done.add(name)
         return done
 
+    def reset_integrators(self):
+        """Clear every loop's explicitly declared error integrator."""
+        for node in self.nodes.values():
+            node.reset_integrator()
+
     def input(self, name, port, meas):
         """Return the input ``port`` of the loop ``name`` for the pu measurement ``meas``."""
         return self._read(*self._port_source[name][port], meas)
@@ -535,6 +540,9 @@ class UniteType:
 
     def command(self, run, ramp=0.0):
         """Take the host's run/stop command."""
+        starting = bool(run) and not self.startup.active
+        if starting:
+            self.graph.reset_integrators()
         self.startup.command(run, ramp)
 
     def track(self, meas):
@@ -542,6 +550,10 @@ class UniteType:
         if self.graph.track(self._pu(meas)):
             self.theta, self.omega = self.initial_sync()
             self.command_theta = self.theta
+        if self.startup.active:
+            # A fresh run is tracked after its host command.  Preserve the aligned angle and
+            # magnitude, but do not let tracking seed an error integrator before PWM starts.
+            self.graph.reset_integrators()
 
     # ------------------------------------------------------------ one sample
     def _pu(self, meas: Measurement) -> ControlMeasurement:

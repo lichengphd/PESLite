@@ -82,6 +82,36 @@ def test_controller_needs_only_samples_and_host_commands(gfl):
     assert not controller(8 * T, sample(8)).gates
 
 
+def test_pwm_start_clears_error_integrators_once(gfl):
+    controller = peslite.UniteType(gfl().unit("vsc"))
+    pll = controller.graph.nodes["pll"]
+    dvc = controller.graph.nodes["dvc"]
+    cc = controller.graph.nodes["cc"]
+    pll.integral, dvc.integral, cc.integral = 1.0, 2.0, 3.0 + 4.0j
+
+    controller.command(False)
+    assert (pll.integral, dvc.integral, cc.integral) == (1.0, 2.0, 3.0 + 4.0j)
+    controller.command(True)
+    assert (pll.integral, dvc.integral, cc.integral) == (0.0, 0.0, 0.0j)
+
+    pll.integral, dvc.integral, cc.integral = 5.0, 6.0, 7.0 + 8.0j
+    controller.command(True)
+    assert (pll.integral, dvc.integral, cc.integral) == (5.0, 6.0, 7.0 + 8.0j)
+
+
+def test_presynchronisation_does_not_seed_a_pwm_start_integrator():
+    params = peslite.load(
+        EXAMPLES / "gfm-psc-example.pes",
+        **{"simulation.solver.linearisations": 0, "simulation.progress.enable": 0},
+    )
+    cfg = params.unit("vsc")
+    controller = peslite.UniteType(cfg)
+    sync = controller.graph.nodes["sync"]
+    sync.v_int = 4.0
+    controller.track(Measurement(0.0, cfg.base.v_phase_peak, 0j, cfg.dclink.vdc_ref, np.zeros(3)))
+    assert sync.v_int == 0.0
+
+
 def test_pwm_stays_blocked_until_first_controller_word_is_loaded(gfl, tmp_path):
     params = gfl(**{
         "events.connect_vsc.t": 0.001,

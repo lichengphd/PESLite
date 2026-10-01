@@ -92,6 +92,9 @@ class Loop:
     def set_state(self, values: Mapping[str, Any]) -> None:
         assign(self, values, self.state_names)
 
+    def reset_integrator(self) -> None:
+        """Clear this loop's error integrator, if it has one, before PWM start-up."""
+
     def retuned(self, old: "Loop") -> None:
         """Take non-state runtime attributes from the loop instance being replaced."""
         for name in self.carried:
@@ -198,6 +201,9 @@ class SRFPLL(Loop):
             self.u_g = u_g + self.T * self.kp * (v.real - u_g)
         return {"theta": self.theta, "frame": frame, "omega": self.omega}
 
+    def reset_integrator(self):
+        self.integral = 0.0
+
 
 @register_loop_type
 class CurrentLoop(Loop):
@@ -284,6 +290,9 @@ class CurrentLoop(Loop):
         if "integral_pu" in values:
             self.integral = self._prev_integral = complex(values["integral_pu"])
 
+    def reset_integrator(self):
+        self.integral = self._prev_integral = 0j
+
 
 @register_loop_type
 class DCVoltageLoop(Loop):
@@ -352,6 +361,10 @@ class DCVoltageLoop(Loop):
         if self.raw < 0.0:
             self.n_reverse += 1
         return {"id_ref": id_ref}
+
+    def reset_integrator(self):
+        self.integral = 0.0
+        self.clamped = False
 
 
 # ------------------------------------------------------------------ grid forming
@@ -491,6 +504,9 @@ class PSC(SyncLaw):
         error = v_ref_pu - v_mag_pu
         self.v_int = ((v_mag_pu - v_ref_pu - self.k_v * error) / self.k_vi
                       if self.k_vi > 0.0 else 0.0)
+
+    def reset_integrator(self):
+        self.v_int = 0.0
 
 
 @register_loop_type
