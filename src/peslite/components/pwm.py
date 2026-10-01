@@ -15,8 +15,7 @@ from numpy.typing import NDArray
 from ..control.blocks import abc2complex
 
 __all__ = ["PWM", "TIME_EPS", "SwitchingSequence", "Modulator", "CarrierComparison",
-           "SynchronousCarrier", "ZOH", "TimeStepAveragedCarrier", "carrier", "carrier_position", "duty_fraction",
-           "make_modulator"]
+           "SynchronousCarrier", "ZOH", "carrier", "carrier_position", "make_modulator"]
 
 
 @dataclass
@@ -152,13 +151,20 @@ class PWM:
         """Load shadow into active registers and schedule switching until the next load."""
         completed = self.interrupt(self.k - 1) + self.computation
         if completed <= t + TIME_EPS:
-            self.active = self.shadow.copy()
+            # Writes replace the shadow word, so the active bank can take ownership without a
+            # copy. Named-state writes detach the banks before mutating either one in place.
+            self.active = self.shadow
         q = self._switching(t, self.active[:3], t)
         self.j += 1
         self.t_load = self.load_time(self.j)
         return q
 
     def _switching(self, t_l: float, d: NDArray[np.float64], t_now: float) -> complex:
+        if type(self.modulator) is ZOH:
+            self.load_end = t_l + self.load_period
+            self.schedule.clear()
+            self.next_switch = math.inf
+            return self.modulator.value(d)
         theta, omega = self.sync
         if theta is not None and omega is not None and t_l != self.t_sync:
             theta = theta + omega * (t_l - self.t_sync)
@@ -179,7 +185,13 @@ class PWM:
         self.next_switch = schedule[0][0] if schedule else math.inf
         return q_now
 
+    @property
+    def next_edge(self) -> float:
+        """Next switching or held-input edge relevant to fast protection."""
+        return min(self.next_switch, self.load_end)
+
     def edge(self, t: float) -> bool:
+        """Whether the old switching or held-input interval ends at ``t``."""
         return abs(self.next_switch - t) < TIME_EPS or abs(self.load_end - t) < TIME_EPS
 
     def switches(self, t: float) -> list[complex]:
@@ -200,6 +212,10 @@ class PWM:
         unknown = set(values) - names
         if unknown:
             raise KeyError(f"PWM registers: no state(s) {sorted(unknown)}; known: {sorted(names)}")
+        if self.active is self.shadow:
+            # load() may transfer ownership without copying.  Named-state writes address the two
+            # register banks independently, so detach them before changing either bank in place.
+            self.active = self.active.copy()
         for key, value in values.items():
             head, _, name = key.rpartition(".")
             k = self._NAMES.index(name)
@@ -250,15 +266,6 @@ def _pieces(t0: float, span: float, f_sw: float, phase: float, tol: float,
         seg = min(((0.5 if rising else 1.0) - u) / f_sw, span - covered)
         yield covered, seg, rising, _value(u), 4.0 * f_sw if rising else -4.0 * f_sw
         covered += seg
-
-
-def duty_fraction(m: float, t0: float, dt: float, f_sw: float, phase: float = 0.0) -> float:
-    """Return the fraction of ``[t0, t0 + dt]`` during which ``m`` is at or above the carrier."""
-    duty_time = 0.0
-    for _start, seg, rising, c0, slope in _pieces(t0, dt, f_sw, phase, 1e-18, 8):
-        crossing = min(seg, max(0.0, (m - c0) / slope))
-        duty_time += crossing if rising else seg - crossing
-    return duty_time / dt
 
 
 # ------------------------------------------------------------------ modulators
@@ -339,41 +346,24 @@ class SynchronousCarrier:
 class ZOH:
     """PWM-period averaging: hold the duty ratios as the switching state for the period."""
 
+    @staticmethod
+    def value(d_abc: NDArray[np.float64]) -> complex:
+        """Return the held space vector without constructing a one-segment schedule."""
+        d_a = min(1.0, max(0.0, float(d_abc[0])))
+        d_b = min(1.0, max(0.0, float(d_abc[1])))
+        d_c = min(1.0, max(0.0, float(d_abc[2])))
+        return abc2complex((d_a, d_b, d_c))
+
     def __call__(self, t: float, T_s: float, d_abc: NDArray[np.float64],
                  theta: float | None = None, omega: float | None = None) -> SwitchingSequence:
         d = np.clip(np.asarray(d_abc, dtype=float), 0.0, 1.0)
         return SwitchingSequence(np.array([T_s]), d.reshape(1, 3))
 
 
-class TimeStepAveragedCarrier:
-    """Time-step averaging: per solver step, the on-fraction of the carrier comparison."""
-
-    def __init__(self, f_sw: float, dt: float, phase: float = 0.0) -> None:
-        self.f_sw, self.dt, self.phase = float(f_sw), float(dt), float(phase)
-
-    def __call__(self, t: float, T_s: float, d_abc: NDArray[np.float64],
-                 theta: float | None = None, omega: float | None = None) -> SwitchingSequence:
-        n = max(1, int(round(T_s / self.dt)))
-        h = T_s / n
-        m = np.clip(2.0 * np.asarray(d_abc, dtype=float) - 1.0, -1.0, 1.0)
-        states = np.empty((n, 3))
-        for i in range(n):
-            t0 = t + i * h
-            for k in range(3):
-                states[i, k] = duty_fraction(m[k], t0, h, self.f_sw, self.phase)
-        return SwitchingSequence(np.full(n, h), states)
-
-
-def make_modulator(pwm: Any, f0: float, averaging: Any, sim: Any) -> Modulator:
-    """Return the modulator selected by one unit's ``averaging`` and ``pwm.sync``.
-
-    A disabled averaging section uses carrier comparison. PWM-period averaging holds the duty
-    ratios continuously; time-step averaging uses the carrier's on-fraction per solver step.
-    """
-    if not averaging.enable:
+def make_modulator(pwm: Any, f0: float, bridge: Any) -> Modulator:
+    """Return the exact-switching or PWM-period-averaged modulator selected by one unit."""
+    if bridge.model == "switching":
         if pwm.sync == "synchronous":
             return SynchronousCarrier(round(pwm.f_sw / f0), pwm.carrier_phase)
         return CarrierComparison(pwm.f_sw, pwm.carrier_phase)
-    if averaging.over == "time_step":
-        return TimeStepAveragedCarrier(pwm.f_sw, sim.solver.dt, pwm.carrier_phase)
     return ZOH()

@@ -51,6 +51,7 @@ class Unit:
         self.scenario = sc = Scenario(cfg.events)
 
         # ------------------------------------------------------------ power
+        T_c = cfg.ctrl.period
         self.dclink = make_dclink(cfg.dclink)
         t0 = sim.initial.t
         connected, since, ramp = sc.at(t0)
@@ -75,7 +76,6 @@ class Unit:
             u_g=lambda: bus.out.u, i_c=lambda: self.branch_f.out.i,
             i_c_state=lambda: self.branch_f.state.i, u_dc=lambda: self.dclink.out.u_dc,
             i_dc=lambda: self.dclink.inp.i_dc)
-        T_c = cfg.ctrl.period
         sample_period = meas.period if meas.period is not None else T_c
         self.adc = ADC(self.ports, T_c, sample_period,
                        meas.window if meas.window is not None else T_c, channels)

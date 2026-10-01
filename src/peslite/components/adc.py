@@ -168,6 +168,10 @@ class ADC:
         """Return the instantaneous phase currents read from the state vector."""
         return complex2abc(self.ports.i_c_state())
 
+    def current_space_vector(self) -> complex:
+        """Return the instantaneous current state without allocating a phase array."""
+        return complex(self.ports.i_c_state())
+
     # ------------------------------------------------------------ its states
     def get_state(self) -> dict[str, Any]:
         return {f"x_{channel}": value for channel, value in self.accumulated.items()}

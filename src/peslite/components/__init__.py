@@ -8,14 +8,13 @@ continuous-time, in SI, connected through :class:`peslite.solver.model.Model`; t
 
 from .network import (ELEMENT_TYPES, Element, Load, RCNode, RLBranch, ThreePhaseSource,
                       register_element_type)
-from .converter import (Bridge, PWMBridge, DCCapacitor, DCCurrentSource, DCLink,
+from .converter import (AveragingBridge, Bridge, PWMBridge, DCCapacitor, DCCurrentSource, DCLink,
                         DCVoltageSource, make_bridge, make_dclink)
 from .adc import ADC, MeasurementPorts
-from .pwm import (ZOH, CarrierComparison, PWM, SwitchingSequence, TimeStepAveragedCarrier,
-                  SynchronousCarrier, make_modulator)
+from .pwm import ZOH, CarrierComparison, PWM, SwitchingSequence, SynchronousCarrier, make_modulator
 
 __all__ = ["ThreePhaseSource", "RLBranch", "RCNode", "Element", "ELEMENT_TYPES",
            "register_element_type", "Load", "Bridge", "PWMBridge", "make_bridge", "DCLink",
            "DCCapacitor", "DCCurrentSource", "DCVoltageSource", "make_dclink", "ADC",
-           "MeasurementPorts", "PWM", "SwitchingSequence",
-           "CarrierComparison", "SynchronousCarrier", "ZOH", "TimeStepAveragedCarrier", "make_modulator"]
+           "MeasurementPorts", "AveragingBridge", "PWM", "SwitchingSequence",
+           "CarrierComparison", "SynchronousCarrier", "ZOH", "make_modulator"]

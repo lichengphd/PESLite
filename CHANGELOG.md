@@ -63,14 +63,23 @@
 ### Per-unit bridge models (#3)
 
 - The bridge model is selected independently for each converter. A unit uses exact switching by
-  default; `units.<u>.averaging: {enable: 1, over: pwm_period}` averages over each PWM period, and
-  `over: time_step` averages the carrier comparison over each fixed solver step.
-- `--averaging` enables averaging for every unit for one run and takes precedence over `--set` of
-  its `enable` switch. When it changes a model, the default result directory gains the
-  `-averaging` suffix. Different units in the same system may use different models.
-- Time-step averaging requires a fixed-step solver and an asynchronous carrier. Carrier phase and
-  synchronisation settings are ignored by PWM-period averaging. `StepAveragedCarrier` is renamed
-  to `TimeStepAveragedCarrier`.
+  default; `units.<u>.bridge.model: pwm_averaging` holds the active duty ratios continuously until
+  the next PWM register load. Different units in the same system may use different models.
+- `--pwm-averaging` selects PWM averaging for every unit, takes precedence over `--set` of
+  `bridge.model`, and uses the `-pwm-averaging` output-directory suffix.
+- PWM averaging keeps the timer, active/shadow registers, computation eligibility and
+  single/double update timing of switching and supports fixed/adaptive solvers and
+  asynchronous/synchronous PWM. The former solver-time-step averaging mode and its `over`
+  parameter are removed.
+- `units.<u>.bridge.model: averaging` and CLI `--averaging` select a separate ideal controlled
+  voltage source with no PWM peripheral. Each controller output is held from the first equivalent
+  PWM update interval available after `ctrl.computation`; the centre of that held interval gives
+  the effective delay (`1.5 Ts` with the defaults) and follows `pwm.update`, carrier timing and
+  computation parameters otherwise.
+  The bridge keeps the same AC/DC/modulation connections in every model. The initial output fills
+  the delay history automatically, and `<unit>.bridge.*` states make
+  continuation from any saved output row exact. `--averaging` uses the `-averaging` result suffix
+  and is mutually exclusive with `--pwm-averaging`.
 
 ### Progress lines and watched quantities (#3)
 
@@ -197,7 +206,7 @@
   integrator (`integrator`, used by `make_solver` and the multirate windows), the check of a
   multirate step (`parse_step`, used by the solver and the validation), the multirate split's groups
   (`MultirateSolver.groups`, used by the energy check), `Re(e conj(f))` (`energy.re_product`), the
-  walk along the carrier (duty fraction and carrier comparison), the four timed protection criteria,
+  walk along the carrier comparison, the four timed protection criteria,
   the reading of YAML and JSON files, the high-pass filter (a `LowPass1`), the check of the
   controller's input (once, where it is scaled to pu).
 - Removed, having no use: `GFMParams`, `PSCParams`, `PLLParams`, `CurrentLoopParams`,

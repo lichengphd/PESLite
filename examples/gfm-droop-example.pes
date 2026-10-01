@@ -15,7 +15,7 @@ units:
       vdc_ref: 1500.0
       source: {type: voltage}
     pwm: {f_sw: 20000.0, modulation_limit: 0.95}
-    averaging: {enable: 1}
+    bridge: {model: pwm_averaging}
     ctrl:
       type: gfm
       loops:

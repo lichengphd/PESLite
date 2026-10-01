@@ -16,7 +16,7 @@ units:
       capacitor: {c_pu: 350.0, r_esr_pu: 0.001}
       source: {type: current, i_pu: 0.5, k_pu: 9.5}
     pwm: {f_sw: 20000.0, modulation_limit: 0.95}
-    averaging: {enable: 1}
+    bridge: {model: pwm_averaging}
     ctrl:
       type: gfm
       loops:

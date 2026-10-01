@@ -43,14 +43,20 @@ class RLBranch:
         self.inp = _BranchInp(u_from=0j, u_to=0j)
         self.out = _BranchOut(i=complex(i0))
         self.breaker_open = False
+        if type(self) is RLBranch:
+            self.rhs = self._rhs_closed
 
     def open_breaker(self) -> None:
         self.breaker_open = True
         self.state.i = 0j
+        if type(self) is RLBranch:
+            self.rhs = self._rhs_open
 
     def close_breaker(self) -> None:
         """Close the breaker; current resumes from zero after an opening."""
         self.breaker_open = False
+        if type(self) is RLBranch:
+            self.rhs = self._rhs_closed
 
     def retune(self, L: float, R: float) -> None:
         """Change inductance and resistance without changing the current state."""
@@ -63,6 +69,12 @@ class RLBranch:
     def rhs(self, t: float):
         if self.breaker_open:
             return (0j,)
+        return ((self.inp.u_from - self.inp.u_to - self.R * self.state.i) / self.L,)
+
+    def _rhs_open(self, t: float):
+        return (0j,)
+
+    def _rhs_closed(self, t: float):
         return ((self.inp.u_from - self.inp.u_to - self.R * self.state.i) / self.L,)
 
     def dissipated_power(self) -> float:

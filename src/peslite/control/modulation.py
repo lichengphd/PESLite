@@ -104,16 +104,20 @@ class OutputStage:
             raise TypeError("pwm_method must be callable")
         if self.limiter is not None and not callable(self.limiter):
             raise TypeError("limiter must be callable or None")
+        self._trusted_pwm = any(self.pwm_method is method for method in PWM_METHODS.values())
+        self._standard_limiter = type(self.limiter) is ModulationLimiter
         self.n_updates = 0
         self.n_saturated = 0
         self.first_saturation_t: float | None = None
         self.saturated = False
         self.m_abc = np.zeros(3)
         self._memo = None  # cached evaluation for the current control instant
+        self._prepared = None
 
     def new_instant(self) -> None:
         """Start a new control instant (clear the cached evaluation)."""
         self._memo = None
+        self._prepared = None
 
     def _evaluate(self, command: complex, rot: complex, u_dc: float) -> tuple[np.ndarray, bool]:
         """Modulating signals and saturation for a dq command (pu), cached for this control instant."""
@@ -122,13 +126,21 @@ class OutputStage:
             return memo[2], memo[3]
         u_ab = command * rot * self.v_base
         if u_dc > 0.0:
-            m = _signals(self.pwm_method(u_ab, u_dc), "pwm_method")
+            raw = self.pwm_method(u_ab, u_dc)
+            m = raw if self._trusted_pwm else _signals(raw, "pwm_method")
         else:
             u = complex2abc(u_ab)
             peak = float(np.max(np.abs(u)))
             m = u / peak if peak > 0.0 else np.zeros(3)
         saturated = False
-        if self.limiter is not None:
+        if self._standard_limiter:
+            max_abs = max(abs(float(m[0])), abs(float(m[1])), abs(float(m[2])))
+            if max_abs > self.limiter.limit:
+                m *= self.limiter.limit / max_abs
+                saturated = True
+            elif u_dc <= 0.0 and u_ab != 0j:
+                saturated = True
+        elif self.limiter is not None:
             limited = _signals(self.limiter(m.copy()), "limiter")
             saturated = limited.tolist() != m.tolist() or (u_dc <= 0.0 and u_ab != 0j)  # both finite, shape (3,)
             m = limited
@@ -144,6 +156,7 @@ class OutputStage:
         count: ``False`` leaves the controller-update and saturation counters unchanged.
         """
         rot = complex(math.cos(theta), math.sin(theta))
+        u_dc_pu = u_dc
         u_dc = u_dc * self.v_dc_base  # PWM receives DC volts; loop feedback stays pu
         u_dq = u_cmd_dq if extra_dq is None else u_cmd_dq + extra_dq
         m_abc, saturated = self._evaluate(u_dq, rot, u_dc)
@@ -154,10 +167,26 @@ class OutputStage:
             u_lim_dq = abc2complex(m_abc) * u_dc / (2.0 * self.v_base) * complex(math.cos(theta), -math.sin(theta))
             cc.backcalculate(u_dq, u_lim_dq)
         self.m_abc, self.saturated = m_abc, saturated
+        duty = 0.5 * (1.0 + self.m_abc)
+        self._prepared = ((u_dq, theta, u_dc_pu), duty)
         if count:
             self.n_updates += 1
             if saturated:
                 self.n_saturated += 1
                 if self.first_saturation_t is None:
                     self.first_saturation_t = t
-        return 0.5 * (1.0 + self.m_abc)
+        return duty
+
+    def finish(self, t: float, u_cmd_dq: complex, theta: float, u_dc: float, *,
+               count: bool = True) -> np.ndarray:
+        """Count and return a command already prepared at this control instant when possible."""
+        prepared = self._prepared
+        if prepared is None or prepared[0] != (u_cmd_dq, theta, u_dc):
+            return self.modulate(t, u_cmd_dq, theta, u_dc, count=count)
+        if count:
+            self.n_updates += 1
+            if self.saturated:
+                self.n_saturated += 1
+                if self.first_saturation_t is None:
+                    self.first_saturation_t = t
+        return prepared[1]

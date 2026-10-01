@@ -1,7 +1,6 @@
-"""Issue #3: each unit selects switching or one of the two averaging bridge models."""
+"""Per-unit exact-switching and PWM-period-averaged bridge models."""
 
 import io
-import re
 import warnings
 from contextlib import redirect_stdout
 
@@ -19,51 +18,56 @@ SHORT = ["--set", "simulation.t_end=0.004",
 
 
 def _models(*args):
-    """Return ``{unit: (enable, over)}`` after resolving command-line arguments."""
+    """Return ``{unit: bridge model}`` after resolving command-line arguments."""
     output = io.StringIO()
     with redirect_stdout(output):
         assert peslite.main([*args, "--resolved"]) == 0
     units = yaml.safe_load(output.getvalue())["units"]
-    return {name: (unit["averaging"]["enable"], unit["averaging"]["over"])
-            for name, unit in units.items()}
+    return {name: unit["bridge"]["model"] for name, unit in units.items()}
 
 
-def test_switching_is_default_and_averaging_is_a_switched_unit_section():
-    assert _models("gfl-example") == {"vsc": (0, "pwm_period")}
-    assert _models("gfm-droop-example") == {"vsc": (1, "pwm_period")}
+def test_switching_is_default_and_pwm_averaging_is_selected_per_unit():
+    assert _models("gfl-example") == {"vsc": "switching"}
+    assert _models("gfm-droop-example") == {"vsc": "pwm_averaging"}
 
 
 @pytest.mark.parametrize("name", ["gfl-example", "gfm-droop-example", "two-converters-example"])
-def test_averaging_flag_turns_averaging_on_for_every_unit(name):
-    assert all(enable == 1 for enable, _over in _models(name, "--averaging").values())
+def test_pwm_averaging_flag_selects_every_unit(name):
+    assert set(_models(name, "--pwm-averaging").values()) == {"pwm_averaging"}
 
 
-def test_there_is_no_switching_flag(capsys):
+@pytest.mark.parametrize("name", ["gfl-example", "gfm-droop-example", "two-converters-example"])
+def test_averaging_flag_selects_every_unit(name):
+    assert set(_models(name, "--averaging").values()) == {"averaging"}
+
+
+def test_bridge_flags_are_mutually_exclusive(capsys):
+    with pytest.raises(SystemExit):
+        peslite.main(["gfl-example", "--pwm-averaging", "--averaging", "--resolved"])
+    assert "not allowed with argument" in capsys.readouterr().err
+
+
+def test_there_is_no_global_switching_flag(capsys):
     with pytest.raises(SystemExit):
         peslite.main(["gfm-droop-example", "--switching", "--resolved"])
     assert "unrecognized arguments: --switching" in capsys.readouterr().err
 
 
-def _with_model(params, enable, over):
-    changes = {f"units.{name}.averaging.{key}": value
-               for name in params.units
-               for key, value in (("enable", enable), ("over", over))}
-    return params.replace(**changes)
+def _with_model(params, model):
+    return params.replace(**{f"units.{name}.bridge.model": model for name in params.units})
 
 
 @pytest.mark.parametrize("path", sorted(EXAMPLES.glob("*-example.pes")), ids=lambda path: path.stem)
-@pytest.mark.parametrize("enable, over", [(0, "pwm_period"),
-                                           (1, "pwm_period"),
-                                           (1, "time_step")])
-def test_every_bundled_file_runs_with_every_model(path, enable, over, tmp_path):
+@pytest.mark.parametrize("model", ["switching", "pwm_averaging", "averaging"])
+def test_every_bundled_file_runs_with_every_completed_model(path, model, tmp_path):
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         params = peslite.load(
             path,
             **{"simulation.t_end": 0.004, "simulation.solver.linearisations": 0},
         )
-        params = _with_model(params, enable, over)
-    result = peslite.Simulation(params).run(out_dir=tmp_path / f"{path.stem}-{enable}-{over}")
+        params = _with_model(params, model)
+    result = peslite.Simulation(params).run(out_dir=tmp_path / f"{path.stem}-{model}")
     assert np.isfinite(result.states["t"]).all()
     assert result.states["t"][-1] == pytest.approx(0.004)
 
@@ -73,7 +77,7 @@ def test_units_can_have_different_models(tmp_path):
         EXAMPLES / "two-converters-example.pes",
         **{"simulation.t_end": 0.004,
            "simulation.solver.linearisations": 0,
-           "units.vsc_1.averaging.enable": 1},
+           "units.vsc_1.bridge.model": "pwm_averaging"},
     )
     simulation = peslite.Simulation(params)
     models = tuple(type(simulation.units[name].bridge.modulator).__name__
@@ -82,93 +86,140 @@ def test_units_can_have_different_models(tmp_path):
     simulation.run(out_dir=tmp_path)
 
 
-def test_averaging_flag_is_the_same_as_setting_the_file_value(tmp_path):
+def test_ideal_averaging_is_a_bridge_implementation_without_a_pwm(tmp_path):
+    params = peslite.load(
+        EXAMPLES / "two-converters-example.pes",
+        **{"simulation.t_end": 0.004,
+           "simulation.solver.linearisations": 0,
+           "units.vsc_1.bridge.model": "averaging"},
+    )
+    simulation = peslite.Simulation(params)
+    assert not isinstance(simulation.units["vsc_1"].bridge, peslite.PWM)
+    assert isinstance(simulation.units["vsc_1"].bridge, peslite.AveragingBridge)
+    assert not hasattr(simulation.units["vsc_1"], "pwm")
+    assert not hasattr(simulation.units["vsc_1"], "averaging")
+    assert type(simulation.units["vsc_2"].bridge.modulator).__name__ == "CarrierComparison"
+    simulation.run(out_dir=tmp_path)
+
+
+def test_changing_bridge_model_keeps_the_same_power_and_modulation_connections(gfl):
+    switching = peslite.Simulation(gfl()).unit()
+    averaging = peslite.Simulation(
+        gfl(**{"units.vsc.bridge.model": "averaging"})
+    ).unit()
+
+    assert tuple(switching.bridge.inp.__slots__) == tuple(averaging.bridge.inp.__slots__)
+    assert set(switching.bridge.inp.__slots__) == {"q", "u_dc", "i_c"}
+    assert [port for _component, port in switching.zoh_connections()] == [
+        port for _component, port in averaging.zoh_connections()
+    ] == ["q"]
+    assert len(switching.connections()) == len(averaging.connections())
+
+
+def test_only_exact_switching_bridge_enters_the_switching_event_loop(gfl):
+    bridges = {
+        model: peslite.Simulation(gfl(**{"units.vsc.bridge.model": model})).unit().bridge
+        for model in ("switching", "pwm_averaging", "averaging")
+    }
+    assert bridges["switching"].has_switching_events
+    assert not bridges["pwm_averaging"].has_switching_events
+    assert not bridges["averaging"].has_switching_events
+    assert not hasattr(bridges["averaging"], "next_switch")
+
+
+def test_pwm_averaging_flag_is_the_same_as_setting_the_file_value(tmp_path):
     out_flag, out_set = tmp_path / "flag", tmp_path / "set"
     with redirect_stdout(io.StringIO()):
-        assert peslite.main(["gfl-example", "--averaging", *SHORT,
+        assert peslite.main(["gfl-example", "--pwm-averaging", *SHORT,
                              "--out", str(out_flag)]) == 0
-        assert peslite.main(["gfl-example", "--set", "units.vsc.averaging.enable=1",
+        assert peslite.main(["gfl-example", "--set", "units.vsc.bridge.model=pwm_averaging",
                              *SHORT, "--out", str(out_set)]) == 0
     assert (out_flag / "states.csv").read_text() == (out_set / "states.csv").read_text()
-    assert peslite.load(out_flag / "simulation.pes").unit("vsc").averaging.enable
+    assert peslite.load(out_flag / "simulation.pes").unit("vsc").bridge.model == "pwm_averaging"
+
+
+def test_pwm_averaging_flag_wins_over_set():
+    assert _models("gfl-example", "--pwm-averaging",
+                   "--set", "units.vsc.bridge.model=switching") == {
+                       "vsc": "pwm_averaging"}
 
 
 def test_averaging_flag_wins_over_set():
     assert _models("gfl-example", "--averaging",
-                   "--set", "units.vsc.averaging.enable=0") == {
-                       "vsc": (1, "pwm_period")}
+                   "--set", "units.vsc.bridge.model=switching") == {
+                       "vsc": "averaging"}
 
 
-def test_time_step_averaging_is_a_kind_of_averaging():
-    assert _models("gfl-example", "--averaging",
-                   "--set", "units.vsc.averaging.over=time_step") == {
-                       "vsc": (1, "time_step")}
-    assert _models("gfl-example", "--averaging") == {"vsc": (1, "pwm_period")}
+@pytest.mark.parametrize("path", [
+    "simulation.bridge",
+    "units.vsc.averaging",
+    "units.vsc.averaging.enable",
+    "units.vsc.bridge.over",
+])
+def test_removed_averaging_paths_are_rejected(gfl, path):
+    with pytest.raises(ConfigError, match="unknown"):
+        gfl(**{path: 1})
 
 
-def test_time_step_averaging_follows_carrier_within_each_period(gfl, tmp_path):
-    runs = {}
-    for over in ("pwm_period", "time_step"):
-        params = gfl(**{"units.vsc.averaging.over": over,
-                        "simulation.output.period": 12.5e-6})
-        runs[over] = peslite.Simulation(params).run(out_dir=tmp_path / over).states["vsc.branch_f.i.re"]
-    ripple = {name: np.ptp(np.diff(values[-40:], 2)) for name, values in runs.items()}
-    assert ripple["time_step"] > 10 * ripple["pwm_period"]
-
-
-def test_over_has_no_effect_on_switching_bridge(gfl, tmp_path):
-    base = {"units.vsc.averaging.enable": 0, "simulation.t_end": 0.002}
-    first = peslite.Simulation(gfl(**base)).run(out_dir=tmp_path / "pwm-period")
-    second = peslite.Simulation(
-        gfl(**base, **{"units.vsc.averaging.over": "time_step"})
-    ).run(out_dir=tmp_path / "time-step")
-    assert all(np.array_equal(first.states[name], second.states[name], equal_nan=True)
-               for name in first.states)
-
-
-def test_averaging_flag_results_use_their_own_folder(tmp_path, monkeypatch):
+def test_pwm_averaging_flag_results_use_their_own_folder(tmp_path, monkeypatch):
     monkeypatch.setattr(peslite.solver.simulation, "_RESULTS", tmp_path)
     with redirect_stdout(io.StringIO()):
         assert peslite.main(["gfl-example", *SHORT]) == 0
+        assert peslite.main(["gfl-example", "--pwm-averaging", *SHORT]) == 0
         assert peslite.main(["gfl-example", "--averaging", *SHORT]) == 0
-        assert peslite.main(["gfm-droop-example", "--averaging", *SHORT]) == 0
+        assert peslite.main(["gfm-droop-example", "--pwm-averaging", *SHORT]) == 0
     assert sorted(path.name for path in tmp_path.iterdir()) == [
-        "gfl-example", "gfl-example-averaging", "gfm-droop-example"]
-    assert not peslite.load(tmp_path / "gfl-example" / "simulation.pes").unit("vsc").averaging.enable
-    assert peslite.load(tmp_path / "gfl-example-averaging" / "simulation.pes").unit("vsc").averaging.enable
+        "gfl-example", "gfl-example-averaging", "gfl-example-pwm-averaging",
+        "gfm-droop-example-pwm-averaging"]
+    assert peslite.load(tmp_path / "gfl-example" / "simulation.pes").unit("vsc").bridge.model == "switching"
+    assert (peslite.load(tmp_path / "gfl-example-pwm-averaging" / "simulation.pes")
+            .unit("vsc").bridge.model == "pwm_averaging")
+    assert (peslite.load(tmp_path / "gfl-example-averaging" / "simulation.pes")
+            .unit("vsc").bridge.model == "averaging")
 
 
-def test_carrier_settings_are_ignored_for_pwm_period_averaging(gfl, tmp_path):
-    duration = {"simulation.t_end": 0.004}
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        synchronous = gfl(**duration,
-                          **{"units.vsc.pwm.sync": "synchronous",
-                             "units.vsc.pwm.carrier_phase": 0.3})
-    asynchronous = gfl(**duration)
-    first = peslite.Simulation(synchronous).run(out_dir=tmp_path / "synchronous")
-    second = peslite.Simulation(asynchronous).run(out_dir=tmp_path / "asynchronous")
-    for name in second.states:
-        assert np.array_equal(first.states[name], second.states[name], equal_nan=True), name
+@pytest.mark.parametrize("solver", [
+    {},
+    {"simulation.solver.type": "adaptive", "simulation.solver.method": "DP45"},
+], ids=["fixed", "adaptive"])
+def test_pwm_averaging_supports_fixed_and_adaptive_solvers(gfl, solver, tmp_path):
+    params = gfl(**solver)
+    result = peslite.Simulation(params).run(out_dir=tmp_path / ("adaptive" if solver else "fixed"))
+    assert result.t[-1] == pytest.approx(params.simulation.t_end)
 
 
-def test_time_step_averaging_has_only_an_asynchronous_carrier(gfl):
-    message = ("units.vsc.pwm.sync = 'synchronous' is not available with time-step "
-               "averaging (units.vsc.averaging.over = 'time_step')")
-    with pytest.raises(ConfigError, match=re.escape(message)):
-        gfl(**{"units.vsc.averaging.over": "time_step",
-               "units.vsc.pwm.sync": "synchronous"})
-    gfl(**{"units.vsc.averaging.enable": 0,
-           "units.vsc.pwm.sync": "synchronous"})
+def test_pwm_averaging_accepts_synchronous_pwm(gfl, tmp_path):
+    params = gfl(**{"units.vsc.pwm.sync": "synchronous",
+                    "units.vsc.pwm.carrier_phase": 0.3})
+    result = peslite.Simulation(params).run(out_dir=tmp_path)
+    assert result.t[-1] == pytest.approx(params.simulation.t_end)
 
 
-def test_time_step_averaging_needs_fixed_step_solver(gfl):
-    with pytest.raises(
-        ConfigError,
-        match=re.escape("units.vsc.averaging.over = 'time_step' requires the fixed-step solver"),
-    ):
-        gfl(**{"units.vsc.averaging.over": "time_step",
-               "simulation.solver.type": "adaptive",
-               "simulation.solver.method": "DP45"})
-    with pytest.raises(ConfigError, match=re.escape("units.vsc.averaging.over: 'carrier' not in")):
-        gfl(**{"units.vsc.averaging.over": "carrier"})
+def test_ideal_averaging_has_its_own_states_and_no_pwm_states(gfl):
+    simulation = peslite.Simulation(gfl(**{"units.vsc.bridge.model": "averaging"}))
+    names = set(simulation.state_names())
+    assert {f"vsc.bridge.d_{phase}" for phase in "abc"} <= names
+    assert {f"vsc.bridge.history.0.d_{phase}" for phase in "abc"} <= names
+    assert {"vsc.bridge.on", "vsc.bridge.history.0.on"} <= names
+    assert not any(name.startswith("vsc.pwm.") for name in names)
+
+
+@pytest.mark.parametrize("solver", [
+    {},
+    {"simulation.solver.type": "adaptive", "simulation.solver.method": "DP45"},
+], ids=["fixed", "adaptive"])
+def test_ideal_averaging_continues_exactly_with_its_delay_history(gfl, solver, tmp_path):
+    params = gfl(**{"units.vsc.bridge.model": "averaging",
+                    "simulation.t_end": 0.004,
+                    "simulation.output.period": 5e-6,
+                    **solver})
+    whole_dir = tmp_path / "whole"
+    whole = peslite.Simulation(params).run(out_dir=whole_dir)
+    continued_params = peslite.load(whole_dir / "simulation.pes",
+                                    initial=whole_dir / "states.csv",
+                                    initial_time=0.003005)
+    continued = peslite.Simulation(continued_params).run(out_dir=tmp_path / "continued")
+    start = int(np.argmin(abs(whole.t - 0.003005)))
+    assert np.array_equal(continued.t, whole.t[start:])
+    for name, values in continued.states.items():
+        assert np.array_equal(values, whole.states[name][start:]), name

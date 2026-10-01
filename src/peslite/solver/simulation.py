@@ -2,9 +2,10 @@
 event loop, and the command line (the ``peslite`` command).
 
 Between events the solver integrates the model; the events are those of the file, each unit's ADC
-samples, control interrupts, PWM loads, averaging-window openings and switching instants, and the
-snapshots. Order at a coincident instant: file events, over-current check, ADC samples, control
-interrupts, PWM loads, window opening, switching instants, snapshot.
+samples, control interrupts, PWM loads or delayed average-source updates, averaging-window
+openings and switching instants, and the snapshots. Order at a coincident instant: file events,
+over-current check, ADC samples, control interrupts, actuation, window opening, switching instants,
+snapshot.
 """
 
 from __future__ import annotations
@@ -634,6 +635,10 @@ class Simulation:
         ctrl_names = {
             unit.name: getattr(unit.ctrl, "log_names", lambda: ())() for unit in units
         }
+        for unit in units:
+            set_logging = getattr(unit.ctrl, "set_logging", None)
+            if set_logging is not None:
+                set_logging(output.signals or bool(watch))
         rec = Recorder(p, output_dir, ctrl_names, keep_states=output.states,
                        keep_signals=output.signals, keep_energy=output.energy,
                        batch_rows=p.simulation.solver.write_length)
@@ -1121,12 +1126,15 @@ def main(argv=None) -> int:
                     help="initial values: a states.csv row or a simulation file's simulation.initial block")
     ap.add_argument("--initial-time", type=float, default=None, metavar="T",
                     help="with a states.csv: start from the row at time T instead of the last row")
-    ap.add_argument("--averaging", action="store_true",
-                    help="run every unit with averaging enabled; each unit keeps its configured "
-                         "averaging.over value, and this option wins over --set")
+    bridge = ap.add_mutually_exclusive_group()
+    bridge.add_argument("--pwm-averaging", action="store_true",
+                        help="run every unit with PWM-period averaging; this option wins over --set")
+    bridge.add_argument("--averaging", action="store_true",
+                        help="run every unit as a delayed ideal averaged voltage source; "
+                             "this option wins over --set")
     ap.add_argument("--out", default=None,
                     help="output directory (default: output/<file name>, or "
-                         "output/<file name>-averaging when --averaging changes a unit)")
+                         "a -pwm-averaging/-averaging suffix with the corresponding bridge option)")
     ap.add_argument("--progress", type=float, default=None, metavar="SECONDS",
                     help="print a progress line every SECONDS of simulated time")
     ap.add_argument("--watch", action="append", default=None, metavar="NAME",
@@ -1154,9 +1162,10 @@ def main(argv=None) -> int:
                                                    for name in value.split(",") if name]
     p = load(config, initial=args.initial,
                     initial_time=args.initial_time, **overrides)
-    averaged = args.averaging and any(not unit.averaging.enable for unit in p.units.values())
-    if args.averaging:
-        p = p.replace(**{f"units.{name}.averaging.enable": 1 for name in p.units})
+    if args.pwm_averaging:
+        p = p.replace(**{f"units.{name}.bridge.model": "pwm_averaging" for name in p.units})
+    elif args.averaging:
+        p = p.replace(**{f"units.{name}.bridge.model": "averaging" for name in p.units})
     if args.watch and not p.simulation.progress.enable:
         ap.error("--watch prints on the progress lines: add --progress SECONDS")
     if args.resolved:
@@ -1169,11 +1178,8 @@ def main(argv=None) -> int:
     if args.ph_report:
         print(sim.ph_report)
         return 0
-    def bridge_model(unit):
-        return (f"averaging over the {unit.averaging.over.replace('_', ' ')}"
-                if unit.averaging.enable else "switching")
-
-    units = ", ".join(f"{n} ({u.ctrl.type}, {bridge_model(u)}, {sim.units[n].bridge.describe()})"
+    units = ", ".join(f"{n} ({u.ctrl.type}, {u.bridge.model.replace('_', ' ')}, "
+                      f"{sim.units[n].bridge.describe()})"
                       for n, u in p.units.items())
     print(f"peslite: {config}  units={units}  "
           f"solver={p.simulation.solver.type}/{p.simulation.solver.method}  "
@@ -1182,7 +1188,8 @@ def main(argv=None) -> int:
     if sim.ph_report is not None:
         print(f"structure: {sim.ph_report.verdict} (state coverage {sim.ph_report.coverage:.0%}"
               f"{'; ' + '; '.join(sim.energy_problems) if sim.energy_problems else ''})")
-    out = Path(args.out) if args.out else _RESULTS / (f"{config.stem}-averaging" if averaged else config.stem)
+    suffix = "-pwm-averaging" if args.pwm_averaging else "-averaging" if args.averaging else ""
+    out = Path(args.out) if args.out else _RESULTS / f"{config.stem}{suffix}"
     r = sim.run(out_dir=out, info={"config": str(config)})
     s = r.summary
     print(f"done: wall {r.wall_time:.1f} s, rhs evaluations {r.n_rhs}, stop at {s.get('t_stop', 0):.4f} s, "

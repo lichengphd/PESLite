@@ -4,11 +4,13 @@ import ast
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 import peslite
 from conftest import EXAMPLES
 from peslite.components import (
     ADC,
+    AveragingBridge,
     MeasurementPorts,
     PWM,
     ZOH,
@@ -19,7 +21,7 @@ COMPONENTS = Path(peslite.components.__file__).parent
 PACKAGE = COMPONENTS.parent
 
 
-def test_unit_delegates_sampling_and_modulation_state_to_components():
+def test_unit_delegates_sampling_to_adc_and_actuation_to_bridge():
     p = peslite.load(EXAMPLES / "gfl-example.pes")
     unit = peslite.Simulation(p).unit()
 
@@ -29,6 +31,7 @@ def test_unit_delegates_sampling_and_modulation_state_to_components():
     assert not hasattr(unit, "pwm")
     assert isinstance(unit.protection, peslite.Protection)
     assert peslite.ADC is ADC and peslite.PWM is PWM
+    assert not hasattr(unit, "pwm")
     assert not hasattr(unit, "sampler")
     assert not hasattr(unit, "window")
     assert not hasattr(unit, "modulator")
@@ -93,6 +96,54 @@ def test_pwm_owns_timer_registers_and_switching_schedule():
     assert pwm.next_switch == float("inf")
     pwm.load(1e-3)
     assert pwm.active[0] == 0.8
+    pwm.set_state({"shadow.d_a": 0.1})
+    assert pwm.get_state()["d_a"] == 0.8
+    assert pwm.get_state()["shadow.d_a"] == 0.1
+
+
+def test_ideal_averaging_holds_its_initial_value_until_the_delayed_output_arrives():
+    period = 50e-6
+    initial = np.array([0.2, 0.4, 0.6])
+    command = np.array([0.8, 0.7, 0.6])
+    assert type(abc2complex(initial)) is complex
+    bridge = AveragingBridge(period, period, 0.0, computation=1e-6)
+    bridge.reset(initial, on=False)
+    assert bridge.start(0.0, (None, None), continued=False) == abc2complex(initial)
+
+    bridge.write(period, command, on=True)
+    assert bridge.delay(period) == pytest.approx(1.5 * period)
+    assert bridge.t_load == pytest.approx(2.0 * period)
+    assert not hasattr(bridge, "next_switch")
+    assert not hasattr(bridge, "switches")
+    assert not bridge.on
+    assert abc2complex(bridge.active[:3]) == abc2complex(initial)
+    assert bridge.load(2.0 * period) == abc2complex(command)
+    assert bridge.on
+
+
+def test_ideal_averaging_delay_follows_computation_and_pwm_update():
+    period = 50e-6
+    zero = AveragingBridge(period, period, 0.0, 0.0)
+    assert zero.apply_time(period) == pytest.approx(period)
+    assert zero.delay(period) == pytest.approx(0.5 * period)
+    double = AveragingBridge(period, period / 2, 0.0, 1e-6)
+    assert double.apply_time(period) == pytest.approx(1.5 * period)
+    assert double.delay(period) == pytest.approx(0.75 * period)
+    slow = AveragingBridge(period, period / 2, 0.0, 30e-6)
+    assert slow.apply_time(period) == pytest.approx(2.0 * period)
+    assert slow.delay(period) == pytest.approx(1.25 * period)
+
+
+def test_ideal_averaging_keeps_only_the_last_command_for_one_equivalent_load():
+    load_period = 50e-6
+    bridge = AveragingBridge(load_period / 2, load_period, 0.0, computation=1e-6)
+    bridge.reset(np.array([0.2, 0.4, 0.6]))
+    bridge.start(0.0, (None, None), continued=False)
+    first = np.array([0.3, 0.4, 0.5])
+    last = np.array([0.7, 0.6, 0.5])
+    bridge.write(0.0, first)
+    bridge.write(load_period / 2, last)
+    assert bridge.load(load_period) == abc2complex(last)
 
 
 def test_duty_register_states_are_owned_by_pwm():
