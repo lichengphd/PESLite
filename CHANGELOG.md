@@ -31,7 +31,7 @@
 - The bridge model is selected independently for each converter. A unit uses exact switching by
   default; `units.<u>.averaging: {enable: 1, over: pwm_period}` averages over each PWM period, and
   `over: time_step` averages the carrier comparison over each fixed solver step.
-- `--averaging` enables averaging for every unit for one run and takes precedence over `--set` of
+- `--pwm-averaging` enables averaging for every unit for one run and takes precedence over `--set` of
   its `enable` switch. When it changes a model, the default result directory gains the
   `-averaging` suffix. Different units in the same system may use different models.
 - Time-step averaging requires a fixed-step solver and an asynchronous carrier. Carrier phase and

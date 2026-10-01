@@ -51,7 +51,7 @@ peslite gfl-example --set simulation.solver.type=adaptive --set simulation.solve
 peslite gfm-droop-example --set units.vsc.averaging.enable=0
 
 # average every converter for this run; print progress with selected quantities
-peslite gfl-example --averaging
+peslite gfl-example --pwm-averaging
 peslite gfl-example --progress 0.1 --watch vsc.vdc_pu --watch vsc.i_c
 
 # continue a run from its last saved state (or from time T with --initial-time T)
@@ -129,7 +129,7 @@ units:
 | `enable: 1, over: pwm_period` | duty ratios held as continuous bridge values over each PWM period; no carrier ripple |
 | `enable: 1, over: time_step` | carrier on-fraction averaged over each fixed solver step |
 
-`--averaging` enables averaging for every converter for one run without editing the file, while
+`--pwm-averaging` enables averaging for every converter for one run without editing the file, while
 preserving each converter's configured `over` value. It takes precedence over an `enable: 0`
 command-line override. If the option changes at least one model, the default result directory is
 `output/<name>-averaging`.
@@ -161,7 +161,7 @@ and PWM loads.
 | `simulation.output.period` | snapshot interval, s |
 | `simulation.energy_check` | `warn` \| `strict` \| `off` |
 | `simulation.progress` | `{enable: 1, period: 0.1, watch: [...]}`; CLI: `--progress`, `--watch` |
-| `units.<u>.averaging` | `{enable: 1, over: pwm_period \| time_step}`; CLI: `--averaging` |
+| `units.<u>.averaging` | `{enable: 1, over: pwm_period \| time_step}`; CLI: `--pwm-averaging` |
 | `units.<u>.ctrl.type` | `gfl` \| `gfm` \| `custom` |
 | `units.<u>.ctrl.period` / `.computation` | control-interrupt period and computation time, s |
 | `units.<u>.ctrl.loops.<loop>.period` | loop period, an integer multiple of `ctrl.period` |

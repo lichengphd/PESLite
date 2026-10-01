@@ -64,7 +64,7 @@ units:                     # converters, one entry each
 
     # averaging: {enable: 0, over: pwm_period}  # bridge model: 0 switching; 1 averaging
     #                     # over each pwm_period (no carrier) or each solver time_step (fixed solver)
-    #                     # --averaging sets enable 1 for every unit
+    #                     # --pwm-averaging sets enable 1 for every unit
 
     ctrl:
       type: gfl            # default wiring: gfl | gfm | custom (explicit connections and outputs)

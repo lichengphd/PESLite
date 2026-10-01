@@ -15,7 +15,7 @@ def _progress(*args):
     output = io.StringIO()
     with redirect_stdout(output):
         assert peslite.main([
-            "gfl-example", "--averaging",
+            "gfl-example", "--pwm-averaging",
             "--set", "simulation.t_end=0.01",
             "--set", "simulation.solver.linearisations=0",
             *args,

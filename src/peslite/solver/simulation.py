@@ -1172,12 +1172,12 @@ def main(argv=None) -> int:
                     help="initial values: a states.csv row or a simulation file's simulation.initial block")
     ap.add_argument("--initial-time", type=float, default=None, metavar="T",
                     help="with a states.csv: start from the row at time T instead of the last row")
-    ap.add_argument("--averaging", action="store_true",
+    ap.add_argument("--pwm-averaging", action="store_true",
                     help="run every unit with averaging enabled; each unit keeps its configured "
                          "averaging.over value, and this option wins over --set")
     ap.add_argument("--out", default=None,
                     help="output directory (default: output/<file name>, or "
-                         "output/<file name>-averaging when --averaging changes a unit)")
+                         "output/<file name>-averaging when --pwm-averaging changes a unit)")
     ap.add_argument("--progress", type=float, default=None, metavar="SECONDS",
                     help="print a progress line every SECONDS of simulated time")
     ap.add_argument("--watch", action="append", default=None, metavar="NAME",
@@ -1205,8 +1205,8 @@ def main(argv=None) -> int:
                                                    for name in value.split(",") if name]
     p = load(config, initial=args.initial,
                     initial_time=args.initial_time, **overrides)
-    averaged = args.averaging and any(not unit.averaging.enable for unit in p.units.values())
-    if args.averaging:
+    averaged = args.pwm_averaging and any(not unit.averaging.enable for unit in p.units.values())
+    if args.pwm_averaging:
         p = p.replace(**{f"units.{name}.averaging.enable": 1 for name in p.units})
     if args.watch and not p.simulation.progress.enable:
         ap.error("--watch prints on the progress lines: add --progress SECONDS")
