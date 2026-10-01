@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.5
 
 - The default per-unit bridge model is now ideal `averaging`. The mutually exclusive
   `--switching`, `--pwm-averaging` and `--averaging` options override every unit for one run.
