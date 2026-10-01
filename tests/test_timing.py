@@ -36,7 +36,7 @@ def _record(p, out):
     unit = sim.unit("vsc")
     interrupts, loads = [], []
     unit.ctrl = _Recorder(unit.ctrl, interrupts, "ctrl")
-    unit.pwm.modulator = _Recorder(unit.pwm.modulator, loads, "mod")
+    unit.bridge.modulator = _Recorder(unit.bridge.modulator, loads, "mod")
     result = sim.run(out_dir=out)
     return result, interrupts, loads[1:]  # first call resumes the registers present at the start
 
@@ -164,7 +164,7 @@ def test_timer_starts_at_the_first_carrier_valley(gfl):
     pwm = peslite.Simulation(gfl(**{
         "units.vsc.pwm.carrier_phase": 0.25,
         "units.vsc.pwm.update": "double",
-    })).unit().pwm
+    })).unit().bridge
     assert (pwm.offset, pwm.period, pwm.load_period) == (pytest.approx(0.75 * T), T, T / 2)
     assert pwm.after(0.0) == 0
     assert pwm.after(pwm.interrupt(3)) == 4
@@ -176,7 +176,7 @@ def test_timer_starts_at_the_first_carrier_valley(gfl):
     synchronous = peslite.Simulation(gfl(**{
         "units.vsc.pwm.carrier_phase": 0.25,
         "units.vsc.pwm.sync": "synchronous",
-    })).unit().pwm
+    })).unit().bridge
     assert synchronous.offset == 0.0
 
 

@@ -285,7 +285,7 @@ def _initial(p: Params) -> None:
     for name, u in p.units.items():
         m, T_c = u.meas, _period(u.ctrl, u.pwm)
         continued = any(key.startswith((f"{name}.ctrl.", f"{name}.pwm.",
-                                         f"{name}.averaging.", f"{name}.meas."))
+                                         f"{name}.bridge.", f"{name}.meas."))
                         for key in p.simulation.initial.states)
         if not continued or m.period is None or m.period >= T_c * (1.0 - 1e-9):
             continue

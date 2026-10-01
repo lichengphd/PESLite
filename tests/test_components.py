@@ -10,7 +10,7 @@ import peslite
 from conftest import EXAMPLES
 from peslite.components import (
     ADC,
-    AveragingActuator,
+    AveragingBridge,
     MeasurementPorts,
     PWM,
     ZOH,
@@ -21,13 +21,14 @@ COMPONENTS = Path(peslite.components.__file__).parent
 PACKAGE = COMPONENTS.parent
 
 
-def test_unit_delegates_sampling_and_modulation_state_to_components():
+def test_unit_delegates_sampling_to_adc_and_actuation_to_bridge():
     p = peslite.load(EXAMPLES / "gfl-example.pes")
     unit = peslite.Simulation(p).unit()
 
     assert isinstance(unit.adc, ADC)
-    assert isinstance(unit.pwm, PWM)
+    assert isinstance(unit.bridge, PWM)
     assert peslite.ADC is ADC and peslite.PWM is PWM
+    assert not hasattr(unit, "pwm")
     assert not hasattr(unit, "sampler")
     assert not hasattr(unit, "window")
     assert not hasattr(unit, "modulator")
@@ -97,22 +98,22 @@ def test_ideal_averaging_holds_its_initial_value_until_the_delayed_output_arrive
     period = 50e-6
     initial = np.array([0.2, 0.4, 0.6])
     command = np.array([0.8, 0.7, 0.6])
-    actuator = AveragingActuator(period, period, 0.0, computation=1e-6)
-    actuator.reset(initial)
-    assert actuator.start(0.0, continued=False) == abc2complex(initial)
+    bridge = AveragingBridge(period, period, 0.0, computation=1e-6)
+    bridge.reset(initial)
+    assert bridge.start(0.0, (None, None), continued=False) == abc2complex(initial)
 
-    actuator.write(period, command)
-    assert actuator.delay(period) == pytest.approx(1.5 * period)
-    assert actuator.t_apply == pytest.approx(2.5 * period)
-    assert abc2complex(actuator.active) == abc2complex(initial)
-    assert actuator.apply(2.5 * period) == abc2complex(command)
+    bridge.write(period, command)
+    assert bridge.delay(period) == pytest.approx(1.5 * period)
+    assert bridge.next_switch == pytest.approx(2.5 * period)
+    assert abc2complex(bridge.active) == abc2complex(initial)
+    assert bridge.apply(2.5 * period) == abc2complex(command)
 
 
 def test_ideal_averaging_delay_follows_computation_and_pwm_update():
     period = 50e-6
-    assert AveragingActuator(period, period, 0.0, 0.0).delay(period) == pytest.approx(0.5 * period)
-    assert AveragingActuator(period, period / 2, 0.0, 1e-6).delay(period) == pytest.approx(0.75 * period)
-    assert AveragingActuator(period, period / 2, 0.0, 30e-6).delay(period) == pytest.approx(1.25 * period)
+    assert AveragingBridge(period, period, 0.0, 0.0).delay(period) == pytest.approx(0.5 * period)
+    assert AveragingBridge(period, period / 2, 0.0, 1e-6).delay(period) == pytest.approx(0.75 * period)
+    assert AveragingBridge(period, period / 2, 0.0, 30e-6).delay(period) == pytest.approx(1.25 * period)
 
 
 def test_duty_register_states_are_owned_by_pwm():

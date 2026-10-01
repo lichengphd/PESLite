@@ -142,8 +142,10 @@ timing as switching. With single update a duty is held for one carrier period; w
 it may load at each carrier valley and peak. An asynchronous carrier phase still shifts that
 unit's control interrupts and loads, although the carrier waveform itself is not evaluated.
 
-Ideal averaging has its own delayed-source implementation: it does not construct a PWM modulator,
-timer or active/shadow registers. For a controller output at `t_k`, let `t_load` be the first
+Ideal averaging is a bridge implementation with the same AC, DC and modulation connections as
+the other bridge models; changing modes does not alter the system connection graph. It does not
+construct a PWM peripheral, carrier, modulator or active/shadow registers. For a controller output at `t_k`, let
+`t_load` be the first
 equivalent register-load instant at or after `t_k + ctrl.computation`, and let `T_load` be one
 carrier period for single update or half a carrier period for double update. The controlled source
 applies that output at
@@ -156,7 +158,7 @@ so its delay is `t_load + T_load/2 - t_k`. With the default single update and no
 this is `1.5 Ts`; zero computation gives `0.5 Ts`; double update with the default computation gives
 `0.75 Ts`. Other control/update grids are evaluated for each output. Before the first delayed
 output arrives, the source naturally keeps the start-up value. Its current output and delay
-history are saved as `<unit>.averaging.*`, so a saved row continues exactly.
+history are bridge states saved as `<unit>.bridge.*`, so a saved row continues exactly.
 
 ## Example configurations
 

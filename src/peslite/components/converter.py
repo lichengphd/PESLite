@@ -1,16 +1,26 @@
-"""The converter's power stage: the ideal bridge and the dc link (capacitor, current or voltage source).
+"""The converter's power stage: bridge models and the dc link.
 
-Quantities are SI; ``q`` is the space vector of the phase switching states (or duty ratios).
+Quantities are SI. Every bridge has the same AC, DC and held modulation connections; the selected
+implementation only changes how its modulation value is produced.
 """
 from __future__ import annotations
 
-from typing import Any, Callable, ClassVar, Optional
+import math
+from typing import Any, Callable, ClassVar, Mapping, Optional
 
-from ..control.blocks import smoothstep
+import numpy as np
+from numpy.typing import NDArray
+
+from ..control.blocks import abc2complex, smoothstep
 from ..solver.energy import PowerPort, StoragePort
 from ..solver.model import Bag, Empty, OutputStage
+from .pwm import Modulator, PWM, make_modulator
 
-__all__ = ["Bridge", "DCLink", "DCCapacitor", "DCCurrentSource", "DCVoltageSource", "make_dclink"]
+__all__ = ["Bridge", "PWMBridge", "AveragingBridge", "DCLink", "DCCapacitor",
+           "DCCurrentSource", "DCVoltageSource", "make_bridge", "make_dclink"]
+
+
+_TIME_EPS = 1e-10
 
 
 class _BridgeInp(Bag):
@@ -66,6 +76,211 @@ class Bridge:
     def zoh_connections(self, label: str) -> dict:
         """Return the connection of the held switching state ``label`` to ``q``."""
         return {(self, "q"): label}
+
+
+class PWMBridge(Bridge, PWM):
+    """Bridge driven by a PWM peripheral.
+
+    Exact switching and PWM-period averaging use the same bridge implementation and event
+    interface; their PWM modulators produce different sequences. The peripheral remains the owner
+    of the public ``<unit>.pwm.*`` register states.
+    """
+
+    def __init__(self, period: float, load_period: float, offset: float, computation: float,
+                 carrier_period: float, modulator: Modulator) -> None:
+        Bridge.__init__(self)
+        PWM.__init__(self, period, load_period, offset, computation, carrier_period, modulator)
+        self.state_prefix = "pwm"
+        self.state_owner = self
+        self._pending: tuple[float, NDArray[np.float64], float | None, float | None] | None = None
+
+    def reset(self, d_abc: NDArray[np.float64]) -> None:
+        PWM.reset(self, d_abc)
+        self._pending = None
+
+    def start(self, t: float, sync: tuple[float | None, float | None],
+              continued: bool) -> complex:
+        self._pending = None
+        return PWM.start(self, t, sync, continued)
+
+    def write(self, t: float, d_abc: NDArray[np.float64], theta: float | None = None,
+              omega: float | None = None) -> bool:
+        """Accept one controller output; return whether completion must follow a coincident load."""
+        if self.computation == 0.0:
+            self.tick(t, theta, omega)
+            self.write_shadow(d_abc)
+            return False
+        self._pending = (t, np.asarray(d_abc, dtype=float), theta, omega)
+        return True
+
+    def finish_control(self) -> None:
+        """Complete a nonzero-time control calculation after any coincident register load."""
+        if self._pending is None:
+            return
+        t, duty, theta, omega = self._pending
+        self.tick(t, theta, omega)
+        self.write_shadow(duty)
+        self._pending = None
+
+class AveragingBridge(Bridge):
+    """Delayed ideal controlled voltage-source bridge.
+
+    It has the same power equations and the same ``q``, AC and DC connections as every other
+    bridge. It differs only in how ``q`` is produced: no carrier, PWM modulator or duty registers
+    are constructed, and a controller command sampled at ``t`` reaches ``q`` at the centre of the
+    first equivalent PWM update interval whose load is not earlier than ``t + computation``. The
+    current duty and recent command history are discrete bridge states so a saved simulation can
+    reconstruct commands that are still in flight.
+    """
+
+    def __init__(self, period: float, load_period: float, offset: float,
+                 computation: float) -> None:
+        super().__init__()
+        self.period = float(period)
+        self.load_period = float(load_period)
+        self.offset = float(offset)
+        self.computation = float(computation)
+        if not math.isfinite(self.period) or self.period <= 0.0:
+            raise ValueError(f"the control period must be finite and positive, got {period}")
+        if not math.isfinite(self.load_period) or self.load_period <= 0.0:
+            raise ValueError(
+                f"the equivalent update period must be finite and positive, got {load_period}"
+            )
+        if not math.isfinite(self.offset):
+            raise ValueError(f"the timer offset must be finite, got {offset}")
+        if not math.isfinite(self.computation) or self.computation < 0.0:
+            raise ValueError(
+                f"the computation time must be finite and nonnegative, got {computation}"
+            )
+        delays = [self.delay(self.interrupt(k)) for k in range(4)]
+        self.history_length = max(
+            1, int(math.ceil(max(delays) / self.period - 1e-12))
+        )
+        zero = np.zeros(3)
+        self.active = zero.copy()
+        self.history = [zero.copy() for _ in range(self.history_length)]  # newest first
+        self.k = 0
+        self.t_interrupt = self.interrupt(0)
+        self._queue: list[tuple[float, int, NDArray[np.float64]]] = []
+        self.t_load = math.inf
+        self.next_switch = math.inf
+        self.load_end = math.inf
+        self.modulator = None
+        self.state_prefix = "bridge"
+        self.state_owner = self
+
+    def interrupt(self, k: int) -> float:
+        return self.offset + k * self.period
+
+    def after(self, t: float) -> int:
+        """Index of the first control interrupt strictly after ``t``."""
+        return int(math.floor((t - self.offset + _TIME_EPS) / self.period)) + 1
+
+    def _load_at_or_after(self, t: float) -> float:
+        j = int(math.ceil((t - self.offset - _TIME_EPS) / self.load_period))
+        return self.offset + j * self.load_period
+
+    def apply_time(self, t: float) -> float:
+        """Time at which the command sampled at ``t`` reaches this bridge."""
+        load = self._load_at_or_after(t + self.computation)
+        return load + 0.5 * self.load_period
+
+    def delay(self, t: float) -> float:
+        return self.apply_time(t) - t
+
+    def describe(self) -> str:
+        delays = [self.delay(self.interrupt(k)) for k in range(8)]
+        lo, hi = min(delays), max(delays)
+        if abs(hi - lo) <= _TIME_EPS:
+            return f"ideal averaging, delay {lo * 1e6:g} us"
+        return f"ideal averaging, delay {lo * 1e6:g}..{hi * 1e6:g} us"
+
+    def reset(self, d_abc: NDArray[np.float64]) -> None:
+        """Fill the bridge output and delay history with its initial duty command."""
+        d = np.clip(np.asarray(d_abc, dtype=float), 0.0, 1.0)
+        self.active = d.copy()
+        self.history = [d.copy() for _ in range(self.history_length)]
+        self._queue.clear()
+        self.next_switch = self.load_end = math.inf
+
+    def start(self, t: float, sync: tuple[float | None, float | None],
+              continued: bool) -> complex:
+        """Resume the command grid and rebuild delayed commands from saved bridge history."""
+        self.k = self.after(t)
+        self.t_interrupt = self.interrupt(self.k)
+        self._queue = []
+        if continued:
+            for age, duty in enumerate(self.history):
+                index = self.k - 1 - age
+                due = self.apply_time(self.interrupt(index))
+                if due > t + _TIME_EPS:
+                    self._queue.append((due, index, duty.copy()))
+            self._queue.sort(key=lambda item: item[:2])
+        self.next_switch = self.load_end = self._queue[0][0] if self._queue else math.inf
+        return abc2complex(self.active)
+
+    def write(self, t: float, d_abc: NDArray[np.float64], theta: float | None = None,
+              omega: float | None = None) -> bool:
+        """Schedule one delayed bridge input; no deferred completion stage is needed."""
+        d = np.clip(np.asarray(d_abc, dtype=float), 0.0, 1.0)
+        self.history = [d.copy(), *self.history[:-1]]
+        self._queue.append((self.apply_time(t), self.k, d.copy()))
+        self.k += 1
+        self.t_interrupt = self.interrupt(self.k)
+        self.next_switch = self.load_end = self._queue[0][0]
+        return False
+
+    def apply(self, t: float) -> complex:
+        """Apply all controller commands that reach the bridge at ``t`` and return its new ``q``."""
+        while self._queue and self._queue[0][0] <= t + _TIME_EPS:
+            self.active = self._queue.pop(0)[2]
+        self.next_switch = self.load_end = self._queue[0][0] if self._queue else math.inf
+        return abc2complex(self.active)
+
+    def finish_control(self) -> None:
+        """The ideal bridge schedules its command immediately; nothing remains to commit."""
+
+    def load(self, t: float) -> complex:
+        """An ideal averaged bridge never schedules a register-load event."""
+        raise RuntimeError("an averaging bridge has no register-load event")
+
+    def switches(self, t: float) -> list[complex]:
+        """Return the delayed ideal-source update due at ``t``, if any."""
+        return [self.apply(t)] if abs(self.next_switch - t) < _TIME_EPS else []
+
+    def get_state(self) -> dict[str, Any]:
+        out = {f"d_{phase}": float(self.active[k]) for k, phase in enumerate("abc")}
+        for age, duty in enumerate(self.history):
+            out.update({f"history.{age}.d_{phase}": float(duty[k])
+                        for k, phase in enumerate("abc")})
+        return out
+
+    def set_state(self, values: Mapping[str, Any]) -> None:
+        known = set(self.get_state())
+        unknown = set(values) - known
+        if unknown:
+            raise KeyError(
+                f"averaging bridge: no state(s) {sorted(unknown)}; known: {sorted(known)}"
+            )
+        for key, value in values.items():
+            parts = key.split(".")
+            target = self.active if len(parts) == 1 else self.history[int(parts[1])]
+            target["abc".index(parts[-1][-1])] = float(value)
+
+
+def make_bridge(cfg: Any, modulator: Modulator | None = None) -> Bridge:
+    """Build the selected bridge implementation behind the common bridge interface."""
+    pwm = cfg.pwm
+    if cfg.bridge.model == "averaging":
+        if modulator is not None:
+            raise ValueError("an averaging bridge does not use a PWM modulator")
+        return AveragingBridge(
+            cfg.ctrl.period, pwm.load_period, pwm.grid_offset, cfg.ctrl.computation)
+    return PWMBridge(
+        cfg.ctrl.period, pwm.load_period, pwm.grid_offset, cfg.ctrl.computation,
+        pwm.switching_period,
+        modulator if modulator is not None else make_modulator(pwm, cfg.base.f0, cfg.bridge),
+    )
 
 
 

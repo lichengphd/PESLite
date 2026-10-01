@@ -80,13 +80,13 @@ def test_units_can_have_different_models(tmp_path):
            "units.vsc_1.bridge.model": "pwm_averaging"},
     )
     simulation = peslite.Simulation(params)
-    models = tuple(type(simulation.units[name].pwm.modulator).__name__
+    models = tuple(type(simulation.units[name].bridge.modulator).__name__
                    for name in ("vsc_1", "vsc_2"))
     assert models == ("ZOH", "CarrierComparison")
     simulation.run(out_dir=tmp_path)
 
 
-def test_ideal_averaging_and_switching_units_use_different_actuators(tmp_path):
+def test_ideal_averaging_is_a_bridge_implementation_without_a_pwm(tmp_path):
     params = peslite.load(
         EXAMPLES / "two-converters-example.pes",
         **{"simulation.t_end": 0.004,
@@ -94,10 +94,26 @@ def test_ideal_averaging_and_switching_units_use_different_actuators(tmp_path):
            "units.vsc_1.bridge.model": "averaging"},
     )
     simulation = peslite.Simulation(params)
-    assert simulation.units["vsc_1"].pwm is None
-    assert type(simulation.units["vsc_1"].averaging).__name__ == "AveragingActuator"
-    assert type(simulation.units["vsc_2"].pwm.modulator).__name__ == "CarrierComparison"
+    assert not isinstance(simulation.units["vsc_1"].bridge, peslite.PWM)
+    assert isinstance(simulation.units["vsc_1"].bridge, peslite.AveragingBridge)
+    assert not hasattr(simulation.units["vsc_1"], "pwm")
+    assert not hasattr(simulation.units["vsc_1"], "averaging")
+    assert type(simulation.units["vsc_2"].bridge.modulator).__name__ == "CarrierComparison"
     simulation.run(out_dir=tmp_path)
+
+
+def test_changing_bridge_model_keeps_the_same_power_and_modulation_connections(gfl):
+    switching = peslite.Simulation(gfl()).unit()
+    averaging = peslite.Simulation(
+        gfl(**{"units.vsc.bridge.model": "averaging"})
+    ).unit()
+
+    assert tuple(switching.bridge.inp.__slots__) == tuple(averaging.bridge.inp.__slots__)
+    assert set(switching.bridge.inp.__slots__) == {"q", "u_dc", "i_c"}
+    assert [port for _component, port in switching.zoh_connections()] == [
+        port for _component, port in averaging.zoh_connections()
+    ] == ["q"]
+    assert len(switching.connections()) == len(averaging.connections())
 
 
 def test_pwm_averaging_flag_is_the_same_as_setting_the_file_value(tmp_path):
@@ -166,8 +182,8 @@ def test_pwm_averaging_accepts_synchronous_pwm(gfl, tmp_path):
 def test_ideal_averaging_has_its_own_states_and_no_pwm_states(gfl):
     simulation = peslite.Simulation(gfl(**{"units.vsc.bridge.model": "averaging"}))
     names = set(simulation.state_names())
-    assert {f"vsc.averaging.d_{phase}" for phase in "abc"} <= names
-    assert {f"vsc.averaging.history.0.d_{phase}" for phase in "abc"} <= names
+    assert {f"vsc.bridge.d_{phase}" for phase in "abc"} <= names
+    assert {f"vsc.bridge.history.0.d_{phase}" for phase in "abc"} <= names
     assert not any(name.startswith("vsc.pwm.") for name in names)
 
 

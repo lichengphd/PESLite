@@ -8,10 +8,9 @@ from __future__ import annotations
 from typing import Any, Mapping, Optional
 
 from ..components.adc import ADC, MeasurementPorts
-from ..components.averaging import AveragingActuator
-from ..components.converter import Bridge, make_dclink
+from ..components.converter import make_bridge, make_dclink
 from ..components.network import RLBranch
-from ..components.pwm import PWM, Modulator, make_modulator
+from ..components.pwm import Modulator
 from ..control.controller import Controller, make_controller
 from .events import UnitScenario
 from .params import SimulationParams, UnitParams
@@ -23,8 +22,8 @@ class Unit:
     """One converter unit built from its parameter section, connected to ``bus``.
 
     ``ctrl`` and ``modulator`` replace the parts built from the section. The unit samples with
-    ``adc`` and controls through either its PWM peripheral or an independently delayed ideal
-    averaged bridge.
+    ``adc`` and controls a bridge whose implementation encapsulates either its PWM peripheral or
+    its delayed ideal-source behavior.
     Events connect or disconnect its filter and DC source and may retune runtime parameters.
     """
 
@@ -36,11 +35,15 @@ class Unit:
         self.scenario = sc = UnitScenario(cfg.events)
 
         # ------------------------------------------------------------ power
+        T_c = cfg.ctrl.period
         self.dclink = make_dclink(cfg.dclink)
         t0 = sim.initial.t
         since, ramp = sc.since(t0)
         self.dclink.connect(sc.connected(t0), since, ramp if t0 < since + ramp else 0.0)
-        self.bridge = Bridge()
+        try:
+            self.bridge = make_bridge(cfg, modulator)
+        except ValueError as exc:
+            raise ValueError(f"{name}: {exc}") from None
         self.branch_f = RLBranch(cfg.ac_filter.l_f, cfg.ac_filter.r_f)
         self.breakers = [self.branch_f, self.dclink]
         self.tripped = False
@@ -57,7 +60,6 @@ class Unit:
             u_g=lambda: bus.out.u, i_c=lambda: self.branch_f.out.i,
             i_c_state=lambda: self.branch_f.state.i, u_dc=lambda: self.dclink.out.u_dc,
             i_dc=lambda: self.dclink.inp.i_dc)
-        T_c = cfg.ctrl.period
         sample_period = meas.period if meas.period is not None else T_c
         samples = max(1, int(round(T_c / sample_period)))
         self.adc = ADC(self.ports, T_c, samples,
@@ -65,23 +67,6 @@ class Unit:
 
         # ------------------------------------------------------------ control
         self.ctrl = ctrl if ctrl is not None else make_controller(cfg, sc)
-        pwm = cfg.pwm
-        self.pwm: PWM | None = None
-        self.averaging: AveragingActuator | None = None
-        if cfg.bridge.model == "averaging":
-            if modulator is not None:
-                raise ValueError(f"{name}: an averaging bridge does not use a PWM modulator")
-            self.averaging = AveragingActuator(
-                T_c, pwm.load_period, pwm.grid_offset, cfg.ctrl.computation)
-            self.timer = self.averaging
-            self.actuator_prefix = "averaging"
-        else:
-            self.pwm = PWM(
-                T_c, pwm.load_period, pwm.grid_offset, cfg.ctrl.computation, pwm.switching_period,
-                modulator if modulator is not None else make_modulator(pwm, cfg.base.f0, cfg.bridge),
-            )
-            self.timer = self.pwm
-            self.actuator_prefix = "pwm"
         self.zoh = f"{name}.q"                   # model label of the bridge's held switching state
 
     # ---------------------------------------------------------------- assembly
@@ -116,7 +101,7 @@ class Unit:
     def state_parts(self) -> list[tuple[str, Any]]:
         """Return this unit's fixed state owners and their public prefixes."""
         parts = [(self.name, self), (f"{self.name}.ctrl", self.ctrl),
-                 (f"{self.name}.{self.actuator_prefix}", self.timer)]
+                 (f"{self.name}.{self.bridge.state_prefix}", self.bridge.state_owner)]
         if self.adc.averaging:
             parts.append((f"{self.name}.meas", self.adc))
         return parts

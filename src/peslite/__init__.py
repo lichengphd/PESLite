@@ -9,7 +9,7 @@ SI; controllers work in each unit's pu bases.
 from . import solver, control, components, assembly
 from .solver import (AdaptiveSolver, DormandPrince45, FixedStepSolver, Model, MultirateSolver, make_solver)
 from .control import OutputStage, UniteType, make_controller, register_loop_type
-from .components import (ADC, PWM, ZOH, AveragingActuator, CarrierComparison, MeasurementPorts,
+from .components import (ADC, PWM, ZOH, AveragingBridge, CarrierComparison, MeasurementPorts,
                          make_modulator, register_element_type)
 from .assembly import (Params, SourceScenario, System, Unit, UnitScenario, dump, dumps, load,
                        register_event_type)
@@ -22,6 +22,6 @@ __all__ = [
     "Params", "load", "dump", "dumps", "System", "Unit", "MeasurementPorts", "Model", "SourceScenario", "UnitScenario",
     "Simulation", "SimulationResult", "UniteType", "main", "make_controller", "make_modulator", "make_solver",
     "register_loop_type", "register_element_type", "register_event_type",
-    "OutputStage", "ADC", "PWM", "AveragingActuator", "CarrierComparison", "ZOH",
+    "OutputStage", "ADC", "PWM", "AveragingBridge", "CarrierComparison", "ZOH",
     "FixedStepSolver", "AdaptiveSolver", "DormandPrince45", "MultirateSolver", "__version__",
 ]

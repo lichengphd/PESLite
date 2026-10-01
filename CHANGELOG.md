@@ -41,7 +41,8 @@
   voltage source with no PWM peripheral. Each controller output is delayed to the centre of the
   first equivalent PWM update interval available after `ctrl.computation`; this gives `1.5 Ts`
   with the defaults and follows `pwm.update`, carrier timing and computation parameters otherwise.
-  The initial output fills the delay history automatically, and `<unit>.averaging.*` states make
+  The bridge keeps the same AC/DC/modulation connections in every model. The initial output fills
+  the delay history automatically, and `<unit>.bridge.*` states make
   continuation from any saved output row exact. `--averaging` uses the `-averaging` result suffix
   and is mutually exclusive with `--pwm-averaging`.
 
