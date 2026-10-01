@@ -31,13 +31,13 @@ class _Recorder:
         return getattr(self._inner, name)
 
 
-def _record(p):
+def _record(p, out):
     sim = peslite.Simulation(p)
     unit = sim.unit("vsc")
     interrupts, loads = [], []
     unit.ctrl = _Recorder(unit.ctrl, interrupts, "ctrl")
     unit.pwm.modulator = _Recorder(unit.pwm.modulator, loads, "mod")
-    result = sim.run()
+    result = sim.run(out_dir=out)
     return result, interrupts, loads[1:]  # first call resumes the registers present at the start
 
 
@@ -82,8 +82,8 @@ def test_timing_configuration_is_checked(gfl, over, message):
         gfl(**over)
 
 
-def test_single_update_applies_a_duty_one_carrier_period_after_its_sample(gfl):
-    _result, interrupts, loads = _record(gfl())
+def test_single_update_applies_a_duty_one_carrier_period_after_its_sample(gfl, tmp_path):
+    _result, interrupts, loads = _record(gfl(), tmp_path)
     assert all(t / T == pytest.approx(round(t / T)) and period == pytest.approx(T)
                for t, period, _duty in loads)
     lags = _lags(interrupts, loads)
@@ -91,35 +91,35 @@ def test_single_update_applies_a_duty_one_carrier_period_after_its_sample(gfl):
     assert np.allclose(lags, T)
 
 
-def test_zero_computation_is_an_ideal_controller(gfl):
-    _result, interrupts, loads = _record(gfl(**{"units.vsc.ctrl.computation": 0.0}))
+def test_zero_computation_is_an_ideal_controller(gfl, tmp_path):
+    _result, interrupts, loads = _record(gfl(**{"units.vsc.ctrl.computation": 0.0}), tmp_path)
     assert np.allclose(_lags(interrupts, loads), 0.0)
 
 
-def test_twice_per_carrier_control_loads_the_previous_peak_duty_at_a_valley(gfl):
+def test_twice_per_carrier_control_loads_the_previous_peak_duty_at_a_valley(gfl, tmp_path):
     """The valley load consumes the prior peak interrupt's shadow before the valley overwrites it."""
-    _result, interrupts, loads = _record(gfl(**{"units.vsc.ctrl.period": T / 2}))
+    _result, interrupts, loads = _record(gfl(**{"units.vsc.ctrl.period": T / 2}), tmp_path)
     lags = _lags(interrupts, loads)
     assert len(interrupts) == pytest.approx(2 * len(loads), abs=2)
     assert np.allclose(lags, T / 2)
 
 
 @pytest.mark.parametrize("computation, lag", [(1e-6, T / 2), (2.5e-5, T / 2), (3e-5, T)])
-def test_double_update_uses_the_first_load_after_computation(gfl, computation, lag):
+def test_double_update_uses_the_first_load_after_computation(gfl, computation, lag, tmp_path):
     _result, interrupts, loads = _record(gfl(**{
         "units.vsc.pwm.update": "double",
         "units.vsc.ctrl.computation": computation,
-    }))
+    }), tmp_path)
     assert all(period == pytest.approx(T / 2) for _t, period, _duty in loads)
     assert np.allclose(_lags(interrupts, loads), lag)
 
 
-def test_timing_follows_an_asynchronous_carrier_phase(gfl):
+def test_timing_follows_an_asynchronous_carrier_phase(gfl, tmp_path):
     phase = 0.3
     _result, interrupts, loads = _record(gfl(**{
         "units.vsc.pwm.carrier_phase": phase,
         "units.vsc.averaging.enable": 0,
-    }))
+    }), tmp_path)
     assert interrupts[0][0] == pytest.approx((1.0 - phase) * T)
     assert all(carrier_position(t, 1 / T, phase) == 0.0 for t, _period, _duty in loads)
     assert np.allclose(_lags(interrupts, loads), T)
@@ -198,15 +198,15 @@ def test_duty_registers_are_states_and_loop_clocks_are_not(gfl):
 ])
 def test_a_run_continues_exactly_from_any_output_row(gfl, tmp_path, over, t0):
     params = gfl(**{"simulation.t_end": 0.004, "simulation.output.period": 5e-6, **over})
-    whole = peslite.Simulation(params).run()
-    whole.save(tmp_path)
+    whole_dir = tmp_path / "whole"
+    whole = peslite.Simulation(params).run(out_dir=whole_dir)
 
     restarted = peslite.load(
-        tmp_path / "simulation.pes",
-        initial=tmp_path / "states.csv",
+        whole_dir / "simulation.pes",
+        initial=whole_dir / "states.csv",
         initial_time=t0,
     )
-    continued = peslite.Simulation(restarted).run()
+    continued = peslite.Simulation(restarted).run(out_dir=tmp_path / "continued")
 
     k0 = int(np.argmin(abs(whole.t - t0)))
     assert whole.t[k0] == pytest.approx(t0)
@@ -215,13 +215,13 @@ def test_a_run_continues_exactly_from_any_output_row(gfl, tmp_path, over, t0):
         assert np.array_equal(values, whole.states[name][k0:]), name
 
 
-def test_initial_and_end_times_are_not_moved_to_a_pwm_grid(gfl):
+def test_initial_and_end_times_are_not_moved_to_a_pwm_grid(gfl, tmp_path):
     t0, t1 = 3.0e-6, 123.0e-6
     result = peslite.Simulation(gfl(**{
         "simulation.initial.t": t0,
         "simulation.t_end": t1,
         "simulation.output.period": 10e-6,
-    })).run()
+    })).run(out_dir=tmp_path)
     assert result.summary["t_start"] == t0
     assert result.summary["t_stop"] == t1
     assert result.states["t"][-1] == t1
@@ -235,10 +235,12 @@ def test_an_oversampled_continuation_starts_at_an_interrupt(gfl):
         gfl(**over, **state, **{"simulation.initial.t": 1.25e-4})
 
 
-def test_a_window_open_before_a_new_run_uses_the_start_values(gfl):
-    over = {"units.vsc.meas.average": "window", "units.vsc.meas.u_dc": "window"}
-    shifted = peslite.Simulation(gfl(**over, **{"units.vsc.pwm.carrier_phase": 0.3})).run()
-    plain = peslite.Simulation(gfl(**over)).run()
+def test_a_window_open_before_a_new_run_uses_the_start_values(gfl, tmp_path):
+    over = {"units.vsc.meas.average": "window", "units.vsc.meas.u_dc": "window",
+            "simulation.output.signals": 1}
+    shifted = peslite.Simulation(gfl(**over, **{"units.vsc.pwm.carrier_phase": 0.3})).run(
+        out_dir=tmp_path / "shifted")
+    plain = peslite.Simulation(gfl(**over)).run(out_dir=tmp_path / "plain")
     for result in (shifted, plain):
-        assert result.control["vsc.vdc_pu"][0] == pytest.approx(1.0, abs=0.01)
-        assert result.control["vsc.vac_pu"][0] == pytest.approx(1.0, abs=0.02)
+        assert result.ctrl["vsc.vdc_pu"][0] == pytest.approx(1.0, abs=0.01)
+        assert result.ctrl["vsc.vac_pu"][0] == pytest.approx(1.0, abs=0.02)

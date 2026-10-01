@@ -135,7 +135,7 @@ class ControlGraph:
         for name, loop in cfg.ctrl.loops.items():
             cls = LOOP_TYPES.get(loop.type)
             if cls is None:
-                raise ConfigError(f"control.loops.{name}: no loop type {loop.type!r} is registered")
+                raise ConfigError(f"ctrl.loops.{name}: no loop type {loop.type!r} is registered")
             self.nodes[name] = node = cls(loop, cfg, scenario)
             self._out_specs[name] = tuple((port, f"{name}.{port}", spec.complex_value)
                                           for port, spec in node.outputs.items())
@@ -150,27 +150,27 @@ class ControlGraph:
                 targets.add(target)
                 source = self.connections.get(target)
                 if source not in types:
-                    raise ConfigError(f"control.connections.{target}: missing or unknown source {source!r}")
+                    raise ConfigError(f"ctrl.connections.{target}: missing or unknown source {source!r}")
                 if types[source] != spec:
-                    raise ConfigError(f"control.connections.{target}: incompatible signal {source!r}: "
+                    raise ConfigError(f"ctrl.connections.{target}: incompatible signal {source!r}: "
                                       f"{types[source]} -> {spec}")
                 owner = source.partition(".")[0]
                 if owner in self.nodes and port not in node.delayed:
                     dependencies[name].add(owner)
         if set(self.connections) - targets:
-            raise ConfigError(f"control.connections: unknown input ports {sorted(set(self.connections) - targets)}")
+            raise ConfigError(f"ctrl.connections: unknown input ports {sorted(set(self.connections) - targets)}")
         for port, spec in {"u_dq": V_DQ, "theta": ANGLE, "omega": FREQUENCY}.items():
             source = self.outputs.get(port)
             if source not in types or types[source] != spec:
-                raise ConfigError(f"control.outputs.{port}: missing or incompatible source {source!r}")
+                raise ConfigError(f"ctrl.outputs.{port}: missing or incompatible source {source!r}")
         if set(self.outputs) - {"u_dq", "theta", "omega"}:
-            raise ConfigError("control.outputs: only u_dq, theta and omega are supported")
+            raise ConfigError("ctrl.outputs: only u_dq, theta and omega are supported")
         self.order = []
         pending = dict(dependencies)
         while pending:
             ready = [n for n, deps in pending.items() if not deps]
             if not ready:
-                raise ConfigError("control.connections: instantaneous cycle; insert an explicit unit_delay")
+                raise ConfigError("ctrl.connections: instantaneous cycle; insert an explicit unit_delay")
             for name in ready:
                 self.order.append(name)
                 pending.pop(name)
@@ -499,6 +499,18 @@ class UniteType:
         if meas.u_dc_raw is not None and meas.u_dc_raw != meas.u_dc:
             out["vdc_raw_pu"] = meas.u_dc_raw / self.v_dc_base
         return out
+
+    def log_names(self) -> tuple[str, ...]:
+        """Return the fixed controller-log schema before the first interrupt."""
+        names = ["id_pu", "iq_pu", "vd_pu", "vq_pu", "vac_pu", "vdc_pu",
+                 "m_max", "in_service"]
+        if self.p.meas.average == "window":
+            names += ["vd_raw_pu", "vq_raw_pu", "id_raw_pu", "iq_raw_pu"]
+        if self.p.meas.u_dc == "window":
+            names.append("vdc_raw_pu")
+        names += (["id_ref_pu", "freq_dev", "angle_rel"] if self._is_gfl else
+                  ["p_pu", "q_pu", "p_ref_pu", "v_ref_pu", "freq_dev", "angle_rel"])
+        return tuple(names)
 
     def update(self, t, meas):
         """Run the loops due at the control interrupt ``t``, on the SI sample ``meas``."""

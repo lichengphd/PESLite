@@ -71,14 +71,14 @@ From Python (in this folder, or anywhere after `pip install -e .`):
 import peslite
 
 p = peslite.load("case.pes", **{"simulation.t_end": 1.0})
-r = peslite.Simulation(p).run()
+r = peslite.Simulation(p).run()     # streams directly to output/run
 
 r.states["vsc.dclink.u_C"]         # a state over time
-r.plant["vsc.i_c"]                 # plant signals (complex space vectors)
-r.control["vsc.id_pu"]             # controller log of unit "vsc"
+r.plant["vsc.i_conv_a"]            # a plant signal in the final CSV schema
+r.ctrl["vsc.id_pu"]                # controller log of unit "vsc"
 r.final_states()                   # last row, usable as an initial state
 r.summary                          # trips, alarms, peaks
-r.save("output/run")               # states.csv, summary.json, simulation.pes
+r.files                            # files already written by run()
 ```
 
 ## Simulation files and events
@@ -175,7 +175,7 @@ and PWM loads.
 | File | Content |
 |---|---|
 | `states.csv` | every state at each snapshot; any row can start a new run |
-| `plant.csv`, `control.<unit>.csv` | plant signals and controller logs (`simulation.output.signals: 1`) |
+| `plant.csv`, `ctrl.<unit>.csv` | plant signals and controller logs (`simulation.output.signals: 1`) |
 | `energy.csv` | stored energy and power balance (`simulation.output.energy: 1`) |
 | `summary.json` | run summary |
 | `simulation.pes` | complete resolved simulation file; loading it repeats the run |
@@ -187,9 +187,11 @@ averaging-window accumulators. An oversampled ADC's intermediate samples are not
 run must be continued from a control interrupt.
 With `simulation.output.states: 0`, no `states.csv` is written and only the terminal state is
 collected internally, so `final_states()` remains available without serialising every snapshot.
-Numeric histories are compacted into NumPy blocks in batches of 100 output rows rather than kept as
-individual Python objects. With `simulation.output.energy: 0`, energy checks still update the
-summary but their full time history is not retained.
+All enabled histories are streamed directly to their final CSV files in bounded batches; a run
+never accumulates the complete history in RAM. Python result columns are read from those final
+files only when requested and are not part of the write path.
+With `simulation.output.energy: 0`, energy checks still update the summary but their full time
+history is not retained.
 
 Output names use the same unit convention as input parameters: an SI value has no unit suffix,
 while a per-unit value ends in `_pu`. Runtime state paths are entity-first: physical states are

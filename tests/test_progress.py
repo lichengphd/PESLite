@@ -42,7 +42,7 @@ def test_watch_prints_quantities_on_each_progress_line(tmp_path):
     assert progress.watch == ["vsc.vdc_pu", "vsc.i_c", "vsc.u_dc"]
 
 
-def test_watch_values_match_result_columns_and_states(gfl, monkeypatch):
+def test_watch_values_match_result_columns_and_states(gfl, monkeypatch, tmp_path):
     params = gfl(**{
         "simulation.output.signals": 1,
         "simulation.output.period": 1e-3,
@@ -59,7 +59,7 @@ def test_watch_values_match_result_columns_and_states(gfl, monkeypatch):
         lambda self, t, logs: seen.setdefault(t, values_at(self, t, logs)),
     )
     with redirect_stdout(io.StringIO()):
-        result = peslite.Simulation(params).run()
+        result = peslite.Simulation(params).run(out_dir=tmp_path)
     t, values = min(seen.items())
     index = int(np.argmin(abs(result.t - t)))
     assert result.t[index] == pytest.approx(t)
@@ -73,38 +73,38 @@ def test_watch_values_match_result_columns_and_states(gfl, monkeypatch):
     assert values["vsc.u_dc"] == result.plant["vsc.u_dc"][index]
 
 
-def test_watch_uses_entity_first_state_names(gfl):
+def test_watch_uses_entity_first_state_names(gfl, tmp_path):
     params = gfl(**{"simulation.progress.enable": 1,
                     "simulation.progress.period": 1e-3})
     simulation = peslite.Simulation(params)
     with redirect_stdout(io.StringIO()):
-        simulation.run()
+        simulation.run(out_dir=tmp_path)
     values = simulation.watch_values(0.002, {})
     assert "vsc.i_c" in values
     assert "vsc.dclink.u_C" in values
     assert not any(name.startswith("plant.") for name in values)
 
 
-def test_watching_does_not_change_the_run(gfl):
+def test_watching_does_not_change_the_run(gfl, tmp_path):
     base = gfl(**{"simulation.progress.enable": 1,
                   "simulation.progress.period": 1e-3})
     with redirect_stdout(io.StringIO()):
-        first = peslite.Simulation(base).run()
+        first = peslite.Simulation(base).run(out_dir=tmp_path / "plain")
         second = peslite.Simulation(base.replace(**{
             "simulation.progress.watch": ["vsc.vdc_pu", "pcc.u_C"]
-        })).run()
+        })).run(out_dir=tmp_path / "watched")
     for name in first.states:
         assert np.array_equal(first.states[name], second.states[name], equal_nan=True), name
 
 
-def test_watch_needs_progress_lines(gfl, capsys):
+def test_watch_needs_progress_lines(gfl, capsys, tmp_path):
     with pytest.raises(SystemExit):
         peslite.main(["gfl-example", "--watch", "vsc.vdc_pu"])
     assert "add --progress SECONDS" in capsys.readouterr().err
 
     params = gfl(**{"simulation.progress.watch": ["vsc.vdc_pu"]})
     with redirect_stdout(io.StringIO()) as output:
-        peslite.Simulation(params).run()
+        peslite.Simulation(params).run(out_dir=tmp_path)
     assert output.getvalue() == ""
 
     with pytest.raises(ConfigError, match="expected a list of quantity names"):
@@ -113,7 +113,7 @@ def test_watch_needs_progress_lines(gfl, capsys):
                "simulation.progress.watch": "vsc.vdc_pu"})
 
 
-def test_unknown_watched_name_reports_known_names(gfl):
+def test_unknown_watched_name_reports_known_names(gfl, tmp_path):
     params = gfl(**{
         "simulation.progress.enable": 1,
         "simulation.progress.period": 1e-3,
@@ -122,4 +122,4 @@ def test_unknown_watched_name_reports_known_names(gfl):
     message = r"unknown name\(s\) \['vsc.vdc'\]; known: .*'vsc.vdc_pu'"
     with pytest.raises(ConfigError, match=message):
         with redirect_stdout(io.StringIO()):
-            peslite.Simulation(params).run()
+            peslite.Simulation(params).run(out_dir=tmp_path)

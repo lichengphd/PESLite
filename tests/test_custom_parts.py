@@ -133,7 +133,7 @@ def _custom_case(case):
             "power": {"type": "power", "period": 5e-5},
             "sync": {"type": "test_lagged_psc", "period": 5e-5,
                      "k_p_pu": 6.2832, "tau": 0.02},
-            "impedance": {"type": "virtual_impedance"},
+            "vi": {"type": "virtual_impedance"},
             "damp": {"type": "active_damping", "period": 5e-5,
                      "r_a_pu": 0.2, "alpha_d": 40.0},
         },
@@ -150,13 +150,13 @@ def _custom_case(case):
     return tree
 
 
-def test_registered_custom_parts_and_user_solver_work_together(case):
+def test_registered_custom_parts_and_user_solver_work_together(case, tmp_path):
     params = from_dict(_custom_case(case))
     solver = _Midpoint(params.simulation.solver.dt)
     simulation = peslite.Simulation(params, solver=solver)
     load = simulation.system.named_elements["load"].branch
     original_resistance = load.R
-    result = simulation.run()
+    result = simulation.run(out_dir=tmp_path)
 
     assert "vsc.ctrl.sync.p_f_pu" in result.states
     assert load.R == pytest.approx(0.5 * original_resistance)

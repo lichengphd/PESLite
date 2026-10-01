@@ -16,9 +16,9 @@ SOLVER = Path(peslite.solver.__file__).parent
 
 
 @pytest.mark.parametrize("path", sorted(EXAMPLES.glob("*-example.pes")), ids=lambda p: p.stem)
-def test_every_bundled_example_runs_with_the_solver(path):
+def test_every_bundled_example_runs_with_the_solver(path, tmp_path):
     sim = peslite.Simulation(peslite.load(path, **QUIET, **{"simulation.t_end": 0.002}))
-    result = sim.run()
+    result = sim.run(out_dir=tmp_path / path.stem)
     assert sim.ph_report.verdict == "port-hamiltonian"
     assert result.summary["t_stop"] == pytest.approx(0.002)
     assert not result.tripped
@@ -40,14 +40,14 @@ def test_make_solver_builds_the_configured_integrator():
 
 
 def test_a_run_continues_exactly_from_a_saved_state(tmp_path):
-    def run(t_end, **changes):
+    def run(t_end, out, **changes):
         params = peslite.load(EXAMPLES / "gfl-example.pes", **QUIET, **FAST,
                               **{"simulation.t_end": t_end}, **changes)
-        return peslite.Simulation(params).run()
+        return peslite.Simulation(params).run(out_dir=out)
 
-    whole = run(0.004)
-    run(0.002).save(tmp_path)
-    continued = run(0.004, initial=tmp_path / "states.csv")
+    whole = run(0.004, tmp_path / "whole")
+    run(0.002, tmp_path / "first")
+    continued = run(0.004, tmp_path / "continued", initial=tmp_path / "first" / "states.csv")
     assert continued.final_states() == whole.final_states()
 
 

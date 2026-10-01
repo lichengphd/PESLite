@@ -22,7 +22,7 @@ units:
       loops:
         power: {type: power}
         sync: {type: matching, k_q_pu: 0.05}
-        impedance: {type: virtual_impedance}
+        vi: {type: virtual_impedance}
     protection: {overcurrent: {enable: 1, limit_pu: 1.5}}
 events:
   connect_vsc: {type: connect, target: vsc, t: 0.2, ramp: 1.0}
@@ -30,4 +30,4 @@ events:
 simulation:
   t_end: 6.0
   solver: {dt: 12.5e-6}
-  output: {control_every: 10}
+  output: {ctrl_every: 10}

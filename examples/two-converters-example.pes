@@ -26,7 +26,7 @@ units:
       loops:
         power: {type: power}
         sync: {type: psc, k_p_pu: 6.2832, k_vi: 20.0}
-        impedance: {type: virtual_impedance}
+        vi: {type: virtual_impedance}
         damp: {type: active_damping, r_a_pu: 0.2, alpha_d: 40.0}
       references: {p_ref_pu: 0.5}
     protection: {overcurrent: {enable: 1, limit_pu: 1.5}}
@@ -59,4 +59,4 @@ simulation:
   t_end: 1.0
   solver: {dt: 12.5e-6}
   stop_on_trip: 0
-  output: {control_every: 10}
+  output: {ctrl_every: 10}

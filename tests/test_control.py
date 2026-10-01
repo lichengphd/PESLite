@@ -35,7 +35,7 @@ class _FixedFrequency(SyncLaw):
         self.v_mag = v_ref_pu
 
 
-def test_registered_loop_owns_its_schema_and_uses_default_role_wiring():
+def test_registered_loop_owns_its_schema_and_uses_default_role_wiring(tmp_path):
     p = peslite.load(
         EXAMPLES / "gfm-psc-example.pes",
         **QUIET,
@@ -51,8 +51,8 @@ def test_registered_loop_owns_its_schema_and_uses_default_role_wiring():
     sim = peslite.Simulation(p)
     ctrl = sim.unit().ctrl
     assert type(p.unit().ctrl.loops["sync"]) is _FixedFrequency.Params
-    assert ctrl.graph.connections["impedance.v_ref"] == "sync.v_ref"
-    result = sim.run()
+    assert ctrl.graph.connections["vi.v_ref"] == "sync.v_ref"
+    result = sim.run(out_dir=tmp_path)
     assert result.summary["vsc.law"] == "test_fixed_frequency"
     assert result.states["vsc.ctrl.sync.theta"][-1] == pytest.approx(
         2 * np.pi * 50.0 * 0.01, rel=1e-9

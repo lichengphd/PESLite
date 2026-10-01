@@ -70,7 +70,7 @@ class _PassiveShunt(Element):
         return self.branch, "i", -1.0
 
 
-def test_builtin_load_is_typed_scaled_built_and_written():
+def test_builtin_load_is_typed_scaled_built_and_written(tmp_path):
     p = from_dict(_load(_tree()))
     cfg = p.elements["load"]
     assert (cfg.r, cfg.l) == pytest.approx(
@@ -90,7 +90,7 @@ def test_builtin_load_is_typed_scaled_built_and_written():
         "simulation.t_end": 2e-4,
         "simulation.energy_check": "off",
     })
-    result = peslite.Simulation(quick).run()
+    result = peslite.Simulation(quick).run(out_dir=tmp_path)
     assert "load.branch.i.re" in result.states
 
 

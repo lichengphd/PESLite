@@ -16,12 +16,13 @@
   states.
 - Each averaged ADC channel keeps one window accumulator (`<unit>.meas.x_*`); the redundant
   absolute integral and window-opening copy (`x_*_open`) are removed.
-- With `simulation.output.states: 0`, only the terminal state row is collected instead of building
-  and discarding a full row at every snapshot. State CSV arrays are streamed directly when enabled,
-  without first duplicating the complete table as Python lists.
-- Numeric histories are compacted into NumPy blocks every 100 output rows instead of retaining
-  individual Python objects. Disabled energy output keeps the energy summary checks but no longer
-  retains the full energy history.
+- All enabled result histories are streamed directly to their final CSV files in batches of 1000
+  rows instead of accumulating in RAM. `simulation.solver.write_length` changes that batch size;
+  Python result columns read those final files on demand and are not part of the write path.
+- With `simulation.output.states: 0`, only the terminal state row is retained for
+  `final_states()`. Disabled energy output keeps the energy summary checks but no energy history.
+- Controller logs consistently use the abbreviation: `r.ctrl`, `ctrl.<unit>.csv` and
+  `simulation.output.ctrl_every`; the old full-word interfaces are removed.
 
 ### Per-unit bridge models (#3)
 
@@ -178,7 +179,7 @@
 ### Simulation file parameters (#2)
 
 - `initial` and `output` are inside `simulation`; the former `simulation.log` fields are now
-  `simulation.output.period` and `simulation.output.control_every`.
+  `simulation.output.period` and `simulation.output.ctrl_every`.
 - Parameter names follow the SI/pu convention (no suffix for SI and `_pu` for per unit).
   `measurement.window_s`, current-loop `bw_hz`, VSG `h_s` and dVOC `kappa_rad` are now
   `window`, `bandwidth`, `h` and `kappa`.

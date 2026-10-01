@@ -60,13 +60,13 @@ def test_log_and_old_parameter_names_are_rejected():
         from_dict(tree)
 
 
-def test_function_first_state_names_are_rejected():
+def test_function_first_state_names_are_rejected(tmp_path):
     params = peslite.load(
         EXAMPLES / "gfl-example.pes",
         **{"simulation.initial.states.plant.pcc.u_C": [500.0, 0.0]},
     )
     with pytest.raises(ConfigError, match=r"unknown state 'plant\.pcc\.u_C'"):
-        peslite.Simulation(params).run()
+        peslite.Simulation(params).run(out_dir=tmp_path)
 
 
 def test_nested_electrical_values_follow_si_and_pu_spelling():

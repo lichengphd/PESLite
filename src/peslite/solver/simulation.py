@@ -10,7 +10,6 @@ interrupts, PWM loads, window opening, switching instants, snapshot.
 from __future__ import annotations
 
 import argparse
-import csv
 import dataclasses
 import json
 import math
@@ -18,6 +17,7 @@ import sysconfig
 import time
 import warnings
 from collections import deque
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
@@ -49,277 +49,267 @@ def _finite(y: np.ndarray) -> bool:
     return all(map(math.isfinite, y.tolist()))
 
 
+def _plant_output_row(params: Params, t: float, plant: Mapping[str, Any],
+                      ctrl_logs: Mapping[str, Mapping[str, float]],
+                      ctrl_names: Mapping[str, Iterable[str]] | None = None) -> dict[str, float]:
+    """Convert one raw plant snapshot into one public, real-valued output row."""
+    row: dict[str, float] = {"t": t}
+    for key, value in plant.items():
+        head, _, what = key.rpartition(".")
+        if what in ("u_g", "i_c", "i", "u") and np.iscomplexobj(value):
+            stem = {"u_g": "v", "i_c": "i_conv", "i": "i", "u": "v"}[what]
+            for phase, phase_value in zip("abc", complex2abc(complex(value))):
+                row[f"{head}.{stem}_{phase}"] = float(phase_value)
+    for name in params.units:
+        for what in ("u_dc", "i_dc"):
+            key = f"{name}.{what}"
+            if key in plant:
+                row[key] = float(plant[key])
+    for name in params.sources:
+        key = f"{name}.angle"
+        if key in plant:
+            row[key] = float(plant[key])
+    names_by_unit = ctrl_names or {unit: log for unit, log in ctrl_logs.items()}
+    for unit, names in names_by_unit.items():
+        log = ctrl_logs.get(unit, {})
+        row.update({f"{unit}.{key}": float(log.get(key, math.nan)) for key in names})
+    return row
+
+
 # ------------------------------------------------------------------ what a run produces
 
 @dataclass
 class SimulationResult:
     params: Params
-    t: np.ndarray
-    plant: dict[str, np.ndarray]
-    control: dict[str, np.ndarray]
-    states: dict[str, np.ndarray] = field(default_factory=dict)
-    energy: dict[str, np.ndarray] = field(default_factory=dict)
+    _records: Any = field(repr=False)
+    out_dir: Path | None = None
+    files: list[Path] = field(default_factory=list)
     summary: dict[str, Any] = field(default_factory=dict)
     wall_time: float = 0.0
     n_rhs: int = 0
+
+    @property
+    def t(self) -> np.ndarray:
+        """Snapshot times, read from the streamed result when requested."""
+        return self._records.t
+
+    @property
+    def plant(self) -> Mapping[str, np.ndarray]:
+        """Plant output columns, read one at a time from ``plant.csv``."""
+        return self._records.plant
+
+    @property
+    def ctrl(self) -> Mapping[str, np.ndarray]:
+        """Controller logs, read one column at a time from the streamed result."""
+        return self._records.ctrl
+
+    @property
+    def states(self) -> Mapping[str, np.ndarray]:
+        """State columns, read one at a time from the streamed result."""
+        return self._records.states
+
+    @property
+    def energy(self) -> Mapping[str, np.ndarray]:
+        """Energy columns, read one at a time from the streamed result."""
+        return self._records.energy
 
     @property
     def tripped(self) -> bool:
         return bool(self.summary.get("tripped", 0))
 
     def columns(self) -> dict[str, np.ndarray]:
-        """Return flat real columns: plant quantities in SI and controller logs in pu.
-
-        Names: ``<bus>.v_a``, ``<unit>.i_conv_a``, ``<branch>.i_a``, ``<source>.i_a``, ``<source>.angle``,
-        ``<unit>.u_dc``/``<unit>.i_dc`` (V/A) and the controllers' logged signals.
-        """
-        cols: dict[str, np.ndarray] = {"t": self.t}
-        for key, vec in self.plant.items():
-            head, _, what = key.rpartition(".")
-            if what in ("u_g", "i_c", "i", "u") and len(vec) and np.iscomplexobj(vec):
-                stem = {"u_g": "v", "i_c": "i_conv", "i": "i", "u": "v"}[what]
-                abc = np.array([complex2abc(z) for z in vec])
-                for k, ph in enumerate("abc"):
-                    cols[f"{head}.{stem}_{ph}"] = abc[:, k]
-        for name in self.params.units:
-            if f"{name}.u_dc" in self.plant:
-                cols[f"{name}.u_dc"] = self.plant[f"{name}.u_dc"]
-            if f"{name}.i_dc" in self.plant:
-                cols[f"{name}.i_dc"] = self.plant[f"{name}.i_dc"]
-        for name in self.params.sources:
-            if f"{name}.angle" in self.plant:
-                cols[f"{name}.angle"] = self.plant[f"{name}.angle"]
-        for unit in self.params.units:
-            prefix = f"{unit}.ctrl."
-            for key, arr in self.plant.items():
-                if key.startswith(prefix):
-                    cols[f"{unit}.{key[len(prefix):]}"] = arr
-        return cols
-
-    def to_csv(self, path: str | Path) -> None:
-        _write(path, self.columns())
-
-    def control_to_csv(self, path: str | Path) -> None:
-        """Write one control-log CSV per unit, ``<path stem>.<unit>.csv``; return the paths."""
-        path = Path(path)
-        written = []
-        for name in self.params.units:
-            head = f"{name}."
-            cols = {"t": self.control[f"{name}.t"]} if f"{name}.t" in self.control else {}
-            cols.update({k[len(head):]: v for k, v in self.control.items()
-                         if k.startswith(head) and k != f"{name}.t"})
-            if len(cols) > 1:
-                out = path.with_name(f"{path.stem}.{name}{path.suffix}")
-                _write(out, cols)
-                written.append(out)
-        return written
+        """Return all real-valued columns of ``plant.csv``."""
+        return {"t": self.t, **{key: values for key, values in self.plant.items()}}
 
     # ------------------------------------------------------------ states
     def final_states(self) -> dict[str, float]:
         """Return the last row of the state table (``t`` included)."""
-        return {k: float(v[-1]) for k, v in self.states.items()}
-
-    def states_to_csv(self, path: str | Path) -> None:
-        """Write the state table at full precision, so a row read back reproduces the state exactly."""
-        keys = list(self.states)
-        with Path(path).open("w", newline="") as fh:
-            w = csv.writer(fh)
-            w.writerow(keys)
-            # Stream the arrays directly: converting every column with tolist() first duplicates
-            # the complete state table in memory immediately before it is written.
-            for row in zip(*(self.states[k] for k in keys)):
-                w.writerow([repr(float(v)) for v in row])
-
-    def energy_to_csv(self, path: str | Path) -> None:
-        keys = list(self.energy)
-        with Path(path).open("w", newline="") as fh:
-            w = csv.writer(fh)
-            w.writerow(keys)
-            for row in zip(*(self.energy[k] for k in keys)):
-                w.writerow([f"{v:.10g}" for v in row])
-
-    def save(self, out_dir: str | Path, info: dict[str, Any] | None = None) -> list[Path]:
-        """Write the configured output files into ``out_dir`` and return their paths.
-
-        info: extra entries for ``summary.json``.
-        """
-        out = Path(out_dir)
-        out.mkdir(parents=True, exist_ok=True)
-        written = []
-        output = self.params.simulation.output
-        if output.states:
-            self.states_to_csv(out / "states.csv")
-            written.append(out / "states.csv")
-        if output.signals:
-            self.to_csv(out / "plant.csv")
-            written += [out / "plant.csv"] + self.control_to_csv(out / "control.csv")
-        if output.energy and self.energy:
-            self.energy_to_csv(out / "energy.csv")
-            written.append(out / "energy.csv")
-        summary = {**(info or {}), "wall_time": self.wall_time, "n_rhs": self.n_rhs, **self.summary}
-        (out / "summary.json").write_text(json.dumps(summary, indent=2, default=float), encoding="utf-8")
-        dump(self.params, out / "simulation.pes")
-        written += [out / "summary.json", out / "simulation.pes"]
-        return written
-
-def _write(path: str | Path, cols: dict) -> None:
-    keys = list(cols)
-    with Path(path).open("w", newline="") as fh:
-        w = csv.writer(fh)
-        w.writerow(keys)
-        for row in zip(*(cols[k] for k in keys)):
-            w.writerow([f"{v:.10g}" for v in row])
+        return dict(self._records.final_states)
 
 
-class _NumericSeries:
-    """Append numeric values cheaply and compact each small batch into a NumPy array."""
 
-    def __init__(self, block_values: int = 100) -> None:
-        self.block_values = block_values
-        self._blocks: list[np.ndarray] = []
-        self._pending: list[Any] = []
-        self._size = 0
-        self._array: np.ndarray | None = None
+class _CSVTable:
+    """A fixed-width numeric table flushed to CSV every ``batch_rows`` rows."""
+
+    def __init__(self, path: Path, batch_rows: int = 1000) -> None:
+        self.path = path
+        self.batch_rows = batch_rows
+        self.keys: list[str] | None = None
+        self.n_rows = 0
+        self._pending: list[list[float]] = []
+        self._fh: Any = None
+
+    def append(self, row: Mapping[str, float]) -> None:
+        if self.keys is None:
+            self.keys = list(row)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._fh = self.path.open("w", newline="")
+            self._fh.write(",".join(self.keys) + "\n")
+        elif list(row) != self.keys:
+            raise RuntimeError("the set of recorded columns changed during the run")
+        self._pending.append(list(row.values()))
+        self.n_rows += 1
+        if len(self._pending) == self.batch_rows:
+            self.flush()
+
+    def flush(self) -> None:
+        if self._pending:
+            np.savetxt(self._fh, np.asarray(self._pending), delimiter=",", fmt="%.17g")
+            self._pending.clear()
+
+    def close(self) -> None:
+        self.flush()
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+    def column(self, key: str) -> np.ndarray:
+        if self.keys is None or key not in self.keys:
+            raise KeyError(key)
+        return np.loadtxt(self.path, delimiter=",", skiprows=1, usecols=self.keys.index(key),
+                          dtype=float, ndmin=1)
+
+
+@dataclass(frozen=True)
+class _ColumnRef:
+    table: _CSVTable
+    key: str
+
+    def read(self) -> np.ndarray:
+        return self.table.column(self.key)
+
+
+class _CSVColumns(Mapping[str, np.ndarray]):
+    """Dictionary-like CSV columns; each requested column is read and then released by its caller."""
+
+    def __init__(self, refs: Mapping[str, _ColumnRef] | None = None) -> None:
+        self._refs = dict(refs or {})
+
+    def __getitem__(self, key: str) -> np.ndarray:
+        try:
+            return self._refs[key].read()
+        except KeyError:
+            raise KeyError(key) from None
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._refs)
 
     def __len__(self) -> int:
-        return self._size
+        return len(self._refs)
+
+
+@dataclass
+class _RecordedOutput:
+    plant_table: _CSVTable | None
+    ctrl_tables: dict[str, _CSVTable]
+    states_table: _CSVTable | None
+    energy_table: _CSVTable | None
+    final_states: dict[str, float]
+    t_stop: float
+
+    def __post_init__(self) -> None:
+        self._t = None
+        for table in (self.plant_table, self.states_table, self.energy_table):
+            if table is not None and table.n_rows:
+                self._t = _ColumnRef(table, "t")
+                break
+        self.plant = _CSVColumns({key: _ColumnRef(self.plant_table, key)
+                                  for key in (self.plant_table.keys or ()) if key != "t"}
+                                 if self.plant_table is not None else {})
+        ctrl: dict[str, _ColumnRef] = {}
+        for unit, table in self.ctrl_tables.items():
+            ctrl.update({f"{unit}.{key}": _ColumnRef(table, key)
+                         for key in (table.keys or ())})
+        self.ctrl = _CSVColumns(ctrl)
+        self.states = _CSVColumns({key: _ColumnRef(self.states_table, key)
+                                   for key in (self.states_table.keys or ())}
+                                  if self.states_table is not None else {})
+        self.energy = _CSVColumns({key: _ColumnRef(self.energy_table, key)
+                                   for key in (self.energy_table.keys or ())}
+                                  if self.energy_table is not None else {})
 
     @property
-    def last(self) -> Any:
-        if self._pending:
-            return self._pending[-1]
-        if self._blocks:
-            return self._blocks[-1][-1]
-        raise IndexError("last value of an empty series")
-
-    def append(self, value: Any) -> None:
-        if self._array is not None:
-            raise RuntimeError("cannot append after the recorded series has been finalised")
-        self._pending.append(value)
-        self._size += 1
-        if len(self._pending) == self.block_values:
-            self._flush()
-
-    def extend_constant(self, value: Any, count: int) -> None:
-        for _ in range(count):
-            self.append(value)
-
-    def _flush(self) -> None:
-        if self._pending:
-            self._blocks.append(np.asarray(self._pending))
-            self._pending.clear()
-
-    def array(self) -> np.ndarray:
-        if self._array is None:
-            self._flush()
-            if not self._blocks:
-                self._array = np.asarray([], dtype=float)
-            elif len(self._blocks) == 1:
-                self._array = self._blocks[0]
-            else:
-                self._array = np.concatenate(self._blocks)
-            self._blocks.clear()
-        return self._array
-
-
-class _NumericTable:
-    """Append a fixed set of float columns to NumPy blocks instead of Python float objects."""
-
-    def __init__(self, block_rows: int = 100) -> None:
-        self.keys: list[str] | None = None
-        self.block_rows = block_rows
-        self._blocks: list[np.ndarray] = []
-        self._pending: list[list[float]] = []
-        self._table: np.ndarray | None = None
-
-    def append(self, t: float, columns: Mapping[str, float]) -> None:
-        if self.keys is None:
-            self.keys = list(columns)
-        elif len(columns) != len(self.keys):
-            raise RuntimeError("the set of recorded columns changed during the run")
-        if self._table is not None:
-            raise RuntimeError("cannot append after the recorded table has been finalised")
-        self._pending.append([t, *columns.values()])
-        if len(self._pending) == self.block_rows:
-            self._flush()
-
-    def _flush(self) -> None:
-        if self._pending:
-            self._blocks.append(np.asarray(self._pending, dtype=float))
-            self._pending.clear()
-
-    def arrays(self) -> dict[str, np.ndarray]:
-        if self._table is None:
-            self._flush()
-            if not self._blocks:
-                self._table = np.empty((0, 0), dtype=float)
-            elif len(self._blocks) == 1:
-                self._table = self._blocks[0]
-            else:
-                self._table = np.concatenate(self._blocks, axis=0)
-            self._blocks.clear()
-        if self.keys is None:
-            return {}
-        return {name: self._table[:, index]
-                for index, name in enumerate(["t", *self.keys])}
+    def t(self) -> np.ndarray:
+        return self._t.read() if self._t is not None else np.asarray([self.t_stop], dtype=float)
 
 
 class Recorder:
-    """Collect snapshots; fixed-width state and energy rows use compact NumPy blocks."""
+    """Stream configured result tables directly to their final CSV files."""
 
-    def __init__(self, keep_states: bool = True, keep_energy: bool = True) -> None:
-        self.t = _NumericSeries()
-        self.plant: dict[str, _NumericSeries] = {}
-        self.ctrl_t: dict[str, _NumericSeries] = {}   # one time grid per unit
-        self.ctrl: dict[str, _NumericSeries] = {}
-        self.last_ctrl_log: dict[str, dict[str, float]] = {}
+    def __init__(self, params: Params, out_dir: Path | None,
+                 ctrl_names: Mapping[str, Iterable[str]] | None = None,
+                 keep_states: bool = True,
+                 keep_signals: bool = False, keep_energy: bool = True,
+                 batch_rows: int = 1000) -> None:
+        self.params = params
+        self.out_dir = out_dir
         self.keep_states = keep_states
+        self.keep_signals = keep_signals
         self.keep_energy = keep_energy
-        self._states = _NumericTable(block_rows=100 if keep_states else 1)
-        self._energy = _NumericTable()
+        self.last_ctrl_log: dict[str, dict[str, float]] = {}
+        self.ctrl_names = {unit: tuple(names) for unit, names in (ctrl_names or {}).items()}
+        self._batch_rows = batch_rows
+        if out_dir is not None:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            names = ["states.csv", "plant.csv", "energy.csv", "summary.json", "simulation.pes",
+                     *(f"ctrl.{unit}.csv" for unit in params.units)]
+            for name in names:
+                (out_dir / name).unlink(missing_ok=True)
+        self._plant = (_CSVTable(out_dir / "plant.csv", batch_rows)
+                       if keep_signals and out_dir is not None else None)
+        self._ctrl: dict[str, _CSVTable] = {}
+        self._states = (_CSVTable(out_dir / "states.csv", batch_rows)
+                        if keep_states and out_dir is not None else None)
+        self._energy = (_CSVTable(out_dir / "energy.csv", batch_rows)
+                        if keep_energy and out_dir is not None else None)
+        self._last_t: float | None = None
+        self._final_states: dict[str, float] = {}
+
+    @property
+    def last_t(self) -> float | None:
+        return self._last_t
 
     def energy_row(self, t: float, columns: dict[str, float]) -> None:
-        if self.keep_energy:
-            self._energy.append(t, columns)
+        if self._energy is not None:
+            self._energy.append({"t": t, **columns})
 
     def state_row(self, t: float, row: dict[str, float]) -> None:
-        self._states.append(t, row)
+        full = {"t": t, **row}
+        if self._states is not None:
+            self._states.append(full)
+        self._final_states = full
 
     def plant_snapshot(self, t: float, signals: dict[str, Any]) -> None:
-        n_before = len(self.t)
-        self.t.append(t)
-        for k, v in signals.items():
-            series = self.plant.get(k)
-            if series is None:
-                series = self.plant[k] = _NumericSeries()
-            series.append(v)
-        for unit, log in self.last_ctrl_log.items():
-            for k, v in log.items():
-                key = f"{unit}.ctrl.{k}"
-                if key not in self.plant:  # controller signal appearing after the first snapshots
-                    self.plant[key] = _NumericSeries()
-                    self.plant[key].extend_constant(math.nan, n_before)
-                self.plant[key].append(v)
+        if self._plant is not None:
+            self._plant.append(_plant_output_row(
+                self.params, t, signals, self.last_ctrl_log, self.ctrl_names))
+        self._last_t = t
 
-    def control_sample(self, unit: str, t: float, log: dict[str, float]) -> None:
-        """Record one controller's log at one of its sampling instants."""
-        times = self.ctrl_t.get(unit)
-        if times is None:
-            times = self.ctrl_t[unit] = _NumericSeries()
-        times.append(t)
-        for k, v in log.items():
-            key = f"{unit}.{k}"
-            series = self.ctrl.get(key)
-            if series is None:
-                series = self.ctrl[key] = _NumericSeries()
-            series.append(v)
+    def ctrl_sample(self, unit: str, t: float, log: dict[str, float]) -> None:
+        """Stream one controller's log at one of its sampling instants."""
+        if not self.keep_signals or self.out_dir is None:
+            return
+        names = self.ctrl_names.get(unit)
+        if not names:
+            names = self.ctrl_names[unit] = tuple(log)
+        if unit not in self._ctrl:
+            self._ctrl[unit] = _CSVTable(self.out_dir / f"ctrl.{unit}.csv", self._batch_rows)
+        self._ctrl[unit].append(
+            {"t": t, **{name: float(log.get(name, math.nan)) for name in names}})
 
-    def arrays(self) -> tuple[np.ndarray, dict[str, np.ndarray], dict[str, np.ndarray],
-                              dict[str, np.ndarray], dict[str, np.ndarray]]:
-        plant = {k: values.array() for k, values in self.plant.items()}
-        ctrl = {f"{unit}.t": times.array() for unit, times in self.ctrl_t.items()}
-        ctrl.update({k: values.array() for k, values in self.ctrl.items()})
-        return self.t.array(), plant, ctrl, self._states.arrays(), self._energy.arrays()
+    def finish(self) -> _RecordedOutput:
+        tables = [table for table in (self._plant, self._states, self._energy) if table is not None]
+        tables += list(self._ctrl.values())
+        for table in tables:
+            table.close()
+        return _RecordedOutput(
+            plant_table=self._plant,
+            ctrl_tables=self._ctrl,
+            states_table=self._states,
+            energy_table=self._energy,
+            final_states={key: float(value) for key, value in self._final_states.items()},
+            t_stop=self._last_t or 0.0,
+        )
 
 
 # ------------------------------------------------------------------ reading results back
@@ -542,11 +532,8 @@ class Simulation:
                 state[alias] = state[name]
         values = {key: abs(value) for key, value in state.items() if isinstance(value, complex)}
         values.update(flatten(state))
-        plant = {key: np.asarray([value]) for key, value in system.signals(t).items()}
-        plant.update({f"{unit}.ctrl.{key}": np.asarray([value])
-                      for unit, log in ctrl_logs.items() for key, value in log.items()})
-        row = SimulationResult(params=self.p, t=np.asarray([t]), plant=plant, control={}).columns()
-        values.update({key: float(value[0]) for key, value in row.items() if key != "t"})
+        row = _plant_output_row(self.p, t, system.signals(t), ctrl_logs)
+        values.update({key: value for key, value in row.items() if key != "t"})
         return values
 
     def state_names(self) -> list[str]:
@@ -611,7 +598,14 @@ class Simulation:
         return y
 
     # ------------------------------------------------------------ the loop
-    def run(self, t_end: float | None = None) -> SimulationResult:
+    def run(self, t_end: float | None = None, *, out_dir: str | Path | None = "output/run",
+            info: Mapping[str, Any] | None = None) -> SimulationResult:
+        """Run once, streaming configured histories directly into ``out_dir``.
+
+        The default directory is ``output/run``. ``None`` is reserved for internal runs that
+        disable every history. No complete numeric history is retained in memory; result columns
+        read the final CSV files on demand.
+        """
         if self.result is not None:
             raise RuntimeError("a Simulation runs once; build a new one for another run")
         p, system = self.p, self.system
@@ -621,12 +615,14 @@ class Simulation:
         t_end = p.simulation.t_end if t_end is None else t_end
         output = p.simulation.output
         log_period = output.period
-        control_every = max(1, output.control_every)
+        ctrl_every = max(1, output.ctrl_every)
         stop_on_trip = p.simulation.stop_on_trip
         progress = p.simulation.progress
         progress_every = progress.period if progress.enable else 0.0
         watch = list(progress.watch) if progress.enable else []
-        rec = Recorder(keep_states=output.states, keep_energy=output.energy)
+        output_dir = Path(out_dir) if out_dir is not None else None
+        if output_dir is None and (output.states or output.signals or output.energy):
+            raise ValueError("out_dir is required when a simulation output is enabled")
         wall0 = time.time()
 
         units = list(system.units.values())
@@ -652,6 +648,12 @@ class Simulation:
             unit.adc.start(t_start, pwm.interrupt(pwm.k - 1), pwm.t_interrupt,
                            held=unit.name not in self._windows_given)
             unit.adc.latest = unit.adc.measure(t_start)
+        ctrl_names = {
+            unit.name: getattr(unit.ctrl, "log_names", lambda: ())() for unit in units
+        }
+        rec = Recorder(p, output_dir, ctrl_names, keep_states=output.states,
+                       keep_signals=output.signals, keep_energy=output.energy,
+                       batch_rows=p.simulation.solver.write_length)
         n_log = max(0, math.ceil(t_start / log_period - 1e-9))
         actions = deque(action for action in self._actions() if action[0] > t_start + _EPS)
         next_report = t_start + progress_every if progress_every > 0 else math.inf
@@ -669,7 +671,8 @@ class Simulation:
             try:
                 with np.errstate(over="raise"):
                     mdl.sync(t_now, y)
-                    rec.plant_snapshot(t_now, system.signals(t_now))
+                    signals = system.signals(t_now) if rec.keep_signals else {}
+                    rec.plant_snapshot(t_now, signals)
                     if rec.keep_states or final:
                         rec.state_row(t_now, self._states.read_flat())
                     if energy_on and _finite(y):
@@ -749,8 +752,8 @@ class Simulation:
             out = unit.ctrl(t_k, unit.adc.sample(t_k))
             if out.log is not None:
                 rec.last_ctrl_log[unit.name] = out.log
-                if unit.pwm.k % control_every == 0:
-                    rec.control_sample(unit.name, t_k, out.log)
+                if unit.pwm.k % ctrl_every == 0:
+                    rec.ctrl_sample(unit.name, t_k, out.log)
             new_trip = out.tripped and not tripped[unit.name]
             if new_trip:
                 do_trip(unit)
@@ -885,18 +888,18 @@ class Simulation:
             for unit, out in shadow_writes:
                 unit.pwm.tick(t_local, out.theta, out.omega)
                 unit.pwm.write_shadow(out.d_abc)
-        if not rec.t or rec.t.last < t_local - _EPS:
+        if rec.last_t is None or rec.last_t < t_local - _EPS:
             snapshot(t_local, final=True)
         if stop_reason:
             warnings.warn(f"simulation stopped at t = {t_local:.6g} s: {stop_reason}", stacklevel=2)
-        t_arr, plant_arrays, ctrl_arrays, state_arrays, energy_arrays = rec.arrays()
+        records = rec.finish()
         summary: dict[str, Any] = {}
         for name, unit in system.units.items():
             if hasattr(unit.ctrl, "summary"):
                 summary.update({f"{name}.{k}": v for k, v in unit.ctrl.summary().items()})
         summary["tripped"] = int(any(tripped.values()))
         summary["t_start"] = t_start
-        summary["t_stop"] = float(t_arr[-1]) if len(t_arr) else t_start
+        summary["t_stop"] = rec.last_t if rec.last_t is not None else t_start
         if stop_reason:
             summary["stop_reason"] = stop_reason
         coarse = getattr(solver, "coarse_hold", None)
@@ -922,16 +925,29 @@ class Simulation:
                                               f"period to linearise: no bound")
                 else:
                     summary.update(split_error_bound(
-                        solver, loop, t_arr, state_arrays, p.simulation.solver.linearisations,
+                        solver, loop, records.t, records.states, p.simulation.solver.linearisations,
                         labels=mdl.state_labels(), prefix=""))
             else:  # parts given as instances
                 summary["split_bound"] = ("the loop has custom parts given as instances, so it cannot be "
                                           "rebuilt for the linearisation: pass them as factories of the "
                                           "parameter tree for a bound")
+        wall_time = time.time() - wall0
+        n_rhs = getattr(solver, "n_rhs", 0) - n_rhs0
+        files: list[Path] = []
+        if output_dir is not None:
+            for table in (records.states_table, records.plant_table, records.energy_table,
+                          *records.ctrl_tables.values()):
+                if table is not None and table.path.is_file():
+                    files.append(table.path)
+            payload = {**(info or {}), "wall_time": wall_time, "n_rhs": n_rhs, **summary}
+            summary_path = output_dir / "summary.json"
+            params_path = output_dir / "simulation.pes"
+            summary_path.write_text(json.dumps(payload, indent=2, default=float), encoding="utf-8")
+            dump(p, params_path)
+            files += [summary_path, params_path]
         self.result = SimulationResult(
-            params=p, t=t_arr, plant=plant_arrays, control=ctrl_arrays, states=state_arrays,
-            energy=energy_arrays, summary=summary, wall_time=time.time() - wall0,
-            n_rhs=getattr(solver, "n_rhs", 0) - n_rhs0)
+            params=p, _records=records, out_dir=output_dir, files=files, summary=summary,
+            wall_time=wall_time, n_rhs=n_rhs)
         return self.result
 
 
@@ -972,7 +988,7 @@ class SystemLoop:
                 sp, energy_check="off", stop_on_trip=False,
                 progress=dataclasses.replace(sp.progress, enable=False),
                                            output=dataclasses.replace(sp.output, period=self.period or 1.0,
-                                                                      states=True, energy=False, signals=False),
+                                                                      states=False, energy=False, signals=False),
                                            solver=dataclasses.replace(sp.solver, subsystems={},
                                                                       linearisations=0)))
 
@@ -1066,8 +1082,8 @@ class SystemLoop:
             else:  # what the end-of-period sample reads
                 sync0 = model.sync
                 model.sync = lambda tt, y: sync0(tt, y + vec if tt >= t_end - _LOOPMAP_EPS else y)  # type: ignore[method-assign]
-        res = sim.run()
-        out = {k: float(v[-1]) for k, v in res.states.items() if k != "t"}
+        res = sim.run(out_dir=None)
+        out = {k: v for k, v in res.final_states().items() if k != "t"}
         if view is not None and view[2] == "c":
             out[view[0]] -= view[1]
         return out
@@ -1212,7 +1228,8 @@ def main(argv=None) -> int:
     if sim.ph_report is not None:
         print(f"structure: {sim.ph_report.verdict} (state coverage {sim.ph_report.coverage:.0%}"
               f"{'; ' + '; '.join(sim.energy_problems) if sim.energy_problems else ''})")
-    r = sim.run()
+    out = Path(args.out) if args.out else _RESULTS / (f"{config.stem}-averaging" if averaged else config.stem)
+    r = sim.run(out_dir=out, info={"config": str(config)})
     s = r.summary
     print(f"done: wall {r.wall_time:.1f} s, rhs evaluations {r.n_rhs}, stop at {s.get('t_stop', 0):.4f} s, "
           f"tripped={bool(s.get('tripped'))}")
@@ -1229,9 +1246,7 @@ def main(argv=None) -> int:
     if "split_error_bound_rated" in s:
         print(f"split error, from the linearised closed loop: <= {s['split_error_bound_rated']:.2e} of rating "
               f"({s['split_bound']})")
-    out = Path(args.out) if args.out else _RESULTS / (f"{config.stem}-averaging" if averaged else config.stem)
-    written = r.save(out, info={"config": str(config)})
-    print("wrote", ", ".join(str(w) for w in written))
+    print("wrote", ", ".join(str(w) for w in r.files))
     final = r.final_states()
     if final:
         width = max(map(len, final))

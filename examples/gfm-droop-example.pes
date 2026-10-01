@@ -32,4 +32,4 @@ events:
 simulation:
   t_end: 6.0
   solver: {dt: 12.5e-6}
-  output: {control_every: 10}
+  output: {ctrl_every: 10}

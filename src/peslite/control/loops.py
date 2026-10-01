@@ -1,6 +1,6 @@
 """What each control loop computes: the loop types, their typed signals and their registry.
 
-A loop type is one class: its parameters (``Params``, the schema of its ``control.loops`` entry),
+A loop type is one class: its parameters (``Params``, the schema of its ``ctrl.loops`` entry),
 its typed input and output ports, its role in the default wiring, and its discrete-time update.
 How loops are connected is not theirs to know (:mod:`.controller`).
 Signals are pu; time s, angles rad, frequencies rad/s.
@@ -52,11 +52,11 @@ ROLES = ("pll", "sync", "current", "dc_voltage", "power", "impedance", "admittan
 class Loop:
     """A control loop: a discrete-time block with typed ports, built as ``cls(cfg, unit, scenario)``.
 
-    A loop type sets ``type`` (its name in ``control.loops``), ``Params`` (a frozen dataclass with
+    A loop type sets ``type`` (its name in ``ctrl.loops``), ``Params`` (a frozen dataclass with
     ``type`` and ``period`` fields; its ``_quantities`` name the fields given in SI or pu),
     ``inputs`` / ``outputs`` (port name -> :class:`SignalType`), ``delayed`` (inputs read after the
     update by ``latch(inputs)``, which break instantaneous cycles) and ``role`` (one of
-    :data:`ROLES`, or ``None``: wired only by ``control.connections``). With ``outputs_from_state``
+    :data:`ROLES`, or ``None``: wired only by ``ctrl.connections``). With ``outputs_from_state``
     its held outputs are set from its states (``initial_outputs()``) when states are loaded.
     It provides ``initial_outputs()`` and ``update(t, inputs) -> outputs``; its named states are the
     attributes in ``state_names`` unless it overrides ``get_state`` / ``set_state``. A loop rebuilt

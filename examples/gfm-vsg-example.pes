@@ -21,7 +21,7 @@ units:
       loops:
         power: {type: power}
         sync: {type: vsg, h: 2.0, d_p_pu: 20.0, k_q_pu: 0.05, t_q: 0.02}
-        impedance: {type: virtual_impedance, x_v_pu: 0.1}
+        vi: {type: virtual_impedance, x_v_pu: 0.1}
       references: {p_ref_pu: 0.5}
     protection: {overcurrent: {enable: 1, limit_pu: 1.5}}
 events:
@@ -31,4 +31,4 @@ events:
 simulation:
   t_end: 6.0
   solver: {dt: 12.5e-6}
-  output: {control_every: 10}
+  output: {ctrl_every: 10}

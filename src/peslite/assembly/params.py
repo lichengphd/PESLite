@@ -528,6 +528,7 @@ class SolverParams:
     subsystems: dict = field(default_factory=dict)  # fixed only: {name: step relative to dt | {step, method}}
     sweeps: int = 2  # coupling sweeps for sub-stepped subsystems (>= 1)
     linearisations: int = 3  # linearisation points for the split error bound (0: none)
+    write_length: int = 1000  # streamed CSV rows per write batch (>= 1)
 
     _choices = {"type": ("fixed", "adaptive")}
 
@@ -547,12 +548,12 @@ class InitialParams:
 
 @dataclass(frozen=True)
 class OutputParams:
-    """What a run records and the files written by ``SimulationResult.save``."""
+    """Histories streamed by ``Simulation.run`` into its output directory."""
 
     period: float = 5e-4  # plant snapshot interval, s
-    control_every: int = 1  # keep every n-th controller sample
+    ctrl_every: int = 1  # keep every n-th controller sample
     states: bool = True  # states.csv
-    signals: bool = False  # plant.csv and control.csv
+    signals: bool = False  # plant.csv and ctrl.<unit>.csv
     energy: bool = False  # energy.csv
 
 

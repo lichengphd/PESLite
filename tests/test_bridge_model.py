@@ -55,7 +55,7 @@ def _with_model(params, enable, over):
 @pytest.mark.parametrize("enable, over", [(0, "pwm_period"),
                                            (1, "pwm_period"),
                                            (1, "time_step")])
-def test_every_bundled_file_runs_with_every_model(path, enable, over):
+def test_every_bundled_file_runs_with_every_model(path, enable, over, tmp_path):
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         params = peslite.load(
@@ -63,12 +63,12 @@ def test_every_bundled_file_runs_with_every_model(path, enable, over):
             **{"simulation.t_end": 0.004, "simulation.solver.linearisations": 0},
         )
         params = _with_model(params, enable, over)
-    result = peslite.Simulation(params).run()
+    result = peslite.Simulation(params).run(out_dir=tmp_path / f"{path.stem}-{enable}-{over}")
     assert np.isfinite(result.states["t"]).all()
     assert result.states["t"][-1] == pytest.approx(0.004)
 
 
-def test_units_can_have_different_models():
+def test_units_can_have_different_models(tmp_path):
     params = peslite.load(
         EXAMPLES / "two-converters-example.pes",
         **{"simulation.t_end": 0.004,
@@ -79,7 +79,7 @@ def test_units_can_have_different_models():
     models = tuple(type(simulation.units[name].pwm.modulator).__name__
                    for name in ("vsc_1", "vsc_2"))
     assert models == ("ZOH", "CarrierComparison")
-    simulation.run()
+    simulation.run(out_dir=tmp_path)
 
 
 def test_averaging_flag_is_the_same_as_setting_the_file_value(tmp_path):
@@ -106,22 +106,22 @@ def test_time_step_averaging_is_a_kind_of_averaging():
     assert _models("gfl-example", "--averaging") == {"vsc": (1, "pwm_period")}
 
 
-def test_time_step_averaging_follows_carrier_within_each_period(gfl):
+def test_time_step_averaging_follows_carrier_within_each_period(gfl, tmp_path):
     runs = {}
     for over in ("pwm_period", "time_step"):
         params = gfl(**{"units.vsc.averaging.over": over,
                         "simulation.output.period": 12.5e-6})
-        runs[over] = peslite.Simulation(params).run().states["vsc.branch_f.i.re"]
+        runs[over] = peslite.Simulation(params).run(out_dir=tmp_path / over).states["vsc.branch_f.i.re"]
     ripple = {name: np.ptp(np.diff(values[-40:], 2)) for name, values in runs.items()}
     assert ripple["time_step"] > 10 * ripple["pwm_period"]
 
 
-def test_over_has_no_effect_on_switching_bridge(gfl):
+def test_over_has_no_effect_on_switching_bridge(gfl, tmp_path):
     base = {"units.vsc.averaging.enable": 0, "simulation.t_end": 0.002}
-    first = peslite.Simulation(gfl(**base)).run()
+    first = peslite.Simulation(gfl(**base)).run(out_dir=tmp_path / "pwm-period")
     second = peslite.Simulation(
         gfl(**base, **{"units.vsc.averaging.over": "time_step"})
-    ).run()
+    ).run(out_dir=tmp_path / "time-step")
     assert all(np.array_equal(first.states[name], second.states[name], equal_nan=True)
                for name in first.states)
 
@@ -138,7 +138,7 @@ def test_averaging_flag_results_use_their_own_folder(tmp_path, monkeypatch):
     assert peslite.load(tmp_path / "gfl-example-averaging" / "simulation.pes").unit("vsc").averaging.enable
 
 
-def test_carrier_settings_are_ignored_for_pwm_period_averaging(gfl):
+def test_carrier_settings_are_ignored_for_pwm_period_averaging(gfl, tmp_path):
     duration = {"simulation.t_end": 0.004}
     with warnings.catch_warnings():
         warnings.simplefilter("error")
@@ -146,8 +146,8 @@ def test_carrier_settings_are_ignored_for_pwm_period_averaging(gfl):
                           **{"units.vsc.pwm.sync": "synchronous",
                              "units.vsc.pwm.carrier_phase": 0.3})
     asynchronous = gfl(**duration)
-    first = peslite.Simulation(synchronous).run()
-    second = peslite.Simulation(asynchronous).run()
+    first = peslite.Simulation(synchronous).run(out_dir=tmp_path / "synchronous")
+    second = peslite.Simulation(asynchronous).run(out_dir=tmp_path / "asynchronous")
     for name in second.states:
         assert np.array_equal(first.states[name], second.states[name], equal_nan=True), name
 
