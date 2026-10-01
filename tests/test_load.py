@@ -7,7 +7,7 @@ from peslite.assembly.params import from_dict
 
 
 def _current(result, name):
-    return np.abs(result.states[f"plant.{name}.re"] + 1j * result.states[f"plant.{name}.im"])
+    return np.abs(result.states[f"{name}.re"] + 1j * result.states[f"{name}.im"])
 
 
 def _two_buses(case, events):
@@ -24,14 +24,14 @@ def _two_buses(case, events):
     return from_dict(tree)
 
 
-def test_branch_source_and_load_switch_during_a_run(case):
+def test_branch_source_and_load_switch_during_a_run(case, tmp_path):
     params = _two_buses(case, {
         "line_off": {"type": "disconnect", "target": "line", "t": 0.001},
         "line_on": {"type": "connect", "target": "line", "t": 0.002},
         "load_on": {"type": "connect", "target": "load", "t": 0.0015},
         "grid_off": {"type": "disconnect", "target": "grid", "t": 0.003},
     })
-    result = peslite.Simulation(params).run()
+    result = peslite.Simulation(params).run(out_dir=tmp_path)
     t = result.states["t"]
     line = _current(result, "line.i")
     load = _current(result, "load.branch.i")
@@ -44,7 +44,7 @@ def test_branch_source_and_load_switch_during_a_run(case):
     assert np.max(grid[t < 0.003]) > 0.0
 
 
-def test_small_load_can_model_a_switched_fault(case):
+def test_small_load_can_model_a_switched_fault(case, tmp_path):
     tree = case()
     tree["elements"] = {
         "fault": {"type": "load", "bus": "pcc", "r_pu": 0.01, "x_pu": 0.01}
@@ -53,7 +53,7 @@ def test_small_load_can_model_a_switched_fault(case):
         "fault_on": {"type": "connect", "target": "fault", "t": 0.002}
     }
     tree["simulation"].update(t_end=0.004, output={"period": 2.5e-5})
-    result = peslite.Simulation(from_dict(tree)).run()
+    result = peslite.Simulation(from_dict(tree)).run(out_dir=tmp_path)
     t = result.states["t"]
     voltage = _current(result, "pcc.u_C")
     assert np.max(voltage[t > 0.0035]) < 0.2 * np.min(voltage[t < 0.002])

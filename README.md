@@ -5,10 +5,11 @@ Time-domain simulation of power-electronic converters in Python.
 - Networks of buses, lines, grid sources and any number of converters, defined in YAML
   simulation files, with run-time changes described as events.
 - Grid-following (PLL, current loop, dc-voltage loop) and grid-forming control
-  (PSC, droop, VSG, dVOC, matching), each loop on its own clock.
-- Switching (ideal switches, exact switching instants), averaged and step-averaged bridges.
+  (PSC, droop, VSG, dVOC, matching), with each loop scheduled on control interrupts.
+- Switching bridges (ideal switches at exact instants) and bridges averaged over the PWM period
+  or solver step, selected independently for each converter.
 - Fixed-step, adaptive (SciPy or built-in DP45) and multirate integration.
-- ADC sampling (instantaneous or window average), computation delay, PWM, protection.
+- ADC sampling (instantaneous or window average), controller computation time, PWM, protection.
 - Energy accounting of the power circuit and restart from any saved state.
 
 The power circuit works in SI units (V, A, H, F, ohm); controllers work in pu of each
@@ -45,9 +46,13 @@ peslite gfm-psc-example
 peslite gfm-droop-example
 
 # override any parameter by its dotted path
-peslite gfl-example --set simulation.t_end=1 --set units.vsc.delay.steps=1
+peslite gfl-example --set simulation.t_end=1 --set units.vsc.ctrl.computation=2e-6
 peslite gfl-example --set simulation.solver.type=adaptive --set simulation.solver.method=DP45
-peslite gfm-droop-example --set simulation.bridge=switching
+peslite gfm-droop-example --set units.vsc.averaging.enable=0
+
+# average every converter for this run; print progress with selected quantities
+peslite gfl-example --averaging
+peslite gfl-example --progress 0.1 --watch vsc.vdc_pu --watch vsc.i_c
 
 # continue a run from its last saved state (or from time T with --initial-time T)
 peslite gfl-example --out output/a
@@ -66,14 +71,14 @@ From Python (in this folder, or anywhere after `pip install -e .`):
 import peslite
 
 p = peslite.load("case.pes", **{"simulation.t_end": 1.0})
-r = peslite.Simulation(p).run()
+r = peslite.Simulation(p).run()     # streams directly to output/run
 
-r.states["plant.vsc.dclink.u_C"]   # a state over time
-r.plant["vsc.i_c"]                 # plant signals (complex space vectors)
-r.control["vsc.id_pu"]             # controller log of unit "vsc"
+r.states["vsc.dclink.u_C"]         # a state over time
+r.plant["vsc.i_conv_a"]            # a plant signal in the final CSV schema
+r.ctrl["vsc.id_pu"]                # controller log of unit "vsc"
 r.final_states()                   # last row, usable as an initial state
 r.summary                          # trips, alarms, peaks
-r.save("output/run")               # states.csv, summary.json, simulation.pes
+r.files                            # files already written by run()
 ```
 
 ## Simulation files and events
@@ -93,7 +98,7 @@ Events use one common top-level mapping:
 ```yaml
 events:
   connect_vsc: {type: connect, target: vsc, t: 0.2, ramp: 1.0}
-  p_step: {type: set, t: 2.0, set: {units.vsc.control.references.p_ref_pu: 0.8}}
+  p_step: {type: set, t: 2.0, set: {units.vsc.ctrl.references.p_ref_pu: 0.8}}
   load_on: {type: connect, target: load, t: 3.0}
   line_trip: {type: disconnect, target: line, t: 4.0}
 ```
@@ -106,6 +111,32 @@ a converter that trips remains disconnected.
 
 The built-in `load` element is a series R-L load from a bus to ground. It can be connected,
 disconnected or retuned by events; a small impedance can be used to model a fault.
+
+## Bridge models
+
+Each converter uses a switching bridge unless its `averaging` section is enabled. This permits a
+system to mix switching and averaging converters:
+
+```yaml
+units:
+  vsc:
+    averaging: {enable: 1, over: pwm_period}  # pwm_period | time_step
+```
+
+| Setting | Model |
+|---|---|
+| `enable: 0` | ideal switches at the exact carrier-comparison instants |
+| `enable: 1, over: pwm_period` | duty ratios held as continuous bridge values over each PWM period; no carrier ripple |
+| `enable: 1, over: time_step` | carrier on-fraction averaged over each fixed solver step |
+
+`--averaging` enables averaging for every converter for one run without editing the file, while
+preserving each converter's configured `over` value. It takes precedence over an `enable: 0`
+command-line override. If the option changes at least one model, the default result directory is
+`output/<name>-averaging`.
+
+Time-step averaging requires a fixed-step solver and an asynchronous carrier. PWM-period
+averaging has no carrier ripple, but the carrier phase still shifts that unit's control interrupts
+and PWM loads.
 
 ## Example configurations
 
@@ -124,17 +155,19 @@ disconnected or retuned by events; a small impedance can be used to model a faul
 | Path | Values |
 |---|---|
 | `simulation.t_end` | end time, s |
-| `simulation.bridge` | `switching` \| `averaged` \| `step_averaged` |
 | `simulation.solver.type` / `.method` | `fixed`: `euler` \| `heun` \| `rk4`; `adaptive`: `RK45` \| `DOP853` \| `Radau` \| `BDF` \| `LSODA` \| `DP45` |
 | `simulation.solver.dt` | maximum fixed step, s |
 | `simulation.solver.subsystems` | own steps per subsystem, e.g. `{vsc.dclink: 10, pcc: 0.1}` |
 | `simulation.output.period` | snapshot interval, s |
 | `simulation.energy_check` | `warn` \| `strict` \| `off` |
-| `units.<u>.control.type` | `gfl` \| `gfm` \| `custom` |
-| `units.<u>.control.loops.<loop>.period` | loop period, s |
-| `units.<u>.measurement.average` | `instantaneous` \| `window` (with `window`) |
+| `simulation.progress` | `{enable: 1, period: 0.1, watch: [...]}`; CLI: `--progress`, `--watch` |
+| `units.<u>.averaging` | `{enable: 1, over: pwm_period \| time_step}`; CLI: `--averaging` |
+| `units.<u>.ctrl.type` | `gfl` \| `gfm` \| `custom` |
+| `units.<u>.ctrl.period` / `.computation` | control-interrupt period and computation time, s |
+| `units.<u>.ctrl.loops.<loop>.period` | loop period, an integer multiple of `ctrl.period` |
+| `units.<u>.meas.period` / `.average` | ADC period; `instantaneous` \| `window` (with `window`) |
+| `units.<u>.pwm.update` | `single` (valleys) \| `double` (valleys and peaks) |
 | `units.<u>.pwm.method` / `.sync` | `spwm` \| `svpwm`; `asynchronous` \| `synchronous` |
-| `units.<u>.delay.steps` | computation delay in PWM updates |
 | `simulation.output.states` / `.signals` / `.energy` | which files are written |
 
 ## Output
@@ -142,15 +175,45 @@ disconnected or retuned by events; a small impedance can be used to model a faul
 | File | Content |
 |---|---|
 | `states.csv` | every state at each snapshot; any row can start a new run |
-| `plant.csv`, `control.<unit>.csv` | plant signals and controller logs (`simulation.output.signals: 1`) |
+| `plant.csv`, `ctrl.<unit>.csv` | plant signals and controller logs (`simulation.output.signals: 1`) |
 | `energy.csv` | stored energy and power balance (`simulation.output.energy: 1`) |
 | `summary.json` | run summary |
 | `simulation.pes` | complete resolved simulation file; loading it repeats the run |
 
+`simulation.initial.t` and `simulation.t_end` are used exactly; neither is aligned or rounded to
+a converter's timer grid. A saved row restores each converter's active and shadow PWM registers,
+derives its computation progress and next timer points from that row's time, and restores any ADC
+averaging-window accumulators. An oversampled ADC's intermediate samples are not states, so its saved
+run must be continued from a control interrupt.
+With `simulation.output.states: 0`, no `states.csv` is written and only the terminal state is
+collected internally, so `final_states()` remains available without serialising every snapshot.
+All enabled histories are streamed directly to their final CSV files in bounded batches; a run
+never accumulates the complete history in RAM. Python result columns are read from those final
+files only when requested and are not part of the write path.
+With `simulation.output.energy: 0`, energy checks still update the summary but their full time
+history is not retained.
+
 Output names use the same unit convention as input parameters: an SI value has no unit suffix,
-while a per-unit value ends in `_pu`. Controller columns are named `ctrl.<unit>.<signal>`. In the
-summary, switches such as `tripped` are 0 or 1, events that did not occur are `null`, and alarms,
-port-Hamiltonian defaults and energy problems are lists.
+while a per-unit value ends in `_pu`. Runtime state paths are entity-first: physical states are
+`<entity>.*`, while converter internals are `<unit>.ctrl.*`, `<unit>.pwm.*` and `<unit>.meas.*`.
+The global solver keeps `solver.*`. In the summary, switches such as `tripped` are 0 or 1, events
+that did not occur are `null`, and alarms, port-Hamiltonian defaults and energy problems are lists.
+
+`--progress SECONDS` prints simulated time and wall time at the configured interval.
+`--watch NAME` appends a value to each line and may be repeated or given comma-separated names.
+A watched name may be a `states.csv` column, a `plant.csv`/controller column, a state alias, or a
+complex state without `.re`/`.im` to print its magnitude. Converters with the same signal use their
+unit prefix, for example `vsc_1.vdc_pu` and `vsc_2.vdc_pu`. State names use the same entity-first
+paths as `states.csv`; there is no separate `plant.*` domain. Existing public result columns take
+precedence when a signal and a state have the same name. For example:
+
+```bash
+peslite gfl-example --progress 0.1 \
+  --watch vsc.vdc_pu \
+  --watch vsc.i_c,vsc.u_dc
+```
+
+An unknown name is reported at the first progress line together with the available names.
 
 ## Custom parts
 
@@ -179,7 +242,7 @@ class MyLaw(SyncLaw):
         self.v_mag = v_ref_pu
 ```
 
-The registered name can then be used at `units.<u>.control.loops.<loop>.type`. Circuit element
+The registered name can then be used at `units.<u>.ctrl.loops.<loop>.type`. Circuit element
 types can likewise be registered with `register_element_type`, and event types with
 `register_event_type`; each type owns a frozen parameter dataclass, so its file parameters use the
 same parsing and validation as built-in types. A user solver may implement the normal solver call
@@ -187,8 +250,8 @@ alone; event-aware solvers may additionally provide `settle()` and `parameters_c
 
 A custom controller output stage can also be built with
 `UniteType(cfg, scenario, pwm_method=..., limiter=...)`. Other replaceable parts are
-`<unit>.modulator`, `<unit>.delay` and `solver`. Executable examples of a custom loop, element,
-event and user solver live in `tests/test_custom_parts.py`; the root `examples/` directory remains
+`<unit>.modulator` and `solver`. Executable examples of a custom loop, element, event and user
+solver live in `tests/test_custom_parts.py`; the root `examples/` directory remains
 simulation-data-only.
 
 ## Layout
@@ -200,7 +263,7 @@ src/peslite/            the package: __init__.py and four code parts
     network.py            three-phase source, R-L branch, bus (R-C node), element types
     converter.py          bridge, dc link (capacitor, current or voltage source)
     adc.py                sampling of a converter's measurements, averaging window, oversampling
-    pwm.py                PWM peripheral: publications, computation delay, carrier, modulators
+    pwm.py                PWM timer, duty registers, carrier and modulators
   control/              the converter's controller
     loops.py              what each loop type computes: its parameters, ports and update
     controller.py         controller interface, loop network, GFL/GFM wiring, UniteType

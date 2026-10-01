@@ -147,14 +147,14 @@ def test_set_events_are_applied_and_validated_in_order():
 
 
 def test_set_paths_use_si_pu_rules_and_detect_same_time_conflicts():
-    p = _gfl().replace(**_set("power", 1.0, **{"units.vsc.control.references.p_ref": 1e6}))
-    assert p.events["power"].set == {"units.vsc.control.references.p_ref": 1e6}
-    assert p.changes[0].params.unit("vsc").control.references.p_ref_pu == pytest.approx(0.5)
+    p = _gfl().replace(**_set("power", 1.0, **{"units.vsc.ctrl.references.p_ref": 1e6}))
+    assert p.events["power"].set == {"units.vsc.ctrl.references.p_ref": 1e6}
+    assert p.changes[0].params.unit("vsc").ctrl.references.p_ref_pu == pytest.approx(0.5)
 
     with pytest.raises(ConfigError, match="is also set at t = 1.0"):
         _gfl().replace(
-            **_set("a", 1.0, **{"units.vsc.control.references.p_ref_pu": 0.5}),
-            **_set("b", 1.0, **{"units.vsc.control.references.p_ref_pu": 0.8}),
+            **_set("a", 1.0, **{"units.vsc.ctrl.references.p_ref_pu": 0.5}),
+            **_set("b", 1.0, **{"units.vsc.ctrl.references.p_ref_pu": 0.8}),
         )
     with pytest.raises(ConfigError, match="pwm.f_sw cannot change during a run"):
         _gfl().replace(**_set("bad", 1.0, **{"units.vsc.pwm.f_sw": 10_000.0}))
@@ -181,10 +181,10 @@ def test_source_scenario_preserves_frequency_phase_and_voltage_changes():
 
 
 def test_events_round_trip_in_resolved_file_and_set_paths_are_replaceable():
-    p = _gfl().replace(**_set("power", 1.0, **{"units.vsc.control.references.p_ref_pu": 0.5}))
-    q = p.replace(**{"events.power.set.units.vsc.control.references.p_ref_pu": 0.7,
+    p = _gfl().replace(**_set("power", 1.0, **{"units.vsc.ctrl.references.p_ref_pu": 0.5}))
+    q = p.replace(**{"events.power.set.units.vsc.ctrl.references.p_ref_pu": 0.7,
                      "events.power.t": 1.5})
-    assert q.events["power"].set == {"units.vsc.control.references.p_ref_pu": 0.7}
+    assert q.events["power"].set == {"units.vsc.ctrl.references.p_ref_pu": 0.7}
     assert q.events["power"].t == 1.5
     rebuilt = from_dict(yaml.safe_load(dumps(q)))
     assert rebuilt.events["power"].set == q.events["power"].set

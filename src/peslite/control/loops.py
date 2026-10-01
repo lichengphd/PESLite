@@ -1,6 +1,6 @@
 """What each control loop computes: the loop types, their typed signals and their registry.
 
-A loop type is one class: its parameters (``Params``, the schema of its ``control.loops`` entry),
+A loop type is one class: its parameters (``Params``, the schema of its ``ctrl.loops`` entry),
 its typed input and output ports, its role in the default wiring, and its discrete-time update.
 How loops are connected is not theirs to know (:mod:`.controller`).
 Signals are pu; time s, angles rad, frequencies rad/s.
@@ -52,11 +52,11 @@ ROLES = ("pll", "sync", "current", "dc_voltage", "power", "impedance", "admittan
 class Loop:
     """A control loop: a discrete-time block with typed ports, built as ``cls(cfg, unit, scenario)``.
 
-    A loop type sets ``type`` (its name in ``control.loops``), ``Params`` (a frozen dataclass with
+    A loop type sets ``type`` (its name in ``ctrl.loops``), ``Params`` (a frozen dataclass with
     ``type`` and ``period`` fields; its ``_quantities`` name the fields given in SI or pu),
     ``inputs`` / ``outputs`` (port name -> :class:`SignalType`), ``delayed`` (inputs read after the
     update by ``latch(inputs)``, which break instantaneous cycles) and ``role`` (one of
-    :data:`ROLES`, or ``None``: wired only by ``control.connections``). With ``outputs_from_state``
+    :data:`ROLES`, or ``None``: wired only by ``ctrl.connections``). With ``outputs_from_state``
     its held outputs are set from its states (``initial_outputs()``) when states are loaded.
     It provides ``initial_outputs()`` and ``update(t, inputs) -> outputs``; its named states are the
     attributes in ``state_names`` unless it overrides ``get_state`` / ``set_state``. A loop rebuilt
@@ -160,7 +160,7 @@ class SRFPLL(Loop):
         kp_pu: float
         ki_pu: float
         normalisation: str = "rated"
-        period: float
+        period: Optional[float] = None
         type: str = "srf_pll"
 
         _choices = {"normalisation": ("rated", "amplitude")}
@@ -216,7 +216,7 @@ class CurrentLoop(Loop):
         decoupling: bool = True
         feedforward: bool = True
         antiwindup: str = "conditional"  # "conditional" | "backcalc" | "none"
-        period: float
+        period: Optional[float] = None
         type: str = "dq_current_pi"
 
         _choices = {"antiwindup": ("conditional", "backcalc", "none")}
@@ -304,7 +304,7 @@ class DCVoltageLoop(Loop):
         ki_pu: float
         id0_export_pu: float = 0.0  # d-axis current feed-forward, pu
         bidirectional: bool = False  # False: id_ref limited to >= 0
-        period: float
+        period: Optional[float] = None
         limit_pu: float = 1.0
         antiwindup: str = "none"
         type: str = "dc_voltage_pi"
@@ -368,7 +368,7 @@ class PowerLoop(Loop):
 
     @dataclass(frozen=True, kw_only=True)
     class Params:
-        period: float
+        period: Optional[float] = None
         filter: PowerFilterParams = field(default_factory=PowerFilterParams)
         type: str = "power"
 
@@ -418,11 +418,11 @@ class SyncLaw(Loop):
         super().__init__(cfg, unit, scenario)
         self.w0, self.T = unit.base.w0, cfg.period
         self.theta, self.omega = 0.0, self.w0
-        self.v_mag = unit.control.references.v_ref_pu
+        self.v_mag = unit.ctrl.references.v_ref_pu
 
     def initial_outputs(self):
         return {"theta": float(self.theta), "frame": float(self.theta), "omega": float(self.omega),
-                "v_ref": self.unit.control.references.v_ref_pu}
+                "v_ref": self.unit.ctrl.references.v_ref_pu}
 
     def update(self, t, inputs):
         frame = float(self.theta)
@@ -445,7 +445,7 @@ class PSC(SyncLaw):
 
     @dataclass(frozen=True, kw_only=True)
     class Params:
-        period: float
+        period: Optional[float] = None
         k_p_pu: float  # rad/s per pu
         k_v: float = 0.0  # AVR proportional gain, pu/pu (0: open-loop magnitude)
         k_vi: float = 0.0  # AVR integral gain, 1/s
@@ -477,7 +477,7 @@ class Droop(SyncLaw):
     class Params:
         m_p_pu: float  # rad/s per pu (P-f droop)
         n_q_pu: float  # pu/pu (Q-V droop)
-        period: float
+        period: Optional[float] = None
         type: str = "droop"
 
         _quantities = {"m_p_pu": "1/power", "n_q_pu": "voltage/power"}
@@ -507,7 +507,7 @@ class VSG(SyncLaw):
         d_p_pu: float  # damping, pu power per pu speed deviation
         k_q_pu: float  # Q-V droop, pu/pu
         t_q: float = 0.0  # voltage-magnitude lag time constant, s (0: none)
-        period: float
+        period: Optional[float] = None
         type: str = "vsg"
 
         _quantities = {"d_p_pu": "power/frequency", "k_q_pu": "voltage/power"}
@@ -545,7 +545,7 @@ class DVOC(SyncLaw):
         eta_pu: float  # rad/s
         alpha_pu: float  # magnitude regulation gain
         kappa: float  # rotation of the current error, rad
-        period: float
+        period: Optional[float] = None
         type: str = "dvoc"
 
         _quantities = {"eta_pu": "resistance", "alpha_pu": "1/resistance"}
@@ -578,7 +578,7 @@ class Matching(SyncLaw):
     class Params:
         k_theta_pu: Optional[float] = None  # rad/s per pu dc voltage (dc base)
         k_q_pu: float = 0.0  # Q-V droop, pu/pu
-        period: float
+        period: Optional[float] = None
         type: str = "matching"
 
         _quantities = {"k_theta_pu": "1/dc_voltage", "k_q_pu": "voltage/power"}
@@ -587,7 +587,7 @@ class Matching(SyncLaw):
 
     def __init__(self, cfg, unit, scenario):
         super().__init__(cfg, unit, scenario)
-        vdc_ref_pu = unit.control.references.vdc_ref_pu
+        vdc_ref_pu = unit.ctrl.references.vdc_ref_pu
         self.k_theta = cfg.k_theta_pu if cfg.k_theta_pu is not None else self.w0 / vdc_ref_pu
         self.k_q = cfg.k_q_pu
 
@@ -640,7 +640,7 @@ class VirtualAdmittance(Loop):
 
     @dataclass(frozen=True, kw_only=True)
     class Params:
-        period: float
+        period: Optional[float] = None
         x_v_pu: float
         r_v_pu: float = 0.0
         current_limit: CurrentLimitParams = field(default_factory=CurrentLimitParams)
@@ -695,7 +695,7 @@ class ActiveDamping(Loop):
 
     @dataclass(frozen=True, kw_only=True)
     class Params:
-        period: float
+        period: Optional[float] = None
         r_a_pu: float
         alpha_d: float
         type: str = "active_damping"
@@ -741,7 +741,7 @@ class UnitDelay(Loop):
 
     @dataclass(frozen=True, kw_only=True)
     class Params:
-        period: float
+        period: Optional[float] = None
         initial: Optional[float] = None  # angle (rad) or frequency (rad/s)
         initial_pu: Optional[float] = None  # electrical signals
         signal: str = "current_pu"

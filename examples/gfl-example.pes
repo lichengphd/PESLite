@@ -48,38 +48,43 @@ units:                     # converters, one entry each
         # k_pu: 0.2        # current-source droop: k_pu * (1 - u_C_pu)
         # voltage source: v_pu (emf, default 1), r_pu (series R)
 
-    # measurement:         # the ADC, sampled at every PWM update
+    # meas:                # the ADC, sampled by the control interrupt
     #   average: instantaneous  # ac voltage and current: instantaneous | window (mean over (t_k - window, t_k])
     #   u_dc: instantaneous     # the same choice for the dc voltage
-    #   window: 50.0e-6    # averaging window, s (default: the PWM update period)
+    #   window: 50.0e-6    # averaging window, s (default: ctrl.period)
+    #   period: 25.0e-6    # oversampling period, s; divides ctrl.period (default: one sample)
 
     pwm:
       f_sw: 20000.0        # carrier frequency, Hz
       modulation_limit: 0.95
-      # update_period: 50.0e-6  # ADC sample, control law and new duty ratios (default: one carrier period)
+      # update: single     # compare registers load at valleys: single | double (valleys and peaks)
       # method: spwm       # spwm | svpwm
       # sync: asynchronous # asynchronous | synchronous (carrier locked to the controller angle)
       # carrier_phase: 0.0 # carrier position at t = 0, in periods
 
-    control:
+    # averaging: {enable: 0, over: pwm_period}  # bridge model: 0 switching; 1 averaging
+    #                     # over each pwm_period (no carrier) or each solver time_step (fixed solver)
+    #                     # --averaging sets enable 1 for every unit
+
+    ctrl:
       type: gfl            # default wiring: gfl | gfm | custom (explicit connections and outputs)
-      loops:               # each loop runs every `period` (s) on its own clock
+      # period: 50.0e-6    # control interrupt, s; multiple of half the carrier period (default: one period)
+      # computation: 1.0e-6  # sample-to-PWM-load eligibility time, s; 0 is an ideal controller
+      loops:               # run in signal order at every interrupt, or every n-th interrupt
         pll:
           type: srf_pll
-          period: 50.0e-6
+          # period: 50.0e-6  # multiple of ctrl.period (default: every interrupt)
           kp_pu: 20.0
           ki_pu: 1200.0
           # normalisation: rated  # rated | amplitude
         cc:
           type: dq_current_pi
-          period: 50.0e-6
           bandwidth: 200.0 # Hz; gains from the bandwidth unless kp_pu, ki_pu are given
           # decoupling: 1
           # feedforward: 1
           # antiwindup: conditional  # conditional | backcalc | none
         dvc:
           type: dc_voltage_pi
-          period: 50.0e-6
           kp_pu: 0.8
           ki_pu: 90.0
           limit_pu: 1.15
@@ -98,12 +103,8 @@ units:                     # converters, one entry each
       #   theta: 0.0       # rad
       #   omega: 314.159   # rad/s (default: 2 pi f0)
       #   zero_v_pu: 0.0
-      # sampling_period: 25.0e-6  # ADC oversampling (default: the PWM update period)
       # A custom loop type, registered with peslite.register_loop_type, is written here
       # like the built-in ones and its parameters are checked the same way.
-
-    # delay:
-    #   steps: 0           # delay of the duty ratios, in PWM updates
 
     protection:            # trips only this converter; each criterion is switched by enable (1/0)
       overcurrent: {enable: 1, limit_pu: 1.15}   # instantaneous phase current: trips at once
@@ -126,7 +127,7 @@ events:                    # what happens during the run, by name; written only 
   #                        # its protection at the end; other targets have nothing to ramp
   # trip_line: {type: disconnect, target: line1, t: 3.0}
   # load_on: {type: connect, target: load1, t: 1.0}                # load1 starts disconnected
-  # p_step: {type: set, t: 2.0, set: {units.vsc.control.references.p_ref_pu: 0.8}}
+  # p_step: {type: set, t: 2.0, set: {units.vsc.ctrl.references.p_ref_pu: 0.8}}
   #                        # set: new values from t on, paths as for --set: references, loop parameters
   #                        # (not type, period), protection, dc source; a source's v, f, angle, l, r;
   #                        # l, r of lines and elements; c, r_d of buses
@@ -135,7 +136,6 @@ events:                    # what happens during the run, by name; written only 
 
 simulation:                # how the model is simulated
   t_end: 3.0
-  # bridge: switching      # switching | averaged | step_averaged
   solver:
     dt: 12.5e-6            # fixed: maximum step
     # type: fixed          # fixed | adaptive
@@ -147,17 +147,22 @@ simulation:                # how the model is simulated
     # subsystems: {vsc.dclink: 10, pcc: 0.1}  # own step relative to dt: 10 = once per 10 steps, 0.1 = 10 per step
     # sweeps: 2            # coupling sweeps for subsystems on their own step
     # linearisations: 3    # points of the split error bound (0: none)
+    # write_length: 1000   # streamed CSV rows written per batch
+    # phs_check_step: 1000  # snapshots between port-Hamiltonian energy audits
   # initial:               # default: buses at their source's emf, dc capacitors at vdc_ref, the rest at zero
-  #   t: 0.0
-  #   states: {plant.vsc.u_dc: 1450.0}  # names as in states.csv (--list-states); keywords: source, rated
+  #   t: 0.0               # exact start time; not moved to a control or PWM timer point
+  #   states: {vsc.u_dc: 1450.0}  # any states.csv row can continue a run; keywords: source, rated
   output:
-    control_every: 10      # keep every 10th controller sample
+    ctrl_every: 10         # keep every 10th controller sample
     # period: 0.5e-3       # snapshot interval, s
     # states: 1            # states.csv
-    # signals: 0           # plant.csv and control.<unit>.csv
+    # signals: 0           # plant.csv and ctrl.<unit>.csv
     # energy: 0            # energy.csv
   # stop_on_trip: 1
-  # progress_every: 0.0    # s of simulated time between progress lines (0: none)
+  # progress:              # console lines (--progress SECONDS, --watch NAME)
+  #   enable: 0
+  #   period: 0.1          # simulated seconds between lines
+  #   watch: [vsc.vdc_pu, vsc.i_c]  # states/outputs; complex state -> magnitude
   # energy_check: warn     # warn | strict | off
 
 # meta:                    # notes only, text; they do not change the simulation

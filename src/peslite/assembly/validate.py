@@ -30,15 +30,6 @@ def _whole(r: float) -> bool:
     return n >= 1 and abs(r - n) <= 1e-9 * max(1.0, r)
 
 
-def _misaligned(name: str, r: float, where: str, both_ways: bool = False) -> None:
-    """Warn if a ratio of periods is not a whole number (optionally in either direction)."""
-    if _whole(r) or (both_ways and _whole(1.0 / r)):
-        return
-    warnings.warn(f"{where}: {name} = {r:.6g} is not a whole number"
-                  f"{' in either direction' if both_ways else ''}, so the two grids do not line "
-                  f"up; the periods are used as configured", stacklevel=3)
-
-
 def _switched(section, where: str) -> None:
     """Validate a section controlled by an ``enable`` switch."""
     if not section.enable:
@@ -49,7 +40,7 @@ def _switched(section, where: str) -> None:
             continue
         if value is None:
             raise ConfigError(f"{where}.{f.name}: required when enable is 1")
-        if not math.isfinite(value) or value <= 0:
+        if isinstance(value, (int, float)) and (not math.isfinite(value) or value <= 0):
             raise ConfigError(f"{where}.{f.name} must be finite and positive, got {value}")
 
 
@@ -78,31 +69,53 @@ def _dclink(cfg, where):
 
 
 def _pwm(w, base, where: str) -> None:
-    """Check switching frequency, update period and synchronous pulse ratio."""
+    """Check switching frequency, phase and synchronous pulse ratio."""
     if not math.isfinite(w.f_sw) or w.f_sw <= 0.0:
         raise ConfigError(f"{where}.f_sw must be finite and positive, got {w.f_sw}")
-    T_pwm = w.effective_update_period
-    if not math.isfinite(T_pwm) or T_pwm <= 0:
-        raise ConfigError(f"{where}.update_period must be finite and positive")
+    if not math.isfinite(w.carrier_phase):
+        raise ConfigError(f"{where}.carrier_phase must be finite, got {w.carrier_phase}")
     if w.sync == "synchronous":
         ratio = w.f_sw / base.f0
         if abs(ratio - round(ratio)) > 1e-9 * max(1.0, ratio):
             raise ConfigError(f"{where}.sync = 'synchronous' needs an integer pulse ratio "
                               f"pwm.f_sw / base.f0, got {w.f_sw} / {base.f0} = {ratio}")
-    _misaligned("pwm.switching_period / pwm.update_period", w.switching_period / T_pwm,
-                f"{where}.update_period", both_ways=True)
 
 
-def _control(c, dclink, where: str) -> None:
+def _period(c, pwm) -> float:
+    """The control period (s), defaulting to one carrier period."""
+    return c.period if c.period is not None else pwm.switching_period
+
+
+def _timing(c, pwm, where: str) -> None:
+    """Check the carrier-triggered control interrupt and computation time."""
+    T_c = _period(c, pwm)
+    if not math.isfinite(T_c) or T_c <= 0.0:
+        raise ConfigError(f"{where}.period must be finite and positive, got {T_c}")
+    half = pwm.switching_period / 2.0
+    if not _whole(T_c / half):
+        raise ConfigError(f"{where}.period = {T_c:.6g} s is not a multiple of half the carrier period "
+                          f"({half:.6g} s at pwm.f_sw = {pwm.f_sw:g} Hz): the carrier triggers the "
+                          f"interrupt at its valleys and peaks")
+    tau = c.computation
+    if not math.isfinite(tau) or tau < 0.0 or tau >= T_c:
+        raise ConfigError(f"{where}.computation = {tau} s must be at least 0 and shorter than the "
+                          f"control period {T_c:.6g} s")
+
+
+def _control(c, dclink, pwm, where: str) -> None:
     """Check typed control loops and their requirements on the DC side."""
     if not c.loops:
         raise ConfigError(f"{where}.loops must contain at least one loop")
+    T_c = _period(c, pwm)
     for name, cfg in c.loops.items():
-        if name in {"measurement", "references", "held", "clock", "command", "prot"}:
+        if name in {"meas", "references", "held", "command", "prot"}:
             raise ConfigError(f"{where}.loops.{name}: reserved loop name")
-        T = cfg.period  # None where the loop type allows it: runs on upstream updates
+        T = cfg.period
         if T is not None and (not math.isfinite(T) or T <= 0):
             raise ConfigError(f"{where}.loops.{name}.period must be finite and positive")
+        if T is not None and not _whole(T / T_c):
+            raise ConfigError(f"{where}.loops.{name}.period = {T:.6g} s is not a multiple of "
+                              f"ctrl.period = {T_c:.6g} s: a loop runs at every n-th control interrupt")
         for key, value in vars(cfg).items():
             if isinstance(value, (int, float)) and not math.isfinite(value):
                 raise ConfigError(f"{where}.loops.{name}.{key} must be finite")
@@ -119,29 +132,25 @@ def _control(c, dclink, where: str) -> None:
             raise ConfigError(f"{where}.references: expected finite scalar references")
 
 
-def _sampling(c, m, T_pwm: float, where: str) -> None:
-    """Check the ADC sampling period and averaging window."""
-    if c.sampling_period is not None and (not math.isfinite(c.sampling_period) or c.sampling_period <= 0):
-        raise ConfigError(f"{where}.control.sampling_period must be positive")
-    if c.sampling_period is not None and c.sampling_period > T_pwm * (1 + 1e-9):
-        raise ConfigError(f"{where}.control.sampling_period is longer than pwm.update_period")
-    sampling_period = c.sampling_period if c.sampling_period is not None else T_pwm
-    _misaligned("pwm.update_period / control.sampling_period", T_pwm / sampling_period,
-                f"{where}.control.sampling_period")
-    if m.window is not None and m.window <= 0.0:
-        raise ConfigError(f"{where}.measurement.window must be > 0, got {m.window}")
-    if m.average == "window" or m.u_dc == "window":
-        window = m.window if m.window is not None else T_pwm
-        if window > T_pwm * (1.0 + 1e-9):
-            raise ConfigError(
-                f"{where}.measurement.window = {window} is longer than the PWM update period {T_pwm}")
-        if sampling_period < T_pwm * (1.0 - 1e-9):
-            raise ConfigError(
-                f"{where}: measurement.average = 'window' cannot be combined with a sampling period "
-                f"shorter than the PWM update period")
-    elif m.window is not None:
-        warnings.warn(f"{where}.measurement.window has no effect: no quantity is window-averaged",
-                      stacklevel=4)
+def _measurement(m, T_c: float, where: str) -> None:
+    """Check ADC oversampling and averaging windows within one control period."""
+    for key in ("period", "window"):
+        value = getattr(m, key)
+        if value is None:
+            continue
+        if not math.isfinite(value) or value <= 0.0:
+            raise ConfigError(f"{where}.{key} must be finite and positive, got {value}")
+        if value > T_c * (1.0 + 1e-9):
+            raise ConfigError(f"{where}.{key} = {value:.6g} s is longer than ctrl.period = {T_c:.6g} s")
+    if m.period is not None and not _whole(T_c / m.period):
+        raise ConfigError(f"{where}.period = {m.period:.6g} s does not divide ctrl.period = "
+                          f"{T_c:.6g} s into whole samples")
+    windowed = "window" in (m.average, m.u_dc)
+    if windowed and m.period is not None and m.period < T_c * (1.0 - 1e-9):
+        raise ConfigError(f"{where}: window averaging (average or u_dc = 'window') cannot be combined "
+                          f"with oversampling (period shorter than ctrl.period)")
+    if not windowed and m.window is not None:
+        warnings.warn(f"{where}.window has no effect: no quantity is window-averaged", stacklevel=4)
 
 
 def _unit(u, base, where: str) -> None:
@@ -152,10 +161,9 @@ def _unit(u, base, where: str) -> None:
         raise ConfigError(f"{where}.ac_filter.l_f must be > 0")
     _dclink(u.dclink, f"{where}.dclink")
     _pwm(u.pwm, base, f"{where}.pwm")
-    _control(u.control, u.dclink, f"{where}.control")
-    _sampling(u.control, u.measurement, u.pwm.effective_update_period, where)
-    if u.delay.steps < 0:
-        raise ConfigError(f"{where}.delay.steps must be >= 0")
+    _timing(u.ctrl, u.pwm, f"{where}.ctrl")
+    _control(u.ctrl, u.dclink, u.pwm, f"{where}.ctrl")
+    _measurement(u.meas, _period(u.ctrl, u.pwm), f"{where}.meas")
     protection = u.protection
     for name in ("overcurrent", "undervoltage", "overvoltage", "frequency", "dc_voltage", "rocof"):
         _switched(getattr(protection, name), f"{where}.protection.{name}")
@@ -211,18 +219,24 @@ def _network(p: Params) -> None:
                 raise ConfigError(f"elements.{name}.{key} must be finite")
 
 
-def _solver(s, bridge: str) -> None:
+def _solver(s, time_step_averaging: list[str]) -> None:
     """Check solver methods, bridge compatibility and subsystem step ratios."""
     if s.type == "fixed" and s.method not in FIXED_METHODS:
         raise ConfigError(f"simulation.solver.method {s.method!r} is not one of {FIXED_METHODS}")
     if s.type == "adaptive" and s.method not in ADAPTIVE_METHODS:
         raise ConfigError(f"simulation.solver.method {s.method!r} is not one of {ADAPTIVE_METHODS}")
-    if bridge == "step_averaged" and s.type != "fixed":
-        raise ConfigError("simulation.bridge = 'step_averaged' requires the fixed-step solver")
+    if time_step_averaging and s.type != "fixed":
+        name = time_step_averaging[0]
+        raise ConfigError(f"units.{name}.averaging.over = 'time_step' requires the fixed-step "
+                          f"solver (simulation.solver.type = 'fixed')")
     if s.sweeps < 1:
         raise ConfigError("simulation.solver.sweeps must be >= 1")
     if s.linearisations < 0:
         raise ConfigError("simulation.solver.linearisations must be >= 0")
+    if s.write_length < 1:
+        raise ConfigError("simulation.solver.write_length must be >= 1")
+    if s.phs_check_step < 1:
+        raise ConfigError("simulation.solver.phs_check_step must be >= 1")
     for name, value in s.subsystems.items():
         where = f"simulation.solver.subsystems.{name}"
         if s.type != "fixed":
@@ -272,11 +286,17 @@ def _initial(p: Params) -> None:
     t0 = p.simulation.initial.t
     if t0 < 0.0:
         raise ConfigError("simulation.initial.t must be >= 0")
-    for name, u in p.units.items():  # t0 must be on every unit's PWM update grid
-        T = u.pwm.effective_update_period
-        if abs(round(t0 / T) * T - t0) > 1e-9 * max(1.0, t0):
-            raise ConfigError(f"simulation.initial.t = {t0} is not on the PWM update grid of {name!r} (a multiple of "
-                              f"units.{name}.pwm.update_period = {T})")
+    for name, u in p.units.items():
+        m, T_c = u.meas, _period(u.ctrl, u.pwm)
+        continued = any(key.startswith((f"{name}.ctrl.", f"{name}.pwm.", f"{name}.meas."))
+                        for key in p.simulation.initial.states)
+        if not continued or m.period is None or m.period >= T_c * (1.0 - 1e-9):
+            continue
+        k = round((t0 - u.pwm.grid_offset) / T_c)
+        if abs(u.pwm.grid_offset + k * T_c - t0) > 1e-10:
+            raise ConfigError(f"simulation.initial.t = {t0} is between two control interrupts of {name!r}, "
+                              f"whose oversampled ADC (units.{name}.meas.period) took samples before it "
+                              f"that are not states: continue from an interrupt")
     if p.simulation.t_end <= t0:
         raise ConfigError(f"simulation.t_end = {p.simulation.t_end} must be after simulation.initial.t = {t0}")
     for key, value in p.simulation.initial.states.items():
@@ -290,15 +310,27 @@ def _initial(p: Params) -> None:
                               f"got {value!r}")
 
 
+def _progress(progress) -> None:
+    """Check progress settings; watched names are resolved at the first progress line."""
+    _switched(progress, "simulation.progress")
+    watch = progress.watch
+    if not isinstance(watch, list) or not all(isinstance(name, str) and name for name in watch):
+        raise ConfigError(f"simulation.progress.watch: expected a list of quantity names, got {watch!r}")
+
+
 def validate(p: Params) -> Params:
     """Check a :class:`Params` tree and return it unchanged; raise ConfigError if invalid."""
     _network(p)
+    time_step = [name for name, unit in p.units.items()
+                 if unit.averaging.enable and unit.averaging.over == "time_step"]
     for name, unit in p.units.items():
         _unit(unit, p.base, f"units.{name}")
-        if unit.pwm.sync == "synchronous" and p.simulation.bridge != "switching":
-            raise ConfigError(f"units.{name}.pwm.sync = 'synchronous' needs simulation.bridge = "
-                              f"'switching' (got {p.simulation.bridge!r}): an averaged bridge has no carrier")
-    _solver(p.simulation.solver, p.simulation.bridge)
+        if unit.pwm.sync == "synchronous" and name in time_step:
+            raise ConfigError(f"units.{name}.pwm.sync = 'synchronous' is not available with time-step "
+                              f"averaging (units.{name}.averaging.over = 'time_step'), which has an "
+                              f"asynchronous carrier")
+    _solver(p.simulation.solver, time_step)
     _events(p)
+    _progress(p.simulation.progress)
     _initial(p)
     return p

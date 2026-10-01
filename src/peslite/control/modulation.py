@@ -151,7 +151,7 @@ class OutputStage:
 
         u_cmd_dq, extra_dq: voltage command (pu, AC base); theta: frame angle (rad); u_dc: dc voltage (pu, DC base).
         cc: current loop for anti-windup (``"conditional"``: roll back its integration, or ``"backcalc"``).
-        count: ``False`` leaves the publication and saturation counters unchanged.
+        count: ``False`` leaves the controller-update and saturation counters unchanged.
         """
         rot = complex(math.cos(theta), math.sin(theta))
         u_dc = u_dc * self.v_dc_base  # PWM receives DC volts; loop feedback stays pu

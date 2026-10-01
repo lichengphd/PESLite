@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "peslite"
-version = "0.1.2"
+version = "0.1.4"
 description = "Power-electronics simulation on a port-Hamiltonian solver kernel: connected subsystem models, energy accounting, fixed/adaptive/multirate integration and converter control."
 readme = "README.md"
 requires-python = ">=3.10"

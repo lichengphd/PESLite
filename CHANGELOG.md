@@ -1,5 +1,68 @@
 # Changelog
 
+## 0.1.4
+
+### Digital control timing and continuation (#4)
+
+- Each converter owns its control-interrupt, PWM-load and ADC timer grids. A control result is
+  written to the PWM shadow registers at its interrupt and becomes eligible for an active-register
+  load after `ctrl.computation`; `pwm.update` selects valley-only or valley-and-peak loads.
+- PWM state paths are `<unit>.pwm.d_*` for the active compare registers and
+  `<unit>.pwm.shadow.d_*` for the shadow registers. Computation progress is derived from the saved
+  time and timer grid; there is no separate queue, `pending`, `ready` or configurable delay step.
+- Runs start at `simulation.initial.t` and end at `simulation.t_end` exactly. Continuing from a
+  state-table row restores PWM registers, computation progress, timer positions and ADC averaging
+  windows. An oversampled ADC continues from an interrupt because its intermediate samples are not
+  states.
+- Each averaged ADC channel keeps one window accumulator (`<unit>.meas.x_*`); the redundant
+  absolute integral and window-opening copy (`x_*_open`) are removed.
+- All enabled result histories are streamed directly to their final CSV files in batches of 1000
+  rows instead of accumulating in RAM. `simulation.solver.write_length` changes that batch size;
+  Python result columns read those final files on demand and are not part of the write path.
+- Repeated port-Hamiltonian energy audits use a precompiled topology and run at the first, final
+  and every `simulation.solver.phs_check_step`-th snapshot (1000 by default).
+- With `simulation.output.states: 0`, only the terminal state row is retained for
+  `final_states()`. Disabled energy output keeps the energy summary checks but no energy history.
+- Controller logs consistently use the abbreviation: `r.ctrl`, `ctrl.<unit>.csv` and
+  `simulation.output.ctrl_every`; the old full-word interfaces are removed.
+
+### Per-unit bridge models (#3)
+
+- The bridge model is selected independently for each converter. A unit uses exact switching by
+  default; `units.<u>.averaging: {enable: 1, over: pwm_period}` averages over each PWM period, and
+  `over: time_step` averages the carrier comparison over each fixed solver step.
+- `--averaging` enables averaging for every unit for one run and takes precedence over `--set` of
+  its `enable` switch. When it changes a model, the default result directory gains the
+  `-averaging` suffix. Different units in the same system may use different models.
+- Time-step averaging requires a fixed-step solver and an asynchronous carrier. Carrier phase and
+  synchronisation settings are ignored by PWM-period averaging. `StepAveragedCarrier` is renamed
+  to `TimeStepAveragedCarrier`.
+
+### Progress lines and watched quantities (#3)
+
+- `simulation.progress: {enable, period, watch}` replaces `simulation.progress_every`.
+  `--progress SECONDS` enables the lines; repeatable `--watch NAME` arguments, including
+  comma-separated names, replace the file's watch list.
+- Watched names may be state-table columns, plant/controller result columns, state aliases, or a
+  complex state without `.re`/`.im` to report its magnitude. State paths are entity-first, with no
+  `plant.*` domain. Unknown names report the known set at the first progress line, and observing
+  values does not change the simulation trajectory.
+
+### Packaging and verification
+
+- Runtime states use entity-first paths: `<entity>.*`, `<unit>.ctrl.*`, `<unit>.pwm.*` and
+  `<unit>.meas.*`; global solver bookkeeping remains `solver.*`. Unit configuration uses the same
+  abbreviations under `units.<unit>.ctrl` and `units.<unit>.meas`; old functional-first state names
+  and the `control`/`measurement` configuration keys are not aliases.
+- PWM register states use `<unit>.pwm.d_*` and `<unit>.pwm.shadow.d_*`; timing is derived rather
+  than exposed as clock, queue or generic `delay.*` states.
+- Project version is 0.1.4. The root `examples/` directory remains data-only, keeps the
+  `*-example.pes` names and is included in the wheel. The PEP 639 `AGPL-3.0-only` metadata is
+  unchanged.
+- Added Issue #3 acceptance coverage for every bundled file under all three bridge models,
+  mixed-model systems, CLI precedence and output paths, solver/PWM compatibility, progress values,
+  aliases, complex magnitudes and run invariance.
+
 ## 0.1.2
 
 ### Issue #2 simulation-file and event model
@@ -22,7 +85,7 @@
 ### Output, examples and packaging
 
 - State, control-signal and summary names use the same SI/per-unit convention as inputs.
-  Controller columns use `ctrl.<unit>.<signal>`. Missing events are `None`/JSON `null`, switches
+  Controller states use `<unit>.ctrl.<state>`. Missing events are `None`/JSON `null`, switches
   are 0 or 1, and alarms, port-Hamiltonian defaults and energy problems are lists.
 - Results save the fully resolved configuration as `simulation.pes`; `--resolved` prints the same
   representation, and both resolved and result-saved files can be run again.
@@ -118,7 +181,7 @@
 ### Simulation file parameters (#2)
 
 - `initial` and `output` are inside `simulation`; the former `simulation.log` fields are now
-  `simulation.output.period` and `simulation.output.control_every`.
+  `simulation.output.period` and `simulation.output.ctrl_every`.
 - Parameter names follow the SI/pu convention (no suffix for SI and `_pu` for per unit).
   `measurement.window_s`, current-loop `bw_hz`, VSG `h_s` and dVOC `kappa_rad` are now
   `window`, `bandwidth`, `h` and `kappa`.

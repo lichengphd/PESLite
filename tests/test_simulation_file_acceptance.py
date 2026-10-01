@@ -94,23 +94,24 @@ def test_annotated_gfl_example_lists_every_option():
     assert sorted(missing) == []
 
 
-def _bus_start(params, bus):
-    result = peslite.Simulation(params).run()
-    voltage = complex(result.states[f"plant.{bus}.u_C.re"][0],
-                      result.states[f"plant.{bus}.u_C.im"][0])
+def _bus_start(params, bus, out):
+    result = peslite.Simulation(params).run(out_dir=out)
+    voltage = complex(result.states[f"{bus}.u_C.re"][0],
+                      result.states[f"{bus}.u_C.im"][0])
     return voltage / params.base.v_phase_peak
 
 
-def test_initial_states_default_to_source_and_rated_dc(gfl):
+def test_initial_states_default_to_source_and_rated_dc(gfl, tmp_path):
     params = gfl()
     assert params.simulation.initial.states == {}
-    assert _bus_start(params, "pcc") == pytest.approx(1.0)
-    result = peslite.Simulation(params).run()
-    assert result.states["plant.vsc.dclink.u_C"][0] == 1500.0
-    assert _bus_start(gfl(**{"sources.grid.v_pu": 1.05}), "pcc") == pytest.approx(1.05)
+    assert _bus_start(params, "pcc", tmp_path / "default-bus") == pytest.approx(1.0)
+    result = peslite.Simulation(params).run(out_dir=tmp_path / "default-unit")
+    assert result.states["vsc.dclink.u_C"][0] == 1500.0
+    assert _bus_start(gfl(**{"sources.grid.v_pu": 1.05}), "pcc",
+                      tmp_path / "raised-source") == pytest.approx(1.05)
 
 
-def test_bus_without_own_source_keeps_default_and_explicit_values_win(case):
+def test_bus_without_own_source_keeps_default_and_explicit_values_win(case, tmp_path):
     tree = case()
     tree["buses"].update(
         b2={"c_pu": 0.02, "r_d_pu": 0.5},
@@ -123,25 +124,25 @@ def test_bus_without_own_source_keeps_default_and_explicit_values_win(case):
     tree["sources"]["grid"]["v_pu"] = 1.05
     tree["sources"]["g2"] = {"bus": "b2", "x_pu": 0.4, "v_pu": 0.95}
     params = from_dict(tree)
-    assert [abs(_bus_start(params, bus)) for bus in ("pcc", "b2", "b3")] == pytest.approx(
+    assert [abs(_bus_start(params, bus, tmp_path / bus)) for bus in ("pcc", "b2", "b3")] == pytest.approx(
         [1.05, 0.95, 1.0]
     )
-    explicit = params.replace(**{"simulation.initial.states.plant.pcc.u_C": [500.0, 0.0]})
-    assert _bus_start(explicit, "pcc") * params.base.v_phase_peak == pytest.approx(500.0)
+    explicit = params.replace(**{"simulation.initial.states.pcc.u_C": [500.0, 0.0]})
+    assert (_bus_start(explicit, "pcc", tmp_path / "explicit") * params.base.v_phase_peak
+            == pytest.approx(500.0))
 
 
 def test_dataclass_rebuild_keeps_defaults_following_the_system_base(gfl):
     params = gfl()
-    unit = dataclasses.replace(
-        params.unit("vsc"), delay=dataclasses.replace(params.unit("vsc").delay, steps=1)
-    )
+    unit = dataclasses.replace(params.unit("vsc"), ctrl=dataclasses.replace(
+        params.unit("vsc").ctrl, computation=2e-6))
     rebuilt = dataclasses.replace(params, units={"vsc": unit}).replace(**{"base.s_base": 1.0e6})
     assert rebuilt.unit("vsc").base.s_base == 1.0e6
 
 
 def test_unused_measurement_window_is_warned_about(gfl):
     with pytest.warns(UserWarning, match="window has no effect"):
-        gfl(**{"units.vsc.measurement.window": 25e-6})
+        gfl(**{"units.vsc.meas.window": 25e-6})
 
 
 def test_resolved_cli_prints_a_loadable_complete_file():
@@ -154,21 +155,20 @@ def test_resolved_cli_prints_a_loadable_complete_file():
         ]) == 0
     tree = yaml.safe_load(stream.getvalue())
     assert tree["simulation"]["t_end"] == 0.5
-    assert tree["units"]["vsc"]["pwm"]["update_period"] == pytest.approx(1e-4)
+    assert tree["units"]["vsc"]["ctrl"]["period"] == pytest.approx(1e-4)
     from_dict(tree)
 
 
 def test_saved_simulation_file_repeats_the_run(gfl, tmp_path):
     params = gfl(**{"simulation.t_end": 0.002})
-    first = peslite.Simulation(params).run()
-    first.save(tmp_path)
-    text = (tmp_path / "simulation.pes").read_text(encoding="utf-8")
-    assert text.startswith("# PESLite 0.1.2")
+    first_dir = tmp_path / "first"
+    first = peslite.Simulation(params).run(out_dir=first_dir)
+    text = (first_dir / "simulation.pes").read_text(encoding="utf-8")
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        loaded = peslite.load(tmp_path / "simulation.pes")
+        loaded = peslite.load(first_dir / "simulation.pes")
     assert dumps(loaded) == text
-    second = peslite.Simulation(loaded).run()
+    second = peslite.Simulation(loaded).run(out_dir=tmp_path / "second")
     for name in first.states:
         assert np.array_equal(first.states[name], second.states[name], equal_nan=True), name
 

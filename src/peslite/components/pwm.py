@@ -1,32 +1,29 @@
-"""The PWM peripheral of a converter: its publications, computation delay, carrier and modulators.
+"""The PWM peripheral of a converter: timer, duty registers, carrier and modulators.
 
-A modulator is called as ``mod(t, T_s, d_abc, theta=None, omega=None) -> SwitchingSequence``
-with times in s, duty ratios in [0, 1], ``theta`` in rad and ``omega`` in rad/s; it turns the duty
-ratios of one PWM publication interval into piecewise-constant switching states of the bridge.
+A modulator is called at every load of the compare registers for the interval until the next load.
 """
 
 from __future__ import annotations
 
 import math
-from collections import deque
 from dataclasses import dataclass
-from typing import Any, Iterator, Mapping, Protocol, runtime_checkable
+from typing import Any, Iterator, Mapping, Optional, Protocol, runtime_checkable
 
 import numpy as np
 from numpy.typing import NDArray
 
 from ..control.blocks import abc2complex
 
-__all__ = ["PWM", "SwitchingSequence", "Modulator", "Delay", "ComputationDelay", "CarrierComparison",
-           "SynchronousCarrier", "ZOH", "StepAveragedCarrier", "carrier", "carrier_position", "duty_fraction",
+__all__ = ["PWM", "TIME_EPS", "SwitchingSequence", "Modulator", "CarrierComparison",
+           "SynchronousCarrier", "ZOH", "TimeStepAveragedCarrier", "carrier", "carrier_position", "duty_fraction",
            "make_modulator"]
 
 
 @dataclass
 class SwitchingSequence:
-    """Piecewise-constant switching pattern over one PWM publication interval.
+    """Piecewise-constant switching pattern from one compare-register load to the next.
 
-    ``dt``: interval lengths (s) summing to the publication interval.
+    ``dt``: interval lengths (s) summing to the interval between compare-register loads.
     ``q_abc[i]``: phase states in interval ``i`` (0/1 when switching, fractional when averaged).
     """
 
@@ -36,121 +33,153 @@ class SwitchingSequence:
 
 @runtime_checkable
 class Modulator(Protocol):
-    """Convert duty ratios into a SwitchingSequence spanning ``T_c`` (s), the PWM publication interval.
+    """Convert loaded duty ratios into a SwitchingSequence spanning ``T`` seconds.
 
     Optional ``theta`` (rad) and ``omega`` (rad/s) set synchronous carrier timing; asynchronous modulators ignore them.
     """
 
-    def __call__(self, t: float, T_c: float, d_abc: NDArray[np.float64],
+    def __call__(self, t: float, T: float, d_abc: NDArray[np.float64],
                  theta: float | None = None, omega: float | None = None) -> SwitchingSequence: ...
 
 
-@runtime_checkable
-class Delay(Protocol):
-    """An N-sample delay line for the duty ratios (computation delay)."""
-
-    n_samples: int
-
-    def __call__(self, d_abc: NDArray[np.float64]) -> NDArray[np.float64]: ...
-
-    def reset(self, d_abc: NDArray[np.float64]) -> None: ...
-
-
-class ComputationDelay:
-    """Delay duty ratios by ``n_samples`` periods: ``d_applied[k] = d_ref[k - n_samples]``.
-
-    :meth:`reset` fills the pipeline with initial duty ratios; ``n_samples = 0`` passes through.
-    Named states: ``"<j>.d_a"``, ``"<j>.d_b"``, ``"<j>.d_c"``; ``j = 0`` is applied next.
-    """
-
-    def __init__(self, n_samples: int = 0) -> None:
-        if n_samples < 0:
-            raise ValueError("n_samples must be >= 0")
-        self.n_samples = int(n_samples)
-        self._buf: deque[NDArray[np.float64]] = deque()
-
-    def reset(self, d_abc: NDArray[np.float64]) -> None:
-        self._buf = deque(np.array(d_abc, dtype=float, copy=True) for _ in range(self.n_samples))
-
-    def __call__(self, d_abc: NDArray[np.float64]) -> NDArray[np.float64]:
-        d = np.asarray(d_abc, dtype=float)
-        if self.n_samples == 0:
-            return d
-        if len(self._buf) != self.n_samples:
-            self.reset(d)
-        self._buf.append(d)
-        return self._buf.popleft()
-
-    def get_state(self) -> dict[str, Any]:
-        return {f"{j}.d_{ph}": float(d[k]) for j, d in enumerate(self._buf) for k, ph in enumerate("abc")}
-
-    def set_state(self, values: Mapping[str, Any]) -> None:
-        for key, value in values.items():
-            j_str, _, name = key.partition(".")
-            if not j_str.isdigit() or name not in ("d_a", "d_b", "d_c") or int(j_str) >= len(self._buf):
-                raise KeyError(f"computation delay: no state {key!r} (pipeline length {len(self._buf)})")
-            self._buf[int(j_str)]["abc".index(name[-1])] = float(value)
+TIME_EPS = 1e-10
 
 
 class PWM:
-    """The PWM peripheral of a unit: at each publication, every ``period`` (s), the controller's duty
-    ratios pass the computation delay ``delay``, and ``modulator`` turns the duty ratios in force into
-    the switching instants of the period.
+    """Carrier timer, PWM duty registers and switching schedule.
 
-    Named states: ``d_a``, ``d_b``, ``d_c``, the duty ratios in force.
+    Interrupts occur every ``period`` from ``offset``. Compare registers load every
+    ``load_period``. An interrupt writes the new duty ratios to the shadow registers; they become
+    loadable after ``computation`` seconds. A load before then keeps the active registers unchanged.
     """
 
-    def __init__(self, period: float, modulator: Modulator, delay: Delay) -> None:
-        self.period, self.modulator, self.delay = period, modulator, delay
-        self.k = 0  # the next publication, at k * period
-        self.d = np.zeros(3)
-        self.sync: tuple[float | None, float | None] = (None, None)  # controller angle, frequency
-        self.start, self.end = 0.0, math.inf  # the current period
-        self.schedule: list[tuple[float, complex]] = []  # its switching instants still to come, and states
+    def __init__(self, period: float, load_period: float, offset: float, computation: float,
+                 carrier_period: float, modulator: Modulator) -> None:
+        if not math.isfinite(computation) or computation < 0.0:
+            raise ValueError(f"the computation time must be finite and >= 0, got {computation}")
+        self.period, self.load_period, self.offset = float(period), float(load_period), float(offset)
+        self.computation, self.carrier_period = float(computation), float(carrier_period)
+        self.modulator = modulator
+        self.k = self.j = 0
+        self.t_interrupt, self.t_load = self.interrupt(0), self.load_time(0)
+        zero = np.zeros(3)
+        self.active, self.shadow = zero.copy(), zero.copy()
+        self.sync: tuple[float | None, float | None] = (None, None)
+        self.t_sync = 0.0
+        self.schedule: list[tuple[float, complex]] = []
         self.next_switch = math.inf
+        self.load_end = math.inf
+
+    def interrupt(self, k: int) -> float:
+        return self.offset + k * self.period
+
+    def load_time(self, j: int) -> float:
+        return self.offset + j * self.load_period
 
     @property
     def t_next(self) -> float:
-        """The time of the next publication (s)."""
-        return self.k * self.period
+        """Next control interrupt (temporary name retained while the run loop is migrated)."""
+        return self.t_interrupt
 
-    def publish(self, d_abc: NDArray[np.float64], theta: float | None = None, omega: float | None = None) -> None:
-        """Take the controller's duty ratios (and angle and frequency) through the computation delay."""
-        self.d = self.delay(d_abc)
-        self.sync = (theta, omega)
+    def after(self, t: float, period: Optional[float] = None) -> int:
+        """Index of the first timer point after ``t``; a point at ``t`` is not after it."""
+        T = self.period if period is None else period
+        return int(math.floor((t - self.offset + TIME_EPS) / T)) + 1
 
-    def modulate(self, t: float) -> complex:
-        """Start the period at ``t`` with the duty ratios in force: schedule its switching instants and
-        return the switching state (space vector) at ``t``."""
-        seq = self.modulator(t, self.period, self.d, *self.sync)
-        q = [abc2complex(row) for row in np.asarray(seq.q_abc, dtype=float).tolist()]
-        times, t_i = [], t
-        for dt in np.asarray(seq.dt, dtype=float).tolist()[:-1]:
-            t_i = t_i + dt
-            times.append(t_i)
-        self.start, self.end = t, t + self.period
-        self.schedule = list(zip(times, q[1:]))
-        self.next_switch = self.schedule[0][0] if self.schedule else math.inf
+    def describe(self) -> str:
+        double = self.load_period < 0.75 * self.carrier_period
+        return (f"control {1e-3 / self.period:g} kHz, computation {self.computation * 1e6:g} us, "
+                f"{'double' if double else 'single'} update")
+
+    def reset(self, d_abc: NDArray[np.float64]) -> None:
+        """Put the same initial duty ratios in the active and shadow registers."""
+        d = np.array(d_abc, dtype=float, copy=True)
+        self.active, self.shadow = d.copy(), d.copy()
+
+    def tick(self, t: float, theta: float | None = None, omega: float | None = None) -> None:
+        """Advance the control-interrupt timer and its synchronous-carrier reference."""
+        self.sync, self.t_sync = (theta, omega), t
         self.k += 1
-        return q[0]
+        self.t_interrupt = self.interrupt(self.k)
 
-    def switches(self, t: float, eps: float) -> list[complex]:
-        """Return the switching states due at ``t`` (within ``eps`` s), in order."""
+    def write_shadow(self, d_abc: NDArray[np.float64]) -> None:
+        """Write the computed duty ratios to the shadow registers."""
+        self.shadow = np.array(d_abc, dtype=float, copy=True)
+
+    def write(self, t: float, d_abc: NDArray[np.float64], theta: float | None = None,
+              omega: float | None = None) -> None:
+        """Advance an interrupt and write its computed duty ratios to shadow."""
+        self.tick(t, theta, omega)
+        self.write_shadow(d_abc)
+
+    def start(self, t: float, sync: tuple[float | None, float | None], continued: bool) -> complex:
+        """Resume the timer and switching sequence at ``t`` after named states were loaded."""
+        self.k, self.j = self.after(t), self.after(t, self.load_period)
+        self.t_interrupt, self.t_load = self.interrupt(self.k), self.load_time(self.j)
+        last = self.interrupt(self.k - 1)
+        self.sync, self.t_sync = sync, min(last, t)
+        q = self._switching(self.load_time(self.j - 1), self.active, t)
+        if not continued:
+            self.t_sync = t
+        return q
+
+    def load(self, t: float) -> complex:
+        """Load shadow into active registers and schedule switching until the next load."""
+        completed = self.interrupt(self.k - 1) + self.computation
+        if completed <= t + TIME_EPS:
+            self.active = self.shadow.copy()
+        q = self._switching(t, self.active, t)
+        self.j += 1
+        self.t_load = self.load_time(self.j)
+        return q
+
+    def _switching(self, t_l: float, d: NDArray[np.float64], t_now: float) -> complex:
+        theta, omega = self.sync
+        if theta is not None and omega is not None and t_l != self.t_sync:
+            theta = theta + omega * (t_l - self.t_sync)
+        seq = self.modulator(t_l, self.load_period, d, theta, omega)
+        dt = np.asarray(seq.dt, dtype=float).tolist()
+        states = np.asarray(seq.q_abc, dtype=float).tolist()
+        self.load_end = t_l + self.load_period
+        schedule: list[tuple[float, complex]] = []
+        q_now, t_i = abc2complex(states[0]), t_l
+        for i in range(len(dt) - 1):
+            t_i += dt[i]
+            q = abc2complex(states[i + 1])
+            if t_i <= t_now + TIME_EPS:
+                q_now = q
+            else:
+                schedule.append((t_i, q))
+        self.schedule = schedule
+        self.next_switch = schedule[0][0] if schedule else math.inf
+        return q_now
+
+    def edge(self, t: float) -> bool:
+        return abs(self.next_switch - t) < TIME_EPS or abs(self.load_end - t) < TIME_EPS
+
+    def switches(self, t: float) -> list[complex]:
+        """Return switching states due at ``t`` in order."""
         due = []
-        while self.schedule and abs(self.schedule[0][0] - t) < eps:
+        while self.schedule and abs(self.schedule[0][0] - t) < TIME_EPS:
             due.append(self.schedule.pop(0)[1])
         self.next_switch = self.schedule[0][0] if self.schedule else math.inf
         return due
 
     def get_state(self) -> dict[str, Any]:
-        return {f"d_{ph}": float(self.d[k]) for k, ph in enumerate("abc")}
+        out = {f"d_{ph}": float(self.active[k]) for k, ph in enumerate("abc")}
+        out.update({f"shadow.d_{ph}": float(self.shadow[k]) for k, ph in enumerate("abc")})
+        return out
 
     def set_state(self, values: Mapping[str, Any]) -> None:
-        d = np.array(self.d, dtype=float)
-        for k, ph in enumerate("abc"):
-            if f"d_{ph}" in values:
-                d[k] = values[f"d_{ph}"]
-        self.d = d
+        names = set(self.get_state())
+        unknown = set(values) - names
+        if unknown:
+            raise KeyError(f"PWM registers: no state(s) {sorted(unknown)}; known: {sorted(names)}")
+        for key, value in values.items():
+            head, _, name = key.rpartition(".")
+            k = "abc".index(name[-1])
+            target = {"": self.active, "shadow": self.shadow}[head]
+            target[k] = float(value)
 
 
 # ------------------------------------------------------------------ the triangular carrier
@@ -283,7 +312,7 @@ class SynchronousCarrier:
 
 
 class ZOH:
-    """Averaged bridge: hold the duty ratios as the switching state for the period."""
+    """PWM-period averaging: hold the duty ratios as the switching state for the period."""
 
     def __call__(self, t: float, T_s: float, d_abc: NDArray[np.float64],
                  theta: float | None = None, omega: float | None = None) -> SwitchingSequence:
@@ -291,8 +320,8 @@ class ZOH:
         return SwitchingSequence(np.array([T_s]), d.reshape(1, 3))
 
 
-class StepAveragedCarrier:
-    """Step-averaged bridge: per ``dt`` step, the on-fraction of the carrier comparison."""
+class TimeStepAveragedCarrier:
+    """Time-step averaging: per solver step, the on-fraction of the carrier comparison."""
 
     def __init__(self, f_sw: float, dt: float, phase: float = 0.0) -> None:
         self.f_sw, self.dt, self.phase = float(f_sw), float(dt), float(phase)
@@ -310,16 +339,16 @@ class StepAveragedCarrier:
         return SwitchingSequence(np.full(n, h), states)
 
 
-def make_modulator(pwm: Any, f0: float, sim: Any) -> Modulator:
-    """Return the modulator for ``simulation.bridge`` and ``pwm.sync``.
+def make_modulator(pwm: Any, f0: float, averaging: Any, sim: Any) -> Modulator:
+    """Return the modulator selected by one unit's ``averaging`` and ``pwm.sync``.
 
-    ``bridge``: ``"switching"``, ``"averaged"`` or ``"step_averaged"``.
+    A disabled averaging section uses carrier comparison. PWM-period averaging holds the duty
+    ratios continuously; time-step averaging uses the carrier's on-fraction per solver step.
     """
-    bridge = sim.bridge
-    if bridge == "switching":
+    if not averaging.enable:
         if pwm.sync == "synchronous":
             return SynchronousCarrier(round(pwm.f_sw / f0), pwm.carrier_phase)
         return CarrierComparison(pwm.f_sw, pwm.carrier_phase)
-    if bridge == "averaged":
-        return ZOH()
-    return StepAveragedCarrier(pwm.f_sw, sim.solver.dt, pwm.carrier_phase)
+    if averaging.over == "time_step":
+        return TimeStepAveragedCarrier(pwm.f_sw, sim.solver.dt, pwm.carrier_phase)
+    return ZOH()

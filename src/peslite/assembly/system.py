@@ -64,8 +64,8 @@ class System:
     def __init__(self, p: Params, parts: Optional[Mapping[str, Any]] = None) -> None:
         """Build the system described by ``p``, including registered ``elements`` entries.
 
-        parts: replacement units or unit parts keyed ``"<unit>"``, ``"<unit>.ctrl"``, ``"<unit>.modulator"``,
-        ``"<unit>.delay"``.
+        parts: replacement units or unit parts keyed ``"<unit>"``, ``"<unit>.ctrl"`` or
+        ``"<unit>.modulator"``.
         """
         self.p = p
         parts = dict(parts or {})
@@ -85,8 +85,7 @@ class System:
         for name, cfg in p.units.items():
             self.units[name] = parts.get(name) or Unit(
                 name, cfg, p.simulation, self.buses[cfg.bus],
-                ctrl=parts.get(f"{name}.ctrl"), modulator=parts.get(f"{name}.modulator"),
-                delay=parts.get(f"{name}.delay"))
+                ctrl=parts.get(f"{name}.ctrl"), modulator=parts.get(f"{name}.modulator"))
 
         # ---------------------------------------------------------- the wiring
         subsystems: dict[str, Any] = dict(self.buses)
@@ -122,6 +121,13 @@ class System:
             self.state_aliases.update(unit.aliases())
 
     # ---------------------------------------------------------------- states
+    def state_parts(self) -> list[tuple[str, Any]]:
+        """Return the power model and unit state owners in state-table order."""
+        parts: list[tuple[str, Any]] = [("", self.model)]
+        for unit in self.units.values():
+            parts.extend(unit.state_parts())
+        return parts
+
     def get_state(self) -> dict[str, Any]:
         """Return every plant state (model and units) by name; model outputs must be synced first."""
         s: dict[str, Any] = self.model.get_state()

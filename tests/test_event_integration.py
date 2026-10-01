@@ -96,7 +96,7 @@ class _PlainHeun:
         return SolverStep(t1, y, self.n_rhs)
 
 
-def test_event_is_an_exact_stop_and_solver_hooks_bracket_the_model_change():
+def test_event_is_an_exact_stop_and_solver_hooks_bracket_the_model_change(tmp_path):
     event_t = 0.000137
     p = _gfl(**{"simulation.t_end": 0.0003},
              **_set("retune", event_t, **{"sources.grid.r_pu": 0.08}))
@@ -111,7 +111,7 @@ def test_event_is_an_exact_stop_and_solver_hooks_bracket_the_model_change():
         apply(change)
 
     sim.system.apply = recorded_apply
-    sim.run()
+    sim.run(out_dir=tmp_path)
 
     assert any(abs(end - event_t) < 1e-14 for end in solver.ends)
     assert solver.hooks == [
@@ -128,7 +128,7 @@ def test_event_is_an_exact_stop_and_solver_hooks_bracket_the_model_change():
     assert after_event and all(value == pytest.approx(2 * old_r) for value in after_event)
 
 
-def test_registered_custom_event_runs_once_at_its_exact_time():
+def test_registered_custom_event_runs_once_at_its_exact_time(tmp_path):
     event_t = 0.000137
     p = _gfl(**{
         "simulation.t_end": 0.0003,
@@ -136,11 +136,11 @@ def test_registered_custom_event_runs_once_at_its_exact_time():
     })
     sim = peslite.Simulation(p)
     RUNS.clear()
-    sim.run()
+    sim.run(out_dir=tmp_path)
     assert RUNS == [("seen", sim.system, event_t)]
 
 
-def test_set_event_before_restart_time_is_in_force_before_the_first_stage():
+def test_set_event_before_restart_time_is_in_force_before_the_first_stage(tmp_path):
     p = _gfl(**{
         "simulation.initial.t": 0.0002,
         "simulation.t_end": 0.0004,
@@ -150,7 +150,7 @@ def test_set_event_before_restart_time_is_in_force_before_the_first_stage():
     sim = peslite.Simulation(p, solver=solver)
     solver.source = sim.system.sources["grid"]
     old_r = solver.source.branch.R
-    sim.run()
+    sim.run(out_dir=tmp_path)
     assert solver.stages[0][0] == pytest.approx(0.0002)
     assert solver.stages[0][1] == pytest.approx(2 * old_r)
 
@@ -205,7 +205,7 @@ def test_shortened_multirate_window_uses_its_length_and_keeps_the_grid(method):
     assert np.array_equal(final, other.settle(0.0055, continued))
 
 
-def test_multirate_refreshes_storage_parameters_after_a_set_event():
+def test_multirate_refreshes_storage_parameters_after_a_set_event(tmp_path):
     event_t = 0.000137
     p = _gfl(**{
         "simulation.t_end": 0.00015,
@@ -214,13 +214,13 @@ def test_multirate_refreshes_storage_parameters_after_a_set_event():
     })
     sim = peslite.Simulation(p)
     old_inductance = sim.system.sources["grid"].branch.L
-    sim.run()
+    sim.run(out_dir=tmp_path)
     held = {storage.label: storage for storage in sim.solver.held_storages}
     assert held["grid.branch.i"].value == pytest.approx(2 * old_inductance)
 
 
 @pytest.mark.parametrize("kind", ["rk4", "DP45", "multirate", "user"])
-def test_fixed_adaptive_multirate_and_user_solver_use_the_right_model_at_event(kind):
+def test_fixed_adaptive_multirate_and_user_solver_use_the_right_model_at_event(kind, tmp_path):
     event_t = 0.00137
     solver_settings = {
         "rk4": {},
@@ -261,7 +261,7 @@ def test_fixed_adaptive_multirate_and_user_solver_use_the_right_model_at_event(k
     simulation.system.apply = recorded_apply
     model.rhs_list = watch(model.rhs_list)
     model.rhs_group = watch(model.rhs_group)
-    simulation.run()
+    simulation.run(out_dir=tmp_path)
 
     assert any(abs(t - event_t) < 1e-14 and not after for t, after in seen)
     assert source.emf.out.phi == 0.1
@@ -280,18 +280,18 @@ def test_run_continued_across_an_event_matches_the_whole_run(tmp_path):
         "simulation.solver.subsystems": {"grid.branch": 4},
         **_set("jump", event_t, **{"sources.grid.angle": 0.1, "sources.grid.r_pu": 0.08}),
     }
-    whole = peslite.Simulation(_gfl(**changes)).run()
-    peslite.Simulation(_gfl(**changes)).run(event_t).save(tmp_path)
+    whole = peslite.Simulation(_gfl(**changes)).run(out_dir=tmp_path / "whole")
+    peslite.Simulation(_gfl(**changes)).run(event_t, out_dir=tmp_path / "first")
     continued_params = peslite.load(
         EXAMPLES / "gfl-example.pes",
-        initial=tmp_path / "states.csv",
+        initial=tmp_path / "first" / "states.csv",
         **{"simulation.energy_check": "off", "simulation.solver.linearisations": 0, **changes},
     )
-    continued = peslite.Simulation(continued_params).run()
+    continued = peslite.Simulation(continued_params).run(out_dir=tmp_path / "continued")
     assert continued.final_states() == whole.final_states()
 
 
-def test_disconnected_converter_pauses_control_and_a_trip_cannot_reconnect():
+def test_disconnected_converter_pauses_control_and_a_trip_cannot_reconnect(tmp_path):
     protections_off = {
         f"units.vsc.protection.{name}.enable": 0
         for name in ("overcurrent", "undervoltage", "overvoltage", "frequency", "dc_voltage", "rocof")
@@ -304,9 +304,9 @@ def test_disconnected_converter_pauses_control_and_a_trip_cannot_reconnect():
         "events.off": {"type": "disconnect", "target": "vsc", "t": 0.0006},
         "events.on": {"type": "connect", "target": "vsc", "t": 0.0009},
     })
-    result = peslite.Simulation(p).run()
+    result = peslite.Simulation(p).run(out_dir=tmp_path / "disconnected")
     t = result.states["t"]
-    integral = result.states["ctrl.vsc.cc.integral_pu.re"]
+    integral = result.states["vsc.ctrl.cc.integral_pu.re"]
     assert np.ptp(integral[t < 0.0002 - 1e-12]) == 0.0
     assert np.ptp(integral[(t > 0.0006 + 1e-12) & (t < 0.0009 - 1e-12)]) == 0.0
 
@@ -321,6 +321,6 @@ def test_disconnected_converter_pauses_control_and_a_trip_cannot_reconnect():
     })
     with pytest.warns(UserWarning, match="has tripped.*leaves it disconnected"):
         sim = peslite.Simulation(tripping)
-        result = sim.run()
+        result = sim.run(out_dir=tmp_path / "tripped")
     assert result.tripped
     assert sim.unit().tripped and sim.unit().branch_f.breaker_open

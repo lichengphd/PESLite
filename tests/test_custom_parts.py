@@ -127,13 +127,13 @@ def _custom_case(case):
     tree = case()
     unit = tree["units"]["vsc"]
     unit["dclink"] = {"vdc_ref": 1500.0, "source": {"type": "voltage"}}
-    unit["control"] = {
+    unit["ctrl"] = {
         "type": "gfm",
         "loops": {
             "power": {"type": "power", "period": 5e-5},
             "sync": {"type": "test_lagged_psc", "period": 5e-5,
                      "k_p_pu": 6.2832, "tau": 0.02},
-            "impedance": {"type": "virtual_impedance"},
+            "vi": {"type": "virtual_impedance"},
             "damp": {"type": "active_damping", "period": 5e-5,
                      "r_a_pu": 0.2, "alpha_d": 40.0},
         },
@@ -150,15 +150,15 @@ def _custom_case(case):
     return tree
 
 
-def test_registered_custom_parts_and_user_solver_work_together(case):
+def test_registered_custom_parts_and_user_solver_work_together(case, tmp_path):
     params = from_dict(_custom_case(case))
     solver = _Midpoint(params.simulation.solver.dt)
     simulation = peslite.Simulation(params, solver=solver)
     load = simulation.system.named_elements["load"].branch
     original_resistance = load.R
-    result = simulation.run()
+    result = simulation.run(out_dir=tmp_path)
 
-    assert "ctrl.vsc.sync.p_f_pu" in result.states
+    assert "vsc.ctrl.sync.p_f_pu" in result.states
     assert load.R == pytest.approx(0.5 * original_resistance)
     assert any(abs(end - 0.002) < 1e-14 for end in solver.ends)
     assert result.n_rhs > 0
@@ -167,7 +167,7 @@ def test_registered_custom_parts_and_user_solver_work_together(case):
 @pytest.mark.parametrize(
     ("path", "value", "message"),
     [
-        ("units.vsc.control.loops.sync.tau", 0.0, "tau must be > 0"),
+        ("units.vsc.ctrl.loops.sync.tau", 0.0, "tau must be > 0"),
         ("elements.load.bus", "missing", "unknown bus"),
         ("events.load_step.factor", -1.0, "factor must be > 0"),
     ],

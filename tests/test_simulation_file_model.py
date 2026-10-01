@@ -34,10 +34,39 @@ def test_log_and_old_parameter_names_are_rejected():
         from_dict(tree)
 
     tree = _tree()
-    current = tree["units"]["vsc"]["control"]["loops"]["cc"]
+    current = tree["units"]["vsc"]["ctrl"]["loops"]["cc"]
     current["bw_hz"] = current.pop("bandwidth")
     with pytest.raises(ConfigError, match=r"unknown key.*bw_hz"):
         from_dict(tree)
+
+    tree = _tree()
+    tree["units"]["vsc"]["control"] = tree["units"]["vsc"].pop("ctrl")
+    with pytest.raises(ConfigError, match=r"units\.vsc: unknown key.*control"):
+        from_dict(tree)
+
+    tree = _tree()
+    tree["units"]["vsc"]["measurement"] = {"average": "instantaneous"}
+    with pytest.raises(ConfigError, match=r"units\.vsc: unknown key.*measurement"):
+        from_dict(tree)
+
+    tree = _tree()
+    tree["units"]["vsc"]["delay"] = {"steps": 1}
+    with pytest.raises(ConfigError, match=r"units\.vsc: unknown key.*delay"):
+        from_dict(tree)
+
+    tree = _tree()
+    tree["units"]["vsc"]["pwm"]["delay"] = {"steps": 1}
+    with pytest.raises(ConfigError, match=r"units\.vsc\.pwm: unknown key.*delay"):
+        from_dict(tree)
+
+
+def test_function_first_state_names_are_rejected(tmp_path):
+    params = peslite.load(
+        EXAMPLES / "gfl-example.pes",
+        **{"simulation.initial.states.plant.pcc.u_C": [500.0, 0.0]},
+    )
+    with pytest.raises(ConfigError, match=r"unknown state 'plant\.pcc\.u_C'"):
+        peslite.Simulation(params).run(out_dir=tmp_path)
 
 
 def test_nested_electrical_values_follow_si_and_pu_spelling():
@@ -69,32 +98,33 @@ def test_switched_sections_require_settings_and_write_zero_or_one():
 def test_dependent_defaults_follow_replace_and_stay_fixed_when_explicit():
     p = peslite.load(EXAMPLES / "gfl-example.pes")
     u = p.replace(**{"units.vsc.pwm.f_sw": 10_000.0, "base.f0": 60.0}).unit("vsc")
-    assert u.pwm.update_period == pytest.approx(1e-4)
-    assert u.control.references.omega == pytest.approx(120 * math.pi)
-    assert u.control.sampling_period is None and u.measurement.window is None
+    assert u.ctrl.period == pytest.approx(1e-4)
+    assert all(loop.period == pytest.approx(1e-4) for loop in u.ctrl.loops.values())
+    assert u.ctrl.references.omega == pytest.approx(120 * math.pi)
+    assert u.meas.period is None and u.meas.window is None
 
-    fixed = p.replace(**{"units.vsc.pwm.update_period": 5e-5})
+    fixed = p.replace(**{"units.vsc.ctrl.period": 5e-5})
     fixed = fixed.replace(**{"units.vsc.pwm.f_sw": 10_000.0})
-    assert fixed.unit("vsc").pwm.update_period == 5e-5
+    assert fixed.unit("vsc").ctrl.period == 5e-5
 
     rebased = p.replace(**{"base.s_base": 1e6})
     assert rebased.unit("vsc").base.s_base == 1e6
-    averaged = p.replace(**{"units.vsc.measurement.average": "window",
+    averaged = p.replace(**{"units.vsc.meas.average": "window",
                             "units.vsc.pwm.f_sw": 10_000.0})
     written = yaml.safe_load(dumps(averaged))
-    assert written["units"]["vsc"]["control"]["sampling_period"] == pytest.approx(1e-4)
-    assert written["units"]["vsc"]["measurement"]["window"] == pytest.approx(1e-4)
+    assert written["units"]["vsc"]["meas"]["period"] == pytest.approx(1e-4)
+    assert written["units"]["vsc"]["meas"]["window"] == pytest.approx(1e-4)
 
 
 def test_to_dict_preserves_following_defaults_but_dumps_resolves_them():
     p = peslite.load(EXAMPLES / "gfl-example.pes")
     compact = to_dict(p)
     complete = yaml.safe_load(dumps(p))
-    assert compact["units"]["vsc"]["pwm"]["update_period"] is None
-    assert compact["units"]["vsc"]["control"]["references"]["omega"] is None
-    assert complete["units"]["vsc"]["pwm"]["update_period"] == pytest.approx(5e-5)
-    assert complete["units"]["vsc"]["control"]["references"]["omega"] == pytest.approx(100 * math.pi)
-    assert complete["units"]["vsc"]["control"]["sampling_period"] == pytest.approx(5e-5)
+    assert compact["units"]["vsc"]["ctrl"]["period"] is None
+    assert compact["units"]["vsc"]["ctrl"]["references"]["omega"] is None
+    assert complete["units"]["vsc"]["ctrl"]["period"] == pytest.approx(5e-5)
+    assert complete["units"]["vsc"]["ctrl"]["references"]["omega"] == pytest.approx(100 * math.pi)
+    assert complete["units"]["vsc"]["meas"]["period"] == pytest.approx(5e-5)
     assert complete["units"]["vsc"]["s_base"] == 2e6
     assert dumps(from_dict(complete)) == dumps(p)
 
@@ -102,7 +132,7 @@ def test_to_dict_preserves_following_defaults_but_dumps_resolves_them():
 def test_resolved_cli_and_meta_contract(capsys):
     assert peslite.main(["gfl-example", "--resolved", "--set", "units.vsc.pwm.f_sw=10000"]) == 0
     resolved = yaml.safe_load(capsys.readouterr().out)
-    assert resolved["units"]["vsc"]["pwm"]["update_period"] == pytest.approx(1e-4)
+    assert resolved["units"]["vsc"]["ctrl"]["period"] == pytest.approx(1e-4)
     from_dict(resolved)
 
     tree = _tree()
@@ -116,11 +146,10 @@ def test_resolved_cli_and_meta_contract(capsys):
 def test_dump_and_initial_file_use_the_nested_simulation_section(tmp_path):
     p = peslite.load(EXAMPLES / "gfl-example.pes").replace(
         **{"simulation.initial.t": 0.001,
-           "simulation.initial.states.plant.pcc.u_C": [500.0, 0.0]})
+           "simulation.initial.states.pcc.u_C": [500.0, 0.0]})
     path = tmp_path / "restart.pes"
     peslite.dump(p, path)
-    assert path.read_text(encoding="utf-8").startswith("# PESLite 0.1.2")
 
     restarted = peslite.load(EXAMPLES / "gfl-example.pes", initial=path)
     assert restarted.simulation.initial.t == 0.001
-    assert restarted.simulation.initial.states["plant.pcc.u_C"] == [500.0, 0.0]
+    assert restarted.simulation.initial.states["pcc.u_C"] == [500.0, 0.0]

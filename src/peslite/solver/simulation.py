@@ -2,15 +2,14 @@
 event loop, and the command line (the ``peslite`` command).
 
 Between events the solver integrates the model; the events are those of the file, each unit's ADC
-samples, loop updates, PWM publications, averaging-window openings and switching instants, and the
-snapshots. Order at a coincident instant: file events, over-current check, ADC samples, loop updates,
-PWM publication, window opening, switching instants, snapshot.
+samples, control interrupts, PWM loads, averaging-window openings and switching instants, and the
+snapshots. Order at a coincident instant: file events, over-current check, ADC samples, control
+interrupts, PWM loads, window opening, switching instants, snapshot.
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import dataclasses
 import json
 import math
@@ -18,6 +17,7 @@ import sysconfig
 import time
 import warnings
 from collections import deque
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
@@ -29,11 +29,11 @@ from ..assembly.events import EVENT_TYPES, SWITCHING, connected_at, switching_sc
 from ..assembly.params import Change, Params, dump, dumps, load
 from ..assembly.system import System
 from ..assembly.unit import Unit
-from ..components.pwm import Delay, Modulator
+from ..components.pwm import Modulator
 from ..control.blocks import abc2complex, complex2abc
 from ..control.controller import Controller
 from .integrators import Solver
-from .model import ConfigError, expand_aliases, flatten, gather, resolve, scatter
+from .model import ConfigError, StateRegistry, expand_aliases, flatten, resolve
 from .multirate import make_solver
 from .splitbound import split_error_bound
 
@@ -49,188 +49,267 @@ def _finite(y: np.ndarray) -> bool:
     return all(map(math.isfinite, y.tolist()))
 
 
+def _plant_output_row(params: Params, t: float, plant: Mapping[str, Any],
+                      ctrl_logs: Mapping[str, Mapping[str, float]],
+                      ctrl_names: Mapping[str, Iterable[str]] | None = None) -> dict[str, float]:
+    """Convert one raw plant snapshot into one public, real-valued output row."""
+    row: dict[str, float] = {"t": t}
+    for key, value in plant.items():
+        head, _, what = key.rpartition(".")
+        if what in ("u_g", "i_c", "i", "u") and np.iscomplexobj(value):
+            stem = {"u_g": "v", "i_c": "i_conv", "i": "i", "u": "v"}[what]
+            for phase, phase_value in zip("abc", complex2abc(complex(value))):
+                row[f"{head}.{stem}_{phase}"] = float(phase_value)
+    for name in params.units:
+        for what in ("u_dc", "i_dc"):
+            key = f"{name}.{what}"
+            if key in plant:
+                row[key] = float(plant[key])
+    for name in params.sources:
+        key = f"{name}.angle"
+        if key in plant:
+            row[key] = float(plant[key])
+    names_by_unit = ctrl_names or {unit: log for unit, log in ctrl_logs.items()}
+    for unit, names in names_by_unit.items():
+        log = ctrl_logs.get(unit, {})
+        row.update({f"{unit}.{key}": float(log.get(key, math.nan)) for key in names})
+    return row
+
+
 # ------------------------------------------------------------------ what a run produces
 
 @dataclass
 class SimulationResult:
     params: Params
-    t: np.ndarray
-    plant: dict[str, np.ndarray]
-    control: dict[str, np.ndarray]
-    states: dict[str, np.ndarray] = field(default_factory=dict)
-    energy: dict[str, np.ndarray] = field(default_factory=dict)
+    _records: Any = field(repr=False)
+    out_dir: Path | None = None
+    files: list[Path] = field(default_factory=list)
     summary: dict[str, Any] = field(default_factory=dict)
     wall_time: float = 0.0
     n_rhs: int = 0
+
+    @property
+    def t(self) -> np.ndarray:
+        """Snapshot times, read from the streamed result when requested."""
+        return self._records.t
+
+    @property
+    def plant(self) -> Mapping[str, np.ndarray]:
+        """Plant output columns, read one at a time from ``plant.csv``."""
+        return self._records.plant
+
+    @property
+    def ctrl(self) -> Mapping[str, np.ndarray]:
+        """Controller logs, read one column at a time from the streamed result."""
+        return self._records.ctrl
+
+    @property
+    def states(self) -> Mapping[str, np.ndarray]:
+        """State columns, read one at a time from the streamed result."""
+        return self._records.states
+
+    @property
+    def energy(self) -> Mapping[str, np.ndarray]:
+        """Energy columns, read one at a time from the streamed result."""
+        return self._records.energy
 
     @property
     def tripped(self) -> bool:
         return bool(self.summary.get("tripped", 0))
 
     def columns(self) -> dict[str, np.ndarray]:
-        """Return flat real columns: plant quantities in SI and controller logs in pu.
-
-        Names: ``<bus>.v_a``, ``<unit>.i_conv_a``, ``<branch>.i_a``, ``<source>.i_a``, ``<source>.angle``,
-        ``<unit>.u_dc``/``<unit>.i_dc`` (V/A) and the controllers' logged signals.
-        """
-        cols: dict[str, np.ndarray] = {"t": self.t}
-        for key, vec in self.plant.items():
-            head, _, what = key.rpartition(".")
-            if what in ("u_g", "i_c", "i", "u") and len(vec) and np.iscomplexobj(vec):
-                stem = {"u_g": "v", "i_c": "i_conv", "i": "i", "u": "v"}[what]
-                abc = np.array([complex2abc(z) for z in vec])
-                for k, ph in enumerate("abc"):
-                    cols[f"{head}.{stem}_{ph}"] = abc[:, k]
-        for name in self.params.units:
-            if f"{name}.u_dc" in self.plant:
-                cols[f"{name}.u_dc"] = self.plant[f"{name}.u_dc"]
-            if f"{name}.i_dc" in self.plant:
-                cols[f"{name}.i_dc"] = self.plant[f"{name}.i_dc"]
-        for name in self.params.sources:
-            if f"{name}.angle" in self.plant:
-                cols[f"{name}.angle"] = self.plant[f"{name}.angle"]
-        for key, arr in self.plant.items():
-            if key.startswith("ctrl."):
-                cols[key[5:]] = arr
-        return cols
-
-    def to_csv(self, path: str | Path) -> None:
-        _write(path, self.columns())
-
-    def control_to_csv(self, path: str | Path) -> None:
-        """Write one control-log CSV per unit, ``<path stem>.<unit>.csv``; return the paths."""
-        path = Path(path)
-        written = []
-        for name in self.params.units:
-            head = f"{name}."
-            cols = {"t": self.control[f"{name}.t"]} if f"{name}.t" in self.control else {}
-            cols.update({k[len(head):]: v for k, v in self.control.items()
-                         if k.startswith(head) and k != f"{name}.t"})
-            if len(cols) > 1:
-                out = path.with_name(f"{path.stem}.{name}{path.suffix}")
-                _write(out, cols)
-                written.append(out)
-        return written
+        """Return all real-valued columns of ``plant.csv``."""
+        return {"t": self.t, **{key: values for key, values in self.plant.items()}}
 
     # ------------------------------------------------------------ states
     def final_states(self) -> dict[str, float]:
         """Return the last row of the state table (``t`` included)."""
-        return {k: float(v[-1]) for k, v in self.states.items()}
+        return dict(self._records.final_states)
 
-    def states_to_csv(self, path: str | Path) -> None:
-        """Write the state table at full precision, so a row read back reproduces the state exactly."""
-        keys = list(self.states)
-        with Path(path).open("w", newline="") as fh:
-            w = csv.writer(fh)
-            w.writerow(keys)
-            columns = [self.states[k].tolist() for k in keys]
-            for row in zip(*columns):
-                w.writerow([repr(v) for v in row])
 
-    def energy_to_csv(self, path: str | Path) -> None:
-        keys = list(self.energy)
-        with Path(path).open("w", newline="") as fh:
-            w = csv.writer(fh)
-            w.writerow(keys)
-            for row in zip(*(self.energy[k] for k in keys)):
-                w.writerow([f"{v:.10g}" for v in row])
 
-    def save(self, out_dir: str | Path, info: dict[str, Any] | None = None) -> list[Path]:
-        """Write the configured output files into ``out_dir`` and return their paths.
+class _CSVTable:
+    """A fixed-width numeric table flushed to CSV every ``batch_rows`` rows."""
 
-        info: extra entries for ``summary.json``.
-        """
-        out = Path(out_dir)
-        out.mkdir(parents=True, exist_ok=True)
-        written = []
-        output = self.params.simulation.output
-        if output.states:
-            self.states_to_csv(out / "states.csv")
-            written.append(out / "states.csv")
-        if output.signals:
-            self.to_csv(out / "plant.csv")
-            written += [out / "plant.csv"] + self.control_to_csv(out / "control.csv")
-        if output.energy and self.energy:
-            self.energy_to_csv(out / "energy.csv")
-            written.append(out / "energy.csv")
-        summary = {**(info or {}), "wall_time": self.wall_time, "n_rhs": self.n_rhs, **self.summary}
-        (out / "summary.json").write_text(json.dumps(summary, indent=2, default=float), encoding="utf-8")
-        dump(self.params, out / "simulation.pes")
-        written += [out / "summary.json", out / "simulation.pes"]
-        return written
+    def __init__(self, path: Path, batch_rows: int = 1000) -> None:
+        self.path = path
+        self.batch_rows = batch_rows
+        self.keys: list[str] | None = None
+        self.n_rows = 0
+        self._pending: list[list[float]] = []
+        self._fh: Any = None
 
-def _write(path: str | Path, cols: dict) -> None:
-    keys = list(cols)
-    with Path(path).open("w", newline="") as fh:
-        w = csv.writer(fh)
-        w.writerow(keys)
-        for row in zip(*(cols[k] for k in keys)):
-            w.writerow([f"{v:.10g}" for v in row])
+    def append(self, row: Mapping[str, float]) -> None:
+        if self.keys is None:
+            self.keys = list(row)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._fh = self.path.open("w", newline="")
+            self._fh.write(",".join(self.keys) + "\n")
+        elif list(row) != self.keys:
+            raise RuntimeError("the set of recorded columns changed during the run")
+        self._pending.append(list(row.values()))
+        self.n_rows += 1
+        if len(self._pending) == self.batch_rows:
+            self.flush()
+
+    def flush(self) -> None:
+        if self._pending:
+            np.savetxt(self._fh, np.asarray(self._pending), delimiter=",", fmt="%.17g")
+            self._pending.clear()
+
+    def close(self) -> None:
+        self.flush()
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+    def column(self, key: str) -> np.ndarray:
+        if self.keys is None or key not in self.keys:
+            raise KeyError(key)
+        return np.loadtxt(self.path, delimiter=",", skiprows=1, usecols=self.keys.index(key),
+                          dtype=float, ndmin=1)
+
+
+@dataclass(frozen=True)
+class _ColumnRef:
+    table: _CSVTable
+    key: str
+
+    def read(self) -> np.ndarray:
+        return self.table.column(self.key)
+
+
+class _CSVColumns(Mapping[str, np.ndarray]):
+    """Dictionary-like CSV columns; each requested column is read and then released by its caller."""
+
+    def __init__(self, refs: Mapping[str, _ColumnRef] | None = None) -> None:
+        self._refs = dict(refs or {})
+
+    def __getitem__(self, key: str) -> np.ndarray:
+        try:
+            return self._refs[key].read()
+        except KeyError:
+            raise KeyError(key) from None
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._refs)
+
+    def __len__(self) -> int:
+        return len(self._refs)
+
+
+@dataclass
+class _RecordedOutput:
+    plant_table: _CSVTable | None
+    ctrl_tables: dict[str, _CSVTable]
+    states_table: _CSVTable | None
+    energy_table: _CSVTable | None
+    final_states: dict[str, float]
+    t_stop: float
+
+    def __post_init__(self) -> None:
+        self._t = None
+        for table in (self.plant_table, self.states_table, self.energy_table):
+            if table is not None and table.n_rows:
+                self._t = _ColumnRef(table, "t")
+                break
+        self.plant = _CSVColumns({key: _ColumnRef(self.plant_table, key)
+                                  for key in (self.plant_table.keys or ()) if key != "t"}
+                                 if self.plant_table is not None else {})
+        ctrl: dict[str, _ColumnRef] = {}
+        for unit, table in self.ctrl_tables.items():
+            ctrl.update({f"{unit}.{key}": _ColumnRef(table, key)
+                         for key in (table.keys or ())})
+        self.ctrl = _CSVColumns(ctrl)
+        self.states = _CSVColumns({key: _ColumnRef(self.states_table, key)
+                                   for key in (self.states_table.keys or ())}
+                                  if self.states_table is not None else {})
+        self.energy = _CSVColumns({key: _ColumnRef(self.energy_table, key)
+                                   for key in (self.energy_table.keys or ())}
+                                  if self.energy_table is not None else {})
+
+    @property
+    def t(self) -> np.ndarray:
+        return self._t.read() if self._t is not None else np.asarray([self.t_stop], dtype=float)
 
 
 class Recorder:
-    """Collects snapshots during a run. ``keep_states=False`` keeps only the last state row."""
+    """Stream configured result tables directly to their final CSV files."""
 
-    def __init__(self, keep_states: bool = True) -> None:
-        self.t: list[float] = []
-        self.plant: dict[str, list] = {}
-        self.ctrl_t: dict[str, list[float]] = {}   # one time grid per unit
-        self.ctrl: dict[str, list] = {}
-        self.last_ctrl_log: dict[str, dict[str, float]] = {}
+    def __init__(self, params: Params, out_dir: Path | None,
+                 ctrl_names: Mapping[str, Iterable[str]] | None = None,
+                 keep_states: bool = True,
+                 keep_signals: bool = False, keep_energy: bool = True,
+                 batch_rows: int = 1000) -> None:
+        self.params = params
+        self.out_dir = out_dir
         self.keep_states = keep_states
-        self.state_keys: list[str] | None = None
-        self.state_t: list[float] = []
-        self.state_rows: list[list[float]] = []
-        self.energy_t: list[float] = []
-        self.energy_rows: dict[str, list] = {}
+        self.keep_signals = keep_signals
+        self.keep_energy = keep_energy
+        self.last_ctrl_log: dict[str, dict[str, float]] = {}
+        self.ctrl_names = {unit: tuple(names) for unit, names in (ctrl_names or {}).items()}
+        self._batch_rows = batch_rows
+        if out_dir is not None:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            names = ["states.csv", "plant.csv", "energy.csv", "summary.json", "simulation.pes",
+                     *(f"ctrl.{unit}.csv" for unit in params.units)]
+            for name in names:
+                (out_dir / name).unlink(missing_ok=True)
+        self._plant = (_CSVTable(out_dir / "plant.csv", batch_rows)
+                       if keep_signals and out_dir is not None else None)
+        self._ctrl: dict[str, _CSVTable] = {}
+        self._states = (_CSVTable(out_dir / "states.csv", batch_rows)
+                        if keep_states and out_dir is not None else None)
+        self._energy = (_CSVTable(out_dir / "energy.csv", batch_rows)
+                        if keep_energy and out_dir is not None else None)
+        self._last_t: float | None = None
+        self._final_states: dict[str, float] = {}
+
+    @property
+    def last_t(self) -> float | None:
+        return self._last_t
 
     def energy_row(self, t: float, columns: dict[str, float]) -> None:
-        self.energy_t.append(t)
-        for k, v in columns.items():
-            self.energy_rows.setdefault(k, []).append(v)
+        if self._energy is not None:
+            self._energy.append({"t": t, **columns})
 
     def state_row(self, t: float, row: dict[str, float]) -> None:
-        if self.state_keys is None:
-            self.state_keys = list(row)
-        elif len(row) != len(self.state_keys):
-            raise RuntimeError("the set of named states changed during the run")
-        if not self.keep_states:
-            self.state_t.clear()
-            self.state_rows.clear()
-        self.state_t.append(t)
-        self.state_rows.append(list(row.values()))
+        full = {"t": t, **row}
+        if self._states is not None:
+            self._states.append(full)
+        self._final_states = full
 
     def plant_snapshot(self, t: float, signals: dict[str, Any]) -> None:
-        n_before = len(self.t)
-        self.t.append(t)
-        for k, v in signals.items():
-            self.plant.setdefault(k, []).append(v)
-        for unit, log in self.last_ctrl_log.items():
-            for k, v in log.items():
-                key = f"ctrl.{unit}.{k}"
-                if key not in self.plant:  # controller signal appearing after the first snapshots
-                    self.plant[key] = [math.nan] * n_before
-                self.plant[key].append(v)
+        if self._plant is not None:
+            self._plant.append(_plant_output_row(
+                self.params, t, signals, self.last_ctrl_log, self.ctrl_names))
+        self._last_t = t
 
-    def control_sample(self, unit: str, t: float, log: dict[str, float]) -> None:
-        """Record one controller's log at one of its sampling instants."""
-        self.ctrl_t.setdefault(unit, []).append(t)
-        for k, v in log.items():
-            self.ctrl.setdefault(f"{unit}.{k}", []).append(v)
+    def ctrl_sample(self, unit: str, t: float, log: dict[str, float]) -> None:
+        """Stream one controller's log at one of its sampling instants."""
+        if not self.keep_signals or self.out_dir is None:
+            return
+        names = self.ctrl_names.get(unit)
+        if not names:
+            names = self.ctrl_names[unit] = tuple(log)
+        if unit not in self._ctrl:
+            self._ctrl[unit] = _CSVTable(self.out_dir / f"ctrl.{unit}.csv", self._batch_rows)
+        self._ctrl[unit].append(
+            {"t": t, **{name: float(log.get(name, math.nan)) for name in names}})
 
-    def arrays(self) -> tuple[np.ndarray, dict[str, np.ndarray], dict[str, np.ndarray], dict[str, np.ndarray]]:
-        plant = {k: np.asarray(v) for k, v in self.plant.items()}
-        ctrl = {f"{unit}.t": np.asarray(times) for unit, times in self.ctrl_t.items()}
-        ctrl.update({k: np.asarray(v) for k, v in self.ctrl.items()})
-        states: dict[str, np.ndarray] = {"t": np.asarray(self.state_t, dtype=float)}
-        if self.state_keys:
-            table = np.asarray(self.state_rows, dtype=float).reshape(len(self.state_rows), len(self.state_keys))
-            states.update({k: table[:, j] for j, k in enumerate(self.state_keys)})
-        energy: dict[str, np.ndarray] = {}
-        if self.energy_t:
-            energy = {"t": np.asarray(self.energy_t, dtype=float)}
-            energy.update({k: np.asarray(v, dtype=float) for k, v in self.energy_rows.items()})
-        return np.asarray(self.t), plant, ctrl, states, energy
+    def finish(self) -> _RecordedOutput:
+        tables = [table for table in (self._plant, self._states, self._energy) if table is not None]
+        tables += list(self._ctrl.values())
+        for table in tables:
+            table.close()
+        return _RecordedOutput(
+            plant_table=self._plant,
+            ctrl_tables=self._ctrl,
+            states_table=self._states,
+            energy_table=self._energy,
+            final_states={key: float(value) for key, value in self._final_states.items()},
+            t_stop=self._last_t or 0.0,
+        )
 
 
 # ------------------------------------------------------------------ reading results back
@@ -281,7 +360,7 @@ class Simulation:
         """Build every part from ``p`` unless replaced through ``parts`` or ``instances``.
 
         parts: factories keyed ``"system"`` or ``"solver"`` (called with ``p``), or ``"<unit>"``,
-        ``"<unit>.ctrl"``, ``"<unit>.modulator"``, ``"<unit>.delay"`` (called with the unit's section).
+        ``"<unit>.ctrl"`` or ``"<unit>.modulator"`` (called with the unit's section).
         instances: ready objects under the same keys (also ``system=``, ``solver=``); with any
         instance the split error bound is not computed.
         """
@@ -294,7 +373,7 @@ class Simulation:
             given["solver"] = solver
         known = {"system", "solver"}
         for name in p.units:
-            known |= {name, f"{name}.ctrl", f"{name}.modulator", f"{name}.delay"}
+            known |= {name, f"{name}.ctrl", f"{name}.modulator"}
         for label, what in (("parts", self._factories), ("instances", given)):
             unknown = set(what) - known
             if unknown:
@@ -306,7 +385,7 @@ class Simulation:
 
         unit_parts = {}
         for name, cfg in p.units.items():
-            for key in (name, f"{name}.ctrl", f"{name}.modulator", f"{name}.delay"):
+            for key in (name, f"{name}.ctrl", f"{name}.modulator"):
                 if key in self._factories:
                     unit_parts[key] = self._factories[key](cfg)
                 elif key in given:
@@ -325,7 +404,7 @@ class Simulation:
             self.solver = make_solver(p.simulation.solver, model=self.system.model,
                                       ratings=self._ratings())
         for unit in self.system.units.values():
-            for obj, proto in ((unit.ctrl, Controller), (unit.pwm.modulator, Modulator), (unit.pwm.delay, Delay)):
+            for obj, proto in ((unit.ctrl, Controller), (unit.pwm.modulator, Modulator)):
                 if not isinstance(obj, proto):
                     raise TypeError(f"{unit.name}: {type(obj).__name__} does not satisfy the "
                                     f"{proto.__name__} protocol")
@@ -338,6 +417,8 @@ class Simulation:
                                   f"{type(self.system).__name__} has none")
         if not isinstance(self.solver, Solver):
             raise TypeError(f"{type(self.solver).__name__} does not satisfy the Solver protocol")
+        self._start_duty()
+        self._states = StateRegistry(self._state_parts())
         self.result: SimulationResult | None = None
         self.energy_problems: list[str] = []
         self.ph_report = None  # port-Hamiltonian structure report
@@ -417,46 +498,61 @@ class Simulation:
             warnings.warn("energy check: " + msg, stacklevel=3)
 
     # ------------------------------------------------------------ states
-    def _parts(self) -> dict[str, Any]:
-        """The parts that have named states, by their prefix in the state table, in its order."""
-        parts: dict[str, Any] = {"plant": self.system}
-        for name, unit in self.system.units.items():
-            parts[f"ctrl.{name}"] = unit.ctrl
-            parts[f"pwm.{name}"] = unit.pwm
-            parts[f"delay.{name}"] = unit.pwm.delay
-            if unit.adc.averaging:
-                parts[f"meas.{name}"] = unit.adc
-        parts["solver"] = self.solver
+    def _state_parts(self) -> list[tuple[str, Any]]:
+        """State owners by fixed state-table prefix, in state-table order."""
+        provide = getattr(self.system, "state_parts", None)
+        if provide is not None:
+            parts = list(provide())
+        else:  # custom systems written for the original aggregate Stateful interface
+            parts = [("", self.system)]
+            for name, unit in self.system.units.items():
+                parts.extend([(f"{name}.ctrl", unit.ctrl), (f"{name}.pwm", unit.pwm)])
+                if unit.adc.averaging:
+                    parts.append((f"{name}.meas", unit.adc))
+        parts.append(("solver", self.solver))
         return parts
 
     def _start_duty(self) -> None:
-        """Put the controllers' start-up duty ratios in force and fill the delay pipelines with them."""
+        """Put the controllers' start-up duty ratios in every PWM register."""
         for unit in self.system.units.values():
-            unit.pwm.d = np.array(unit.ctrl.initial_duty(), dtype=float)
-            unit.pwm.delay.reset(unit.pwm.d)
+            unit.pwm.reset(np.asarray(unit.ctrl.initial_duty(), dtype=float))
+
+    def watch_values(self, t: float,
+                     ctrl_logs: Mapping[str, Mapping[str, float]]) -> dict[str, float]:
+        """Return values addressable by ``simulation.progress.watch`` at time ``t``.
+
+        Names include state-table columns, plant-table columns, state aliases, and complex states
+        without their ``.re``/``.im`` suffix, in which case the magnitude is returned.
+        Public plant/controller columns take precedence over an alias with the same name.
+        """
+        system = self.system
+        state = self._states.read()
+        for alias, name in getattr(system, "state_aliases", {}).items():
+            if name in state:
+                state[alias] = state[name]
+        values = {key: abs(value) for key, value in state.items() if isinstance(value, complex)}
+        values.update(flatten(state))
+        row = _plant_output_row(self.p, t, system.signals(t), ctrl_logs)
+        values.update({key: value for key, value in row.items() if key != "t"})
+        return values
 
     def state_names(self) -> list[str]:
         """Return the state-table column names after ``t``, i.e. the valid ``initial.states`` keys."""
-        if self.result is None:
-            self._start_duty()
-        return list(flatten(gather(self._parts())))
+        return list(self._states.columns)
 
     def _apply_initial(self, t0: float) -> np.ndarray:
         """Load ``initial.states`` into the parts; return the solver vector."""
         system = self.system
-        aliases = {f"plant.{a}": f"plant.{c}" for a, c in getattr(system, "state_aliases", {}).items()}
+        aliases = dict(getattr(system, "state_aliases", {}))
         presets_of = getattr(system, "state_presets", None)
         presets = presets_of(t0) if presets_of is not None else {}
-        if callable(presets):  # state-dependent keywords: strip the "plant." prefix
-            inner = presets
-            presets = lambda key, word: inner(key[6:] if key.startswith("plant.") else key, word)  # noqa: E731
-        self._start_duty()  # so that the duty ratios and delay pipelines have their states
-        template = gather(self._parts())
+        self._start_duty()  # so that the duty ratios and shadow registers have their states
+        template = self._states.read()
         try:
             given = expand_aliases(self.p.simulation.initial.states, aliases)
             if callable(presets):
                 for bus in getattr(system, "buses", {}):
-                    key = f"plant.{bus}.u_C"
+                    key = f"{bus}.u_C"
                     if key not in template or any(name == key or name.startswith(key + ".") for name in given):
                         continue
                     try:
@@ -470,7 +566,7 @@ class Simulation:
                 msg += f". Aliases: {', '.join(f'{a} -> {c}' for a, c in aliases.items())}"
             raise ConfigError(msg) from None
         # 1. power stage (unset states stay zero), events up to t0, then the solver vector
-        scatter({"plant": system}, values)
+        self._states.load(values, ["", *system.units])
         if hasattr(system, "switch"):
             for name, steps in switching_schedule(self.p.events).items():
                 if not connected_at(steps, t0):
@@ -485,21 +581,31 @@ class Simulation:
             align = getattr(unit.ctrl, "align_startup", None)
             if align is not None:
                 align(unit.ports.u_g(), unit.ports.u_dc())
-            unit.adc.seed()  # averaging window starts at t0
-            unit.pwm.d = np.array(unit.ctrl.initial_duty(), dtype=float)
-            scatter({f"pwm.{name}": unit.pwm}, values)
-        # 3. controllers, delay pipelines, measurement windows, solver
+            unit.pwm.reset(np.asarray(unit.ctrl.initial_duty(), dtype=float))
+            self._states.load(values, [f"{name}.pwm"])
+        # 3. controllers, measurement windows, solver
+        self._continued = set()
+        self._windows_given = set()
         for name, unit in system.units.items():
-            scatter({f"ctrl.{name}": unit.ctrl}, values)
-            unit.pwm.delay.reset(unit.pwm.d)
-            scatter({f"delay.{name}": unit.pwm.delay}, values)
+            self._states.load(values, [f"{name}.ctrl"])
+            if any(key.startswith((f"{name}.ctrl.", f"{name}.pwm.")) for key in values):
+                self._continued.add(name)
             if unit.adc.averaging:
-                scatter({f"meas.{name}": unit.adc}, values)
-        scatter({"solver": self.solver}, values)
+                self._states.load(values, [f"{name}.meas"])
+                if any(key.startswith(f"{name}.meas.") for key in values):
+                    self._windows_given.add(name)
+        self._states.load(values, ["solver"])
         return y
 
     # ------------------------------------------------------------ the loop
-    def run(self, t_end: float | None = None) -> SimulationResult:
+    def run(self, t_end: float | None = None, *, out_dir: str | Path | None = "output/run",
+            info: Mapping[str, Any] | None = None) -> SimulationResult:
+        """Run once, streaming configured histories directly into ``out_dir``.
+
+        The default directory is ``output/run``. ``None`` is reserved for internal runs that
+        disable every history. No complete numeric history is retained in memory; result columns
+        read the final CSV files on demand.
+        """
         if self.result is not None:
             raise RuntimeError("a Simulation runs once; build a new one for another run")
         p, system = self.p, self.system
@@ -509,34 +615,45 @@ class Simulation:
         t_end = p.simulation.t_end if t_end is None else t_end
         output = p.simulation.output
         log_period = output.period
-        control_every = max(1, output.control_every)
+        ctrl_every = max(1, output.ctrl_every)
         stop_on_trip = p.simulation.stop_on_trip
-        progress_every = p.simulation.progress_every
-        rec = Recorder(keep_states=output.states)
+        progress = p.simulation.progress
+        progress_every = progress.period if progress.enable else 0.0
+        watch = list(progress.watch) if progress.enable else []
+        output_dir = Path(out_dir) if out_dir is not None else None
+        if output_dir is None and (output.states or output.signals or output.energy):
+            raise ValueError("out_dir is required when a simulation output is enabled")
         wall0 = time.time()
 
         units = list(system.units.values())
-        periods = [u.pwm.period for u in units]
-        t_start = min(round(p.simulation.initial.t / T) * T for T in periods)
+        t_start = p.simulation.initial.t
         if t_end <= t_start + _EPS:
             raise ValueError(f"t_end = {t_end} must be after the start time {t_start}")
-        # the run ends at the earliest period boundary at or after t_end
-        t_final = min(math.ceil((t_end - _EPS) / T) * T for T in periods)
+        t_final = t_end
         # trips already handled, by unit (a trip loaded with the initial states is handled at the first sample)
         tripped = {u.name: bool(getattr(u.ctrl, "tripped", False)) or u.tripped for u in units}
-        for unit in units:
-            pwm = unit.pwm
-            pwm.k = int(round(t_start / pwm.period))
-            pwm.start = pwm.t_next
-            pwm.sync = unit.ctrl.initial_sync() if hasattr(unit.ctrl, "initial_sync") else (None, None)
-            if hasattr(unit.ctrl, "reset_clocks"):
-                unit.ctrl.reset_clocks(t_start)
         averaging = [u for u in units if u.adc.averaging]  # units whose ADC averages
         y = self._apply_initial(t_start)
         if parameters_changed is not None:
             parameters_changed()
         for unit in units:
+            sync = unit.ctrl.initial_sync() if hasattr(unit.ctrl, "initial_sync") else (None, None)
+            mdl.set_zoh_input(unit.zoh, unit.pwm.start(t_start, sync, unit.name in self._continued))
+        # The loaded compare registers determine the bridge at the exact start time.  Seed every
+        # ADC from that side of the held-input change, then reconstruct its timer/window position.
+        mdl.sync(t_start, y)
+        for unit in units:
+            unit.adc.seed()
+            pwm = unit.pwm
+            unit.adc.start(t_start, pwm.interrupt(pwm.k - 1), pwm.t_interrupt,
+                           held=unit.name not in self._windows_given)
             unit.adc.latest = unit.adc.measure(t_start)
+        ctrl_names = {
+            unit.name: getattr(unit.ctrl, "log_names", lambda: ())() for unit in units
+        }
+        rec = Recorder(p, output_dir, ctrl_names, keep_states=output.states,
+                       keep_signals=output.signals, keep_energy=output.energy,
+                       batch_rows=p.simulation.solver.write_length)
         n_log = max(0, math.ceil(t_start / log_period - 1e-9))
         actions = deque(action for action in self._actions() if action[0] > t_start + _EPS)
         next_report = t_start + progress_every if progress_every > 0 else math.inf
@@ -545,26 +662,43 @@ class Simulation:
 
         mode = p.simulation.energy_check
         energy_on = mode != "off" and hasattr(mdl, "energy_balance")
+        phs_check_step = p.simulation.solver.phs_check_step
+        snapshot_index = 0
         worst = {"tellegen": 0.0, "balance": 0.0}
         stop_reason = ""
         coarse_reported = False
         stopped = False
-        parts = self._parts()
-
-        def snapshot(t_now: float) -> None:
+        adc_inputs_changed = False
+        def snapshot(t_now: float, final: bool = False) -> None:
+            nonlocal snapshot_index
+            audit_due = energy_on and (snapshot_index % phs_check_step == 0 or final)
+            snapshot_index += 1
             try:
                 with np.errstate(over="raise"):
                     mdl.sync(t_now, y)
-                    rec.plant_snapshot(t_now, system.signals(t_now))
-                    rec.state_row(t_now, flatten(gather(parts)))
-                    if energy_on and _finite(y):
+                    signals = system.signals(t_now) if rec.keep_signals else {}
+                    rec.plant_snapshot(t_now, signals)
+                    if rec.keep_states or final:
+                        rec.state_row(t_now, self._states.read_flat())
+                    if audit_due and _finite(y):
                         rep = mdl.energy_balance(t_now, y)
-                        rec.energy_row(t_now, rep.columns())
+                        if rec.keep_energy:
+                            rec.energy_row(t_now, rep.columns())
                         scale = rep.scale
                         worst["tellegen"] = max(worst["tellegen"], abs(rep.tellegen) / scale)
                         worst["balance"] = max(worst["balance"], rep.max_residual / scale)
             except (OverflowError, FloatingPointError):
                 pass  # diverged state: not recorded
+
+        def watched(t_now: float) -> str:
+            """Format the quantities appended to a progress line."""
+            mdl.sync(t_now, y)
+            values = self.watch_values(t_now, rec.last_ctrl_log)
+            unknown = [name for name in watch if name not in values]
+            if unknown:
+                raise ConfigError(f"simulation.progress.watch: unknown name(s) {unknown}; "
+                                  f"known: {sorted(values)}")
+            return "".join(f"   {name} = {values[name]:.6g}" for name in watch)
 
         @np.errstate(over="raise")  # overflow counts as divergence
         def integrate(t_a: float, t_b: float, y: np.ndarray, event: bool) -> np.ndarray:
@@ -610,48 +744,51 @@ class Simulation:
             mdl.set_states(y)
 
         def do_trip(unit: Unit) -> None:
-            nonlocal y
+            nonlocal y, adc_inputs_changed
             tripped[unit.name] = True
             settle_now()
             unit.trip()
             y = mdl.get_initial_values()
+            adc_inputs_changed = True
 
-        def publish(unit: Unit, t_k: float) -> bool:
-            """Sample, run the controller and publish its duty ratios; return True if a new trip stops the run."""
+        def interrupt(unit: Unit, t_k: float):
+            """Sample and run a controller; return its output and whether its trip stops the run."""
             mdl.sync(t_k, y)
             out = unit.ctrl(t_k, unit.adc.sample(t_k))
             if out.log is not None:
                 rec.last_ctrl_log[unit.name] = out.log
-                if unit.pwm.k % control_every == 0:
-                    rec.control_sample(unit.name, t_k, out.log)
+                if unit.pwm.k % ctrl_every == 0:
+                    rec.ctrl_sample(unit.name, t_k, out.log)
             new_trip = out.tripped and not tripped[unit.name]
             if new_trip:
                 do_trip(unit)
-            unit.pwm.publish(out.d_abc, out.theta, out.omega)
-            return new_trip and stop_on_trip
+            return out, new_trip and stop_on_trip
 
-        def modulate(unit: Unit, t_k: float) -> None:
-            """Start the unit's PWM period at ``t_k``."""
-            mdl.set_zoh_input(unit.zoh, unit.pwm.modulate(t_k))
+        def load_pwm(unit: Unit, t_k: float) -> None:
+            """Load the unit's PWM compare registers at ``t_k``."""
+            nonlocal adc_inputs_changed
+            mdl.set_zoh_input(unit.zoh, unit.pwm.load(t_k))
+            adc_inputs_changed = True
 
         # ---------------------------------------------------------------- the event grid
-        for unit in units:  # first period: start-up duty ratios, no controller call
-            modulate(unit, unit.pwm.t_next)
         while True:
+            adc_inputs_changed = False
             t_log = n_log * log_period
             t_stop = t_log if t_log < t_final - _EPS else t_final  # the earliest event of all
             for unit in units:
                 pwm, adc = unit.pwm, unit.adc
                 t_c = pwm.t_next
-                t_stop = min(t_stop, t_c if t_c < t_final - _EPS else t_final, pwm.next_switch,
-                             adc.t_window(t_c), adc.t_sample(pwm.start), getattr(unit.ctrl, "next_event", math.inf))
+                t_stop = min(t_stop, t_c if t_c < t_final - _EPS else t_final,
+                             pwm.t_load if pwm.t_load < t_final - _EPS else t_final,
+                             pwm.next_switch, adc.t_window(t_c),
+                             adc.t_sample(pwm.interrupt(pwm.k - 1)))
             if actions:
                 t_stop = min(t_stop, actions[0][0])
             event_due = bool(actions and actions[0][0] <= t_stop + _EPS)
             advancing = t_stop > t_local + _EPS
             if advancing and advance(t_local, t_stop, event_due):
                 stopped = True
-                snapshot(t_local)
+                snapshot(t_local, final=True)
                 break
             # File events run before the coincident protection/control/PWM events.
             if event_due:
@@ -664,10 +801,11 @@ class Simulation:
                 if parameters_changed is not None:
                     parameters_changed()
                 y = mdl.get_initial_values()
+                adc_inputs_changed = True
             # 0. over-current check of units whose switching interval ends here
             for unit in units:
                 pwm = unit.pwm
-                ends = abs(pwm.next_switch - t_stop) < _EPS or abs(pwm.end - t_stop) < _EPS
+                ends = abs(pwm.next_switch - t_stop) < _EPS or abs(pwm.load_end - t_stop) < _EPS
                 check = getattr(unit.ctrl, "fast_check", None)
                 if ends and check is not None and not tripped[unit.name]:
                     mdl.set_states(y)
@@ -676,27 +814,39 @@ class Simulation:
                         if stop_on_trip:
                             stopped = True
             if stopped:
-                snapshot(t_local)
+                snapshot(t_local, final=True)
                 break
             # ADC samples due here, before any loop update
             for unit in units:
-                if abs(unit.adc.t_sample(unit.pwm.start) - t_stop) < _EPS:
+                if abs(unit.adc.t_sample(unit.pwm.interrupt(unit.pwm.k - 1)) - t_stop) < _EPS:
                     mdl.sync(t_local, y)
                     unit.adc.peek(t_local)
-            # loop-only updates: latest sample, no PWM/delay advance
-            for unit in units:
-                if (getattr(unit.ctrl, "next_event", math.inf) <= t_stop + _EPS
-                        and abs(unit.pwm.t_next - t_stop) >= _EPS and t_stop < t_final - _EPS):
-                    unit.ctrl.update(t_stop, unit.adc.latest)
-            # 1. PWM publications due here (with any due loop updates)
+            # 1. control interrupts due here
+            shadow_writes = []
             for unit in units:
                 if abs(unit.pwm.t_next - t_stop) < _EPS and t_stop < t_final - _EPS:
-                    if publish(unit, t_stop):
+                    out, stop = interrupt(unit, t_stop)
+                    if unit.pwm.computation == 0.0:
+                        unit.pwm.tick(t_stop, out.theta, out.omega)
+                        unit.pwm.write_shadow(out.d_abc)
+                    else:
+                        shadow_writes.append((unit, out))
+                    if stop:
                         stopped = True
-                    modulate(unit, t_stop)
             if stopped:
-                snapshot(t_local)
+                for unit, out in shadow_writes:
+                    unit.pwm.tick(t_stop, out.theta, out.omega)
+                    unit.pwm.write_shadow(out.d_abc)
+                snapshot(t_local, final=True)
                 break
+            # 1a. PWM compare-register loads due here, after coincident interrupts
+            for unit in units:
+                if abs(unit.pwm.t_load - t_stop) < _EPS and t_stop < t_final - _EPS:
+                    load_pwm(unit, t_stop)
+            # A nonzero computation starts after any coincident load has consumed the old shadow.
+            for unit, out in shadow_writes:
+                unit.pwm.tick(t_stop, out.theta, out.omega)
+                unit.pwm.write_shadow(out.d_abc)
             # 1b. an averaging window shorter than the PWM update period opens here
             for unit in units:
                 if abs(unit.adc.t_window(unit.pwm.t_next) - t_stop) < _EPS:
@@ -704,8 +854,15 @@ class Simulation:
                     unit.adc.open()
             # 2. switching instants due here
             for unit in units:
-                for q in unit.pwm.switches(t_stop, _EPS):
+                for q in unit.pwm.switches(t_stop):
                     mdl.set_zoh_input(unit.zoh, q)
+                    adc_inputs_changed = True
+            # An averaging interval after a plant or held-input jump starts from the value on the
+            # new side.  Its integral/opening states do not change at the zero-duration edge.
+            if averaging and adc_inputs_changed:
+                mdl.sync(t_local, y)
+                for unit in averaging:
+                    unit.adc.seed()
             # 3. snapshots
             if abs(t_log - t_stop) < _EPS and t_stop < t_final - _EPS:
                 snapshot(t_local)
@@ -713,28 +870,41 @@ class Simulation:
             if t_stop >= t_final - _EPS:
                 break
             if t_local >= next_report:
-                print(f"  t = {t_local:8.4f} s   wall {time.time() - wall0:8.1f} s", flush=True)
+                suffix = watched(t_local) if watch else ""
+                print(f"  t = {t_local:8.4f} s   wall {time.time() - wall0:8.1f} s{suffix}",
+                      flush=True)
                 next_report += progress_every
 
         if not stopped:
-            # final instant: only the loop/PWM events due here
+            # Complete all unit actions due at the final instant. A saved row represents the
+            # state after that instant, exactly as the same row in a longer run does.
+            shadow_writes = []
             for unit in units:
                 if abs(unit.pwm.t_next - t_local) < _EPS:
-                    publish(unit, t_local)
-                elif getattr(unit.ctrl, "next_event", math.inf) <= t_local + _EPS:
-                    unit.ctrl.update(t_local, unit.adc.latest)
-        if not rec.t or rec.t[-1] < t_local - _EPS:
-            snapshot(t_local)
+                    out, _stop = interrupt(unit, t_local)
+                    if unit.pwm.computation == 0.0:
+                        unit.pwm.tick(t_local, out.theta, out.omega)
+                        unit.pwm.write_shadow(out.d_abc)
+                    else:
+                        shadow_writes.append((unit, out))
+            for unit in units:
+                if abs(unit.pwm.t_load - t_local) < _EPS:
+                    load_pwm(unit, t_local)
+            for unit, out in shadow_writes:
+                unit.pwm.tick(t_local, out.theta, out.omega)
+                unit.pwm.write_shadow(out.d_abc)
+        if rec.last_t is None or rec.last_t < t_local - _EPS:
+            snapshot(t_local, final=True)
         if stop_reason:
             warnings.warn(f"simulation stopped at t = {t_local:.6g} s: {stop_reason}", stacklevel=2)
-        t_arr, plant_arrays, ctrl_arrays, state_arrays, energy_arrays = rec.arrays()
+        records = rec.finish()
         summary: dict[str, Any] = {}
         for name, unit in system.units.items():
             if hasattr(unit.ctrl, "summary"):
                 summary.update({f"{name}.{k}": v for k, v in unit.ctrl.summary().items()})
         summary["tripped"] = int(any(tripped.values()))
         summary["t_start"] = t_start
-        summary["t_stop"] = float(t_arr[-1]) if len(t_arr) else t_start
+        summary["t_stop"] = rec.last_t if rec.last_t is not None else t_start
         if stop_reason:
             summary["stop_reason"] = stop_reason
         coarse = getattr(solver, "coarse_hold", None)
@@ -760,16 +930,29 @@ class Simulation:
                                               f"period to linearise: no bound")
                 else:
                     summary.update(split_error_bound(
-                        solver, loop, t_arr, state_arrays, p.simulation.solver.linearisations,
-                        labels=mdl.state_labels(), prefix="plant."))
+                        solver, loop, records.t, records.states, p.simulation.solver.linearisations,
+                        labels=mdl.state_labels(), prefix=""))
             else:  # parts given as instances
                 summary["split_bound"] = ("the loop has custom parts given as instances, so it cannot be "
                                           "rebuilt for the linearisation: pass them as factories of the "
                                           "parameter tree for a bound")
+        wall_time = time.time() - wall0
+        n_rhs = getattr(solver, "n_rhs", 0) - n_rhs0
+        files: list[Path] = []
+        if output_dir is not None:
+            for table in (records.states_table, records.plant_table, records.energy_table,
+                          *records.ctrl_tables.values()):
+                if table is not None and table.path.is_file():
+                    files.append(table.path)
+            payload = {**(info or {}), "wall_time": wall_time, "n_rhs": n_rhs, **summary}
+            summary_path = output_dir / "summary.json"
+            params_path = output_dir / "simulation.pes"
+            summary_path.write_text(json.dumps(payload, indent=2, default=float), encoding="utf-8")
+            dump(p, params_path)
+            files += [summary_path, params_path]
         self.result = SimulationResult(
-            params=p, t=t_arr, plant=plant_arrays, control=ctrl_arrays, states=state_arrays,
-            energy=energy_arrays, summary=summary, wall_time=time.time() - wall0,
-            n_rhs=getattr(solver, "n_rhs", 0) - n_rhs0)
+            params=p, _records=records, out_dir=output_dir, files=files, summary=summary,
+            wall_time=wall_time, n_rhs=n_rhs)
         return self.result
 
 
@@ -797,7 +980,8 @@ class SystemLoop:
             self.periods.extend(T for T in getattr(u.ctrl, "periods", {}).values() if T)
         self.period = macro_period(self.periods)
         self.w0 = 2.0 * math.pi * sim.p.base.f0
-        self._flags = {k for k, v in gather(sim._parts()).items() if isinstance(v, bool)}
+        self._flags = set(sim._states.boolean_names)
+        self._plant_columns = set(sim._states.read_flat(["", *sim.units]))
         rated = sim.solver.rated_effort
         self._rated = ({lab: float(r) for lab, r in zip(sim.system.model.state_labels(), rated)}
                        if rated is not None else {})
@@ -805,9 +989,11 @@ class SystemLoop:
         sp = p.simulation
         self._p = dataclasses.replace(
             p,
-            simulation=dataclasses.replace(sp, energy_check="off", stop_on_trip=False, progress_every=0.0,
+            simulation=dataclasses.replace(
+                sp, energy_check="off", stop_on_trip=False,
+                progress=dataclasses.replace(sp.progress, enable=False),
                                            output=dataclasses.replace(sp.output, period=self.period or 1.0,
-                                                                      states=True, energy=False, signals=False),
+                                                                      states=False, energy=False, signals=False),
                                            solver=dataclasses.replace(sp.solver, subsystems={},
                                                                       linearisations=0)))
 
@@ -817,22 +1003,22 @@ class SystemLoop:
         cols: list[tuple[str, list[str], float]] = []
         used: set[str] = set()
         for c in names:
-            if c in used or c == "t" or c.startswith("solver.") or ".clock." in c:
+            if c in used or c == "t" or c.startswith("solver."):
                 continue  # solver bookkeeping, not a loop state
             if c in self._flags:
                 cols.append(("frozen", [c], 1.0))
                 used.add(c)
             elif c.endswith(".re") and c[:-3] + ".im" in names:
                 base = c[:-3]
-                turns = base.startswith("plant.")  # alpha-beta; a controller vector is already in dq
-                scale = self._rated.get(base[len("plant."):] + ".re", 0.0) if turns else 0.0
+                turns = c in self._plant_columns  # physical alpha-beta; controller vectors are already dq
+                scale = self._rated.get(base + ".re", 0.0) if turns else 0.0
                 cols.append(("vector" if turns else "fixed", [c, base + ".im"], scale if scale > 0 else 1.0))
                 used.update(cols[-1][1])
             elif c.endswith(".d_a") and c[:-4] + ".d_b" in names and c[:-4] + ".d_c" in names:
                 cols.append(("triple", [c[:-4] + f".d_{ph}" for ph in "abc"], 1.0))
                 used.update(cols[-1][1])
             else:
-                scale = self._rated.get(c[len("plant."):], 0.0) if c.startswith("plant.") else 0.0
+                scale = self._rated.get(c, 0.0) if c in self._plant_columns else 0.0
                 cols.append(("scalar", [c], scale if scale > 0 else 1.0))
                 used.add(c)
         return cols
@@ -901,10 +1087,10 @@ class SystemLoop:
             else:  # what the end-of-period sample reads
                 sync0 = model.sync
                 model.sync = lambda tt, y: sync0(tt, y + vec if tt >= t_end - _LOOPMAP_EPS else y)  # type: ignore[method-assign]
-        res = sim.run()
-        out = {k: float(v[-1]) for k, v in res.states.items() if k != "t"}
+        res = sim.run(out_dir=None)
+        out = {k: v for k, v in res.final_states().items() if k != "t"}
         if view is not None and view[2] == "c":
-            out["plant." + view[0]] -= view[1]
+            out[view[0]] -= view[1]
         return out
 
 
@@ -986,10 +1172,17 @@ def main(argv=None) -> int:
                     help="initial values: a states.csv row or a simulation file's simulation.initial block")
     ap.add_argument("--initial-time", type=float, default=None, metavar="T",
                     help="with a states.csv: start from the row at time T instead of the last row")
+    ap.add_argument("--averaging", action="store_true",
+                    help="run every unit with averaging enabled; each unit keeps its configured "
+                         "averaging.over value, and this option wins over --set")
     ap.add_argument("--out", default=None,
-                    help="output directory (default: output/<file name> in the current working directory)")
+                    help="output directory (default: output/<file name>, or "
+                         "output/<file name>-averaging when --averaging changes a unit)")
     ap.add_argument("--progress", type=float, default=None, metavar="SECONDS",
-                    help="print a progress line every SECONDS of simulated time (overrides the config)")
+                    help="print a progress line every SECONDS of simulated time")
+    ap.add_argument("--watch", action="append", default=None, metavar="NAME",
+                    help="append a state or plant/control value to each progress line; repeatable, "
+                         "or use NAME,NAME")
     ap.add_argument("--list-states", action="store_true",
                     help="print the state names generated for this configuration and exit")
     ap.add_argument("--ph-report", action="store_true",
@@ -1005,9 +1198,18 @@ def main(argv=None) -> int:
 
     overrides = dict(args.set)
     if args.progress is not None:
-        overrides["simulation.progress_every"] = args.progress
+        overrides["simulation.progress.enable"] = 1
+        overrides["simulation.progress.period"] = args.progress
+    if args.watch is not None:
+        overrides["simulation.progress.watch"] = [name for value in args.watch
+                                                   for name in value.split(",") if name]
     p = load(config, initial=args.initial,
                     initial_time=args.initial_time, **overrides)
+    averaged = args.averaging and any(not unit.averaging.enable for unit in p.units.values())
+    if args.averaging:
+        p = p.replace(**{f"units.{name}.averaging.enable": 1 for name in p.units})
+    if args.watch and not p.simulation.progress.enable:
+        ap.error("--watch prints on the progress lines: add --progress SECONDS")
     if args.resolved:
         print(dumps(p), end="")
         return 0
@@ -1018,16 +1220,21 @@ def main(argv=None) -> int:
     if args.ph_report:
         print(sim.ph_report)
         return 0
-    units = ", ".join(f"{n} ({u.control.type}, PWM {1e-3 / u.pwm.update_period:.0f} kHz, delay {u.delay.steps})"
+    def bridge_model(unit):
+        return (f"averaging over the {unit.averaging.over.replace('_', ' ')}"
+                if unit.averaging.enable else "switching")
+
+    units = ", ".join(f"{n} ({u.ctrl.type}, {bridge_model(u)}, {sim.units[n].pwm.describe()})"
                       for n, u in p.units.items())
-    print(f"peslite: {config}  units={units}  bridge={p.simulation.bridge}  "
+    print(f"peslite: {config}  units={units}  "
           f"solver={p.simulation.solver.type}/{p.simulation.solver.method}  "
           f"t = {p.simulation.initial.t} .. {p.simulation.t_end} s  "
           f"({len(p.simulation.initial.states)} initial values given)")
     if sim.ph_report is not None:
         print(f"structure: {sim.ph_report.verdict} (state coverage {sim.ph_report.coverage:.0%}"
               f"{'; ' + '; '.join(sim.energy_problems) if sim.energy_problems else ''})")
-    r = sim.run()
+    out = Path(args.out) if args.out else _RESULTS / (f"{config.stem}-averaging" if averaged else config.stem)
+    r = sim.run(out_dir=out, info={"config": str(config)})
     s = r.summary
     print(f"done: wall {r.wall_time:.1f} s, rhs evaluations {r.n_rhs}, stop at {s.get('t_stop', 0):.4f} s, "
           f"tripped={bool(s.get('tripped'))}")
@@ -1044,9 +1251,7 @@ def main(argv=None) -> int:
     if "split_error_bound_rated" in s:
         print(f"split error, from the linearised closed loop: <= {s['split_error_bound_rated']:.2e} of rating "
               f"({s['split_bound']})")
-    out = Path(args.out) if args.out else _RESULTS / config.stem
-    written = r.save(out, info={"config": str(config)})
-    print("wrote", ", ".join(str(w) for w in written))
+    print("wrote", ", ".join(str(w) for w in r.files))
     final = r.final_states()
     if final:
         width = max(map(len, final))

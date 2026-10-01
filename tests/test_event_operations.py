@@ -70,7 +70,7 @@ class _PassiveShunt(Element):
         return self.branch, "i", -1.0
 
 
-def test_builtin_load_is_typed_scaled_built_and_written():
+def test_builtin_load_is_typed_scaled_built_and_written(tmp_path):
     p = from_dict(_load(_tree()))
     cfg = p.elements["load"]
     assert (cfg.r, cfg.l) == pytest.approx(
@@ -90,8 +90,8 @@ def test_builtin_load_is_typed_scaled_built_and_written():
         "simulation.t_end": 2e-4,
         "simulation.energy_check": "off",
     })
-    result = peslite.Simulation(quick).run()
-    assert "plant.load.branch.i.re" in result.states
+    result = peslite.Simulation(quick).run(out_dir=tmp_path)
+    assert "load.branch.i.re" in result.states
 
 
 @pytest.mark.parametrize(
@@ -201,9 +201,9 @@ def test_system_applies_retunes_and_control_loops_keep_their_state():
         "branches.line.r_pu": 0.02,
         "elements.load.r_pu": 1.0,
         "units.vsc.dclink.source.i_pu": 0.5,
-        "units.vsc.control.references.p_ref_pu": 0.4,
-        "units.vsc.control.loops.pll.kp_pu": 10.0,
-        "units.vsc.control.loops.dvc.kp_pu": 0.4,
+        "units.vsc.ctrl.references.p_ref_pu": 0.4,
+        "units.vsc.ctrl.loops.pll.kp_pu": 10.0,
+        "units.vsc.ctrl.loops.dvc.kp_pu": 0.4,
         "units.vsc.protection.hold": 0.01,
         "units.vsc.protection.rocof.window": 0.2,
     }}
@@ -226,8 +226,6 @@ def test_system_applies_retunes_and_control_loops_keep_their_state():
     old_dvc = unit.ctrl.graph.nodes["dvc"]
     old_dvc.integral, old_dvc.n_updates, old_dvc.n_clamped = 0.2, 5, 2
     old_dvc.n_reverse, old_dvc.first_clamp_t = 1, 4e-4
-    unit.ctrl.reset_clocks(change.t)
-
     system.apply(change)
     current = change.params
     assert bus.state.u_C == 3 + 4j
@@ -250,10 +248,12 @@ def test_system_applies_retunes_and_control_loops_keep_their_state():
     unit.ctrl.update(change.t, _measurement(p, change.t))
     pll = unit.ctrl.graph.nodes["pll"]
     assert pll is not old_pll and pll.kp == 10.0
-    assert (pll.theta, pll.integral) == pytest.approx((1.2, 0.3))
+    # The retuned loop first takes over the old state, then performs this interrupt's update.
+    assert pll.integral == pytest.approx(0.3)
+    assert pll.theta == pytest.approx(1.2 + pll.T * (pll.w0 + pll.ki * 0.3))
     dvc = unit.ctrl.graph.nodes["dvc"]
     assert dvc is not old_dvc and dvc.kp == 0.4 and dvc.integral == 0.2
-    assert (dvc.n_updates, dvc.n_clamped, dvc.n_reverse, dvc.first_clamp_t) == (5, 2, 1, 4e-4)
+    assert (dvc.n_updates, dvc.n_clamped, dvc.n_reverse, dvc.first_clamp_t) == (6, 3, 1, 4e-4)
     assert unit.ctrl.graph.references["p_ref_pu"] == 0.4
 
     specs = system.model.energy_specs

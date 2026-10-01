@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import peslite  # noqa: E402
 
-QUIET = {"simulation.solver.linearisations": 0, "simulation.progress_every": 0.0}
+QUIET = {"simulation.solver.linearisations": 0, "simulation.progress.enable": 0}
 
 CASE = {
     "base": {"s_base": 2.0e6, "v_ll_rms": 690.0, "f0": 50.0},
@@ -26,15 +26,15 @@ CASE = {
                    "capacitor": {"c_pu": 35.0, "r_esr_pu": 0.001},
                    "source": {"type": "current", "i_pu": 0.9}},
         "pwm": {"f_sw": 20000.0, "modulation_limit": 0.95},
-        "control": {"type": "gfl", "loops": {
+        "averaging": {"enable": 1},
+        "ctrl": {"type": "gfl", "loops": {
             "pll": {"type": "srf_pll", "period": 5e-5, "kp_pu": 20.0, "ki_pu": 1200.0},
             "cc": {"type": "dq_current_pi", "period": 5e-5, "bandwidth": 200.0},
             "dvc": {"type": "dc_voltage_pi", "period": 5e-5, "kp_pu": 0.8,
                     "ki_pu": 90.0, "limit_pu": 1.15, "id0_export_pu": 0.9},
         }},
     }},
-    "simulation": {"t_end": 0.004, "bridge": "averaged",
-                   "solver": {"dt": 12.5e-6, "linearisations": 0}},
+    "simulation": {"t_end": 0.004, "solver": {"dt": 12.5e-6, "linearisations": 0}},
 }
 
 
@@ -61,7 +61,7 @@ def gfl():
     def make(**over):
         return peslite.load(
             EXAMPLES / "gfl-example.pes",
-            **{**QUIET, "simulation.t_end": 0.004, "simulation.bridge": "averaged",
+            **{**QUIET, "simulation.t_end": 0.004, "units.vsc.averaging.enable": 1,
                "events.connect_vsc.t": 0.0, **over},
         )
     return make
