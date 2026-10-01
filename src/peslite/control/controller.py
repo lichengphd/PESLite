@@ -115,17 +115,21 @@ class Startup:
         self.run = bool(run)
         if self.run:
             self.ramp = float(ramp)
+            self.steps, self.value, self.complete = 0, 0.0, False
         else:
-            self.steps = 0
+            self.steps, self.value, self.complete = 0, 0.0, False
 
     @property
     def active(self) -> bool:
         return self.run
 
+    @property
+    def in_progress(self) -> bool:
+        return self.run and not self.complete
+
     def advance(self) -> None:
         """Advance one controller interrupt and expose its start-up multiplier."""
-        if not self.run:
-            self.steps, self.value, self.complete = 0, 0.0, False
+        if not self.in_progress:
             return
         progress = 1.0 if self.ramp <= 0.0 else min(1.0, self.steps * self.T / self.ramp)
         self.value = smoothstep(progress)
@@ -590,7 +594,8 @@ class UniteType:
     def __call__(self, t, meas):
         control_meas = self._pu(meas)
         startup = self.startup
-        startup.advance()
+        if startup.in_progress:
+            startup.advance()
         self.stage.new_instant()
         self.graph.update(t, control_meas, finalize=self._accept_command)
         frame = self.graph.values.get(self._frame_key, self.theta)

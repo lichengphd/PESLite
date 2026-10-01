@@ -42,8 +42,18 @@ def test_startup_counts_only_controller_interrupts():
     startup.set_state({"steps": 100})
     assert startup.steps == 4
     startup.command(False)
-    startup.advance()
-    assert (startup.active, startup.steps) == (False, 0)
+    assert (startup.active, startup.steps, startup.value, startup.complete) == (False, 0, 0.0, False)
+
+
+def test_completed_startup_is_not_advanced_again():
+    startup = Startup(T=0.25, run=True, ramp=0.5)
+    while not startup.complete:
+        startup.advance()
+    held = startup.get_state(), startup.value, startup.complete
+    assert not startup.in_progress
+    for _ in range(10):
+        startup.advance()
+    assert (startup.get_state(), startup.value, startup.complete) == held
 
 
 def test_controller_needs_only_samples_and_host_commands(gfl):
