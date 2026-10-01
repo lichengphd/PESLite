@@ -11,7 +11,7 @@ from conftest import EXAMPLES
 from peslite.assembly import Event, Scenario, register_event_type
 from peslite.assembly.events import EVENT_TYPES, SourceScenario, connected_at, events_for, switching_schedule
 from peslite.assembly.params import ConfigError, dumps, from_dict, read_tree
-from peslite.control import Sequencer
+from peslite.control import Startup
 
 
 def _gfl():
@@ -122,14 +122,14 @@ def test_switching_schedule_and_scenario_connection_ramps():
     assert not scenario.connected(2.5) and scenario.connected(4.0)
     assert scenario.since(4.0) == (3.0, 2.0)
 
-    sequence = Sequencer(0.5, run=False)
-    sequence.command(True, 2.0)
+    startup = Startup(0.5, run=False)
+    startup.command(True, 2.0)
     for _ in range(3):
-        sequence.step()
-    assert 0.0 < sequence.ramp_value < 1.0 and not sequence.complete
+        startup.advance()
+    assert 0.0 < startup.value < 1.0 and not startup.complete
     for _ in range(3):
-        sequence.step()
-    assert sequence.ramp_value == 1.0 and sequence.complete
+        startup.advance()
+    assert startup.value == 1.0 and startup.complete
 
     always = Scenario()
     assert always.connected(0.0) and always.since(0.0) == (-math.inf, 0.0)

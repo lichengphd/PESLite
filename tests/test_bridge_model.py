@@ -76,7 +76,7 @@ def test_units_can_have_different_models(tmp_path):
            "units.vsc_1.averaging.enable": 1},
     )
     simulation = peslite.Simulation(params)
-    models = tuple(type(simulation.units[name].pwm.modulator).__name__
+    models = tuple(type(simulation.units[name].bridge.modulator).__name__
                    for name in ("vsc_1", "vsc_2"))
     assert models == ("ZOH", "CarrierComparison")
     simulation.run(out_dir=tmp_path)

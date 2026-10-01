@@ -1,16 +1,21 @@
-"""The converter's power stage: the ideal bridge and the dc link (capacitor, current or voltage source).
+"""The converter's power stage: bridge models and the dc link.
 
-Quantities are SI; ``q`` is the space vector of the phase switching states (or duty ratios).
+Quantities are SI. Every bridge keeps the same AC/DC and held-modulation connections; a concrete
+bridge also owns the timing which turns sampled controller commands into its modulation value.
 """
 from __future__ import annotations
 
 from typing import Any, Callable, ClassVar, Optional
 
+from numpy.typing import NDArray
+
 from ..control.blocks import smoothstep
 from ..solver.energy import PowerPort, StoragePort
 from ..solver.model import Bag, Empty, OutputStage
+from .pwm import TIME_EPS, Modulator, PWM, ZOH, make_modulator
 
-__all__ = ["Bridge", "DCLink", "DCCapacitor", "DCCurrentSource", "DCVoltageSource", "make_dclink"]
+__all__ = ["Bridge", "PWMBridge", "make_bridge", "DCLink", "DCCapacitor",
+           "DCCurrentSource", "DCVoltageSource", "make_dclink"]
 
 
 class _BridgeInp(Bag):
@@ -28,6 +33,7 @@ class Bridge:
     """
 
     state_names: ClassVar[tuple[str, ...]] = ()
+    has_switching_events: ClassVar[bool] = False
     outputs_need_inputs: ClassVar[bool] = True
     dirac: ClassVar[bool] = True
     output_stages: ClassVar[tuple[OutputStage, ...]] = (
@@ -67,6 +73,93 @@ class Bridge:
         """Return the connection of the held switching state ``label`` to ``q``."""
         return {(self, "q"): label}
 
+
+class PWMBridge(Bridge, PWM):
+    """Physical bridge with its PWM peripheral behind one scheduling interface.
+
+    Exact switching and PWM-period averaging differ only in their modulator.  Keeping the PWM
+    inside the bridge gives every bridge model the same external power and held-input connections;
+    a future ideal averaged bridge can implement this timing interface without changing Unit or
+    Simulation wiring.
+    """
+
+    state_prefix = "pwm"
+
+    def __init__(self, period: float, load_period: float, offset: float, computation: float,
+                 carrier_period: float, modulator: Modulator) -> None:
+        Bridge.__init__(self)
+        PWM.__init__(self, period, load_period, offset, computation, carrier_period, modulator)
+        self.state_owner = self
+        self.has_switching_events = not isinstance(modulator, ZOH)
+
+    @property
+    def event_periods(self) -> list[float]:
+        """Periods which can change this bridge's sampled-data map."""
+        periods = [self.period, self.load_period]
+        if self.has_switching_events:
+            periods.append(self.carrier_period)
+        return periods
+
+    def next_time(self) -> float:
+        """Next controller, register-load or internal switching event."""
+        return min(self.t_interrupt, self.t_load, self.next_switch)
+
+    @property
+    def next_control_time(self) -> float:
+        return self.t_interrupt
+
+    @property
+    def control_index(self) -> int:
+        return self.k
+
+    def previous_control_time(self) -> float:
+        return self.interrupt(self.k - 1)
+
+    def control_count(self, t_a: float, t_b: float) -> int:
+        return self.count(t_a, t_b)
+
+    def control_due(self, t: float) -> bool:
+        return abs(self.t_interrupt - t) < TIME_EPS
+
+    def fast_edge(self, t: float) -> bool:
+        """Whether the old bridge output interval ends at ``t``."""
+        return self.edge(t)
+
+    def actuate(self, t: float, command: tuple[float, Any] | None, enabled: bool) -> list[complex]:
+        """Accept one sampled command and return bridge inputs which become active at ``t``.
+
+        The bridge owns the computation/load ordering.  Unit deliberately does not know whether
+        the implementation uses compare registers, a delayed averaged command or no carrier.
+        """
+        changes: list[complex] = []
+        if command is not None and self.computation == 0.0:
+            at, output = command
+            self.write(at, output.d_abc, bool(output.gates) and enabled,
+                       output.theta, output.omega)
+        if abs(self.t_load - t) < TIME_EPS:
+            changes.append(self.load(t))
+        if command is not None and self.computation > 0.0:
+            at, output = command
+            self.write(at, output.d_abc, bool(output.gates) and enabled,
+                       output.theta, output.omega)
+        changes.extend(self.switches(t))
+        return changes
+
+
+def make_bridge(cfg: Any, sim: Any, modulator: Modulator | None = None) -> PWMBridge:
+    """Build the unit's current bridge model behind the common bridge boundary.
+
+    This branch still selects exact/PWM-period/time-step behavior through its existing averaging
+    parameters.  Model selection is confined here so the three-mode bridge work can replace this
+    factory without changing Unit or Simulation.
+    """
+    pwm = cfg.pwm
+    return PWMBridge(
+        cfg.ctrl.period, pwm.load_period, pwm.grid_offset, cfg.ctrl.computation,
+        pwm.switching_period,
+        modulator if modulator is not None else make_modulator(
+            pwm, cfg.base.f0, cfg.averaging, sim),
+    )
 
 
 class _DCState(Bag):

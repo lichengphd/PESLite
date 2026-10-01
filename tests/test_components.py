@@ -24,7 +24,9 @@ def test_unit_delegates_sampling_and_modulation_state_to_components():
     unit = peslite.Simulation(p).unit()
 
     assert isinstance(unit.adc, ADC)
-    assert isinstance(unit.pwm, PWM)
+    assert isinstance(unit.bridge, peslite.PWMBridge)
+    assert isinstance(unit.bridge, PWM)
+    assert not hasattr(unit, "pwm")
     assert isinstance(unit.protection, peslite.Protection)
     assert peslite.ADC is ADC and peslite.PWM is PWM
     assert not hasattr(unit, "sampler")
@@ -42,7 +44,7 @@ def test_adc_owns_oversampling_and_averaging_window_state():
         u_dc=lambda: values["dc"],
     )
     adc = ADC(ports, period=1.0, sample_period=0.5, length=1.0,
-              channels={"v": 0j, "i": 0j})
+              channels={"u_g": 0j, "i_c": 0j})
     adc.seed()
     values.update(v=3 + 0j, i=4 + 0j)
     adc.accumulate(0.5)
@@ -55,7 +57,7 @@ def test_adc_owns_oversampling_and_averaging_window_state():
     assert sample.i_c == 4 + 0j
     assert sample.u_dc == 10.0
     assert [s.t for s in sample.samples] == [0.5, 1.0]
-    assert set(adc.get_state()) == {"x_v", "x_i"}
+    assert set(adc.get_state()) == {"x_u_g", "x_i_c"}
 
 
 def test_adc_reconstructs_its_sampling_position_from_the_start_time():

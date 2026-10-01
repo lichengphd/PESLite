@@ -134,6 +134,14 @@ def _control(c, dclink, pwm, where: str) -> None:
 
 def _measurement(m, T_c: float, where: str) -> None:
     """Check ADC oversampling and averaging windows within one control period."""
+    if not isinstance(m.average, (list, tuple)):
+        raise ConfigError(f"{where}.average: expected a list of channels, got {m.average!r}")
+    unknown = set(m.average) - {"u_g", "i_c", "u_dc"}
+    if unknown:
+        raise ConfigError(f"{where}.average: unknown channel(s) {sorted(unknown)}; "
+                          "known: ['i_c', 'u_dc', 'u_g']")
+    if len(set(m.average)) != len(m.average):
+        raise ConfigError(f"{where}.average: channels must not be repeated")
     for key in ("period", "window"):
         value = getattr(m, key)
         if value is None:
@@ -145,11 +153,10 @@ def _measurement(m, T_c: float, where: str) -> None:
     if m.period is not None and not _whole(T_c / m.period):
         raise ConfigError(f"{where}.period = {m.period:.6g} s does not divide ctrl.period = "
                           f"{T_c:.6g} s into whole samples")
-    windowed = "window" in (m.average, m.u_dc)
-    if windowed and m.period is not None and m.period < T_c * (1.0 - 1e-9):
-        raise ConfigError(f"{where}: window averaging (average or u_dc = 'window') cannot be combined "
+    if m.average and m.period is not None and m.period < T_c * (1.0 - 1e-9):
+        raise ConfigError(f"{where}: window averaging cannot be combined "
                           f"with oversampling (period shorter than ctrl.period)")
-    if not windowed and m.window is not None:
+    if not m.average and m.window is not None:
         warnings.warn(f"{where}.window has no effect: no quantity is window-averaged", stacklevel=4)
 
 

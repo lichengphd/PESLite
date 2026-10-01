@@ -178,7 +178,7 @@ def test_system_switches_units_sources_and_loads():
     cc, dvc = unit.ctrl.graph.nodes["cc"], unit.ctrl.graph.nodes["dvc"]
     cc.integral, dvc.integral = 0.2 + 0.1j, 0.3
     unit.ctrl(0.15, _measurement(p, 0.15))
-    assert not unit.ctrl.sequencer.running
+    assert not unit.ctrl.startup.active
     assert cc.integral == 0.2 + 0.1j and dvc.integral == 0.3
 
     system.switch("vsc", True, 0.2, 0.1)

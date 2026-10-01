@@ -33,14 +33,14 @@ class MeasurementPorts:
     i_dc: Optional[Callable[[], float]] = None
 
     def read(self) -> dict[str, complex | float]:
-        """The instantaneous values of the ADC channels ``v``, ``i`` and ``dc``."""
-        return {"v": self.u_g(), "i": self.i_c(), "dc": self.u_dc()}
+        """The instantaneous values of the ADC channels."""
+        return {"u_g": self.u_g(), "i_c": self.i_c(), "u_dc": self.u_dc()}
 
 
 class ADC:
     """Sampler triggered every control ``period`` and optionally between interrupts.
 
-    The channels in ``channels`` (``"v"``, ``"i"``, ``"dc"``, each with its zero value) are averaged
+    The channels in ``channels`` (``"u_g"``, ``"i_c"``, ``"u_dc"``) are averaged
     over a window of ``length`` s ending at the interrupt; the others are instantaneous.
     Named state per averaged channel ``c``: ``x_c``, the integral accumulated in the open window.
     """
@@ -160,8 +160,8 @@ class ADC:
         u_raw, i_raw, dc_raw = ports.u_g(), ports.i_c(), ports.u_dc()
         mean = {channel: self.accumulated[channel] / self.length for channel in self.channels}
         return Measurement(t=t,
-                           u_g=mean.get("v", u_raw), i_c=mean.get("i", i_raw),
-                           u_dc=mean.get("dc", dc_raw), i_abc=complex2abc(i_raw),
+                           u_g=mean.get("u_g", u_raw), i_c=mean.get("i_c", i_raw),
+                           u_dc=mean.get("u_dc", dc_raw), i_abc=complex2abc(i_raw),
                            u_g_raw=u_raw, i_c_raw=i_raw, u_dc_raw=dc_raw)
 
     def phase_currents(self) -> np.ndarray:

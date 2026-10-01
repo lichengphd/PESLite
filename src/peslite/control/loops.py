@@ -50,7 +50,7 @@ ROLES = ("pll", "sync", "current", "dc_voltage", "power", "impedance", "admittan
 
 
 class Loop:
-    """A control loop: a discrete-time block with typed ports, built as ``cls(cfg, unit, sequencer)``.
+    """A control loop: a discrete-time block with typed ports, built as ``cls(cfg, unit, startup)``.
 
     A loop type sets ``type`` (its name in ``ctrl.loops``), ``Params`` (a frozen dataclass with
     ``type`` and ``period`` fields; its ``_quantities`` name the fields given in SI or pu),
@@ -61,7 +61,7 @@ class Loop:
     It provides ``initial_outputs()`` and ``update(t, inputs) -> outputs``; its named states are the
     attributes in ``state_names`` unless it overrides ``get_state`` / ``set_state``. A loop rebuilt
     after retuning continues from those states and from attributes listed in ``carried``.
-    ``cfg``: the loop's parameters; ``unit``: the unit's parameters; ``sequencer``: the controller's
+    ``cfg``: the loop's parameters; ``unit``: the unit's parameters; ``startup``: the controller's
     current run/ramp state.
     """
 
@@ -75,8 +75,8 @@ class Loop:
     state_names: tuple[str, ...] | Mapping[str, str] = ()
     carried: ClassVar[tuple[str, ...]] = ()
 
-    def __init__(self, cfg: Any, unit: Any, sequencer: Any) -> None:
-        self.cfg, self.unit, self.sequencer = cfg, unit, sequencer
+    def __init__(self, cfg: Any, unit: Any, startup: Any) -> None:
+        self.cfg, self.unit, self.startup = cfg, unit, startup
 
     def initial_outputs(self) -> dict[str, Any]:
         raise NotImplementedError
@@ -172,8 +172,8 @@ class SRFPLL(Loop):
     inputs = {"v": V_AB}
     outputs = {"theta": ANGLE, "frame": ANGLE, "omega": FREQUENCY}
 
-    def __init__(self, cfg, unit, sequencer):
-        super().__init__(cfg, unit, sequencer)
+    def __init__(self, cfg, unit, startup):
+        super().__init__(cfg, unit, startup)
         self.kp, self.ki, self.w0, self.T = cfg.kp_pu, cfg.ki_pu, unit.base.w0, cfg.period
         self.theta, self.omega, self.integral = 0.0, self.w0, 0.0
         self.u_g = 1.0 if cfg.normalisation == "amplitude" else None
@@ -227,8 +227,8 @@ class CurrentLoop(Loop):
     inputs = {"id_ref": CURRENT, "iq_ref": CURRENT, "v": V_AB, "i": I_AB, "frame": ANGLE, "omega": FREQUENCY,
               "extra": V_DQ}
     outputs = {"u_dq": V_DQ, "extra": V_DQ}
-    def __init__(self, cfg, unit, sequencer):
-        super().__init__(cfg, unit, sequencer)
+    def __init__(self, cfg, unit, startup):
+        super().__init__(cfg, unit, startup)
         x = unit.ac_filter.l_f * unit.base.w0 / unit.base.z_base
         r = unit.ac_filter.r_f / unit.base.z_base
         self.kp = cfg.kp_pu if cfg.kp_pu is not None else x / unit.base.w0 * 2 * math.pi * cfg.bandwidth
@@ -247,7 +247,7 @@ class CurrentLoop(Loop):
         self.extra = inputs["extra"]
         i, u_ff, omega = inputs["i"] * rot, inputs["v"] * rot, inputs["omega"]
         self._prev_integral = self.integral
-        if not self.sequencer.running:
+        if not self.startup.active:
             e = 0j
         else:
             e = complex(inputs["id_ref"], inputs["iq_ref"]) - i
@@ -316,8 +316,8 @@ class DCVoltageLoop(Loop):
     outputs = {"id_ref": CURRENT}
     carried = ("n_updates", "n_clamped", "n_reverse", "first_clamp_t")
 
-    def __init__(self, cfg, unit, sequencer):
-        super().__init__(cfg, unit, sequencer)
+    def __init__(self, cfg, unit, startup):
+        super().__init__(cfg, unit, startup)
         self.kp, self.ki, self.T = cfg.kp_pu, cfg.ki_pu, cfg.period
         self.limit = cfg.limit_pu
         self.floor = -cfg.limit_pu if cfg.bidirectional else 0.0
@@ -335,9 +335,9 @@ class DCVoltageLoop(Loop):
 
     def update(self, t, inputs):
         self.n_updates += 1
-        ff = self.sequencer.ramp_value * self.cfg.id0_export_pu
+        ff = self.startup.value * self.cfg.id0_export_pu
         self.error = inputs["u_dc"] - inputs["vdc_ref"]
-        if not self.sequencer.running:
+        if not self.startup.active:
             self.raw = 0.0
         else:
             if not (self.antiwindup == "conditional" and self.clamped):
@@ -374,8 +374,8 @@ class PowerLoop(Loop):
     inputs = {"v": V_AB, "i": I_AB}
     outputs = {"p": POWER_PU, "q": POWER_PU}
 
-    def __init__(self, cfg, unit, sequencer):
-        super().__init__(cfg, unit, sequencer)
+    def __init__(self, cfg, unit, startup):
+        super().__init__(cfg, unit, startup)
         bandwidth = cfg.filter.bandwidth if cfg.filter.enable else 0.0
         self.lpf_p = LowPass1(bandwidth, cfg.period, 0.0, init_on_first=False)
         self.lpf_q = LowPass1(bandwidth, cfg.period, 0.0, init_on_first=False)
@@ -412,8 +412,8 @@ class SyncLaw(Loop):
     outputs = {"theta": ANGLE, "frame": ANGLE, "omega": FREQUENCY, "v_ref": VOLTAGE}
     state_names = ("theta",)
 
-    def __init__(self, cfg, unit, sequencer):
-        super().__init__(cfg, unit, sequencer)
+    def __init__(self, cfg, unit, startup):
+        super().__init__(cfg, unit, startup)
         self.w0, self.T = unit.base.w0, cfg.period
         self.theta, self.omega = 0.0, self.w0
         self.v_mag = unit.ctrl.references.v_ref_pu
@@ -423,7 +423,7 @@ class SyncLaw(Loop):
                 "v_ref": self.unit.ctrl.references.v_ref_pu}
 
     def update(self, t, inputs):
-        if not self.sequencer.running:
+        if not self.startup.active:
             out = self.track(inputs)
             if out is not None:
                 return out
@@ -432,8 +432,8 @@ class SyncLaw(Loop):
         frame = float(self.theta)
         rot = _into(frame)
         v, i = inputs["v"] * rot, inputs["i"] * rot
-        p_ref, q_ref, v_ref = self.sequencer.setpoints(
-            inputs["p_ref"], inputs["q_ref"], inputs["v_ref"])
+        p_ref = self.startup.value * inputs["p_ref"]
+        q_ref, v_ref = inputs["q_ref"], inputs["v_ref"]
         self.step(self.T, inputs["p"], inputs["q"], abs(v), inputs["u_dc"], p_ref, q_ref, v_ref, i)
         return {"theta": self.theta, "frame": frame, "omega": self.omega, "v_ref": self.v_mag}
 
@@ -474,8 +474,8 @@ class PSC(SyncLaw):
     type = "psc"
     state_names = {"theta": "theta", "v_int_pu": "v_int"}
 
-    def __init__(self, cfg, unit, sequencer):
-        super().__init__(cfg, unit, sequencer)
+    def __init__(self, cfg, unit, startup):
+        super().__init__(cfg, unit, startup)
         self.k_p, self.k_v, self.k_vi = cfg.k_p_pu, cfg.k_v, cfg.k_vi
         self.v_int = 0.0
 
@@ -508,8 +508,8 @@ class Droop(SyncLaw):
 
     type = "droop"
 
-    def __init__(self, cfg, unit, sequencer):
-        super().__init__(cfg, unit, sequencer)
+    def __init__(self, cfg, unit, startup):
+        super().__init__(cfg, unit, startup)
         self.m_p, self.n_q = cfg.m_p_pu, cfg.n_q_pu
 
     def step(self, T, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
@@ -538,8 +538,8 @@ class VSG(SyncLaw):
 
     type = "vsg"
 
-    def __init__(self, cfg, unit, sequencer):
-        super().__init__(cfg, unit, sequencer)
+    def __init__(self, cfg, unit, startup):
+        super().__init__(cfg, unit, startup)
         self.h, self.d_p, self.k_q, self.t_q = cfg.h, cfg.d_p_pu, cfg.k_q_pu, cfg.t_q
         self.dw_pu = 0.0
         self.state_names = {"theta": "theta", "dw_pu": "dw_pu",
@@ -581,8 +581,8 @@ class DVOC(SyncLaw):
     type = "dvoc"
     state_names = {"theta": "theta", "v_mag_pu": "v_mag"}
 
-    def __init__(self, cfg, unit, sequencer):
-        super().__init__(cfg, unit, sequencer)
+    def __init__(self, cfg, unit, startup):
+        super().__init__(cfg, unit, startup)
         self.eta, self.alpha = cfg.eta_pu, cfg.alpha_pu
         self.rot = cmath.exp(1j * cfg.kappa)
 
@@ -613,8 +613,8 @@ class Matching(SyncLaw):
 
     type = "matching"
 
-    def __init__(self, cfg, unit, sequencer):
-        super().__init__(cfg, unit, sequencer)
+    def __init__(self, cfg, unit, startup):
+        super().__init__(cfg, unit, startup)
         vdc_ref_pu = unit.ctrl.references.vdc_ref_pu
         self.k_theta = cfg.k_theta_pu if cfg.k_theta_pu is not None else self.w0 / vdc_ref_pu
         self.k_q = cfg.k_q_pu
@@ -648,8 +648,8 @@ class VirtualImpedance(Loop):
     inputs = {"v_ref": VOLTAGE, "i": I_AB, "frame": ANGLE, "omega": FREQUENCY, "extra": V_DQ}
     outputs = {"u_dq": V_DQ}
 
-    def __init__(self, cfg, unit, sequencer):
-        super().__init__(cfg, unit, sequencer)
+    def __init__(self, cfg, unit, startup):
+        super().__init__(cfg, unit, startup)
         self.r_pu, self.x_pu, self.w0 = cfg.r_v_pu, cfg.x_v_pu, unit.base.w0
 
     def initial_outputs(self):
@@ -685,8 +685,8 @@ class VirtualAdmittance(Loop):
     inputs = {"v_ref": VOLTAGE, "v": V_AB, "frame": ANGLE, "omega": FREQUENCY}
     outputs = {"id_ref": CURRENT, "iq_ref": CURRENT}
 
-    def __init__(self, cfg, unit, sequencer):
-        super().__init__(cfg, unit, sequencer)
+    def __init__(self, cfg, unit, startup):
+        super().__init__(cfg, unit, startup)
         self.r_pu, self.x_pu, self.w0, self.T = cfg.r_v_pu, cfg.x_v_pu, unit.base.w0, cfg.period
         self.i_limit = cfg.current_limit.limit_pu if cfg.current_limit.enable else math.inf
         self.i_ref = 0j
@@ -735,8 +735,8 @@ class ActiveDamping(Loop):
     inputs = {"i": I_AB, "frame": ANGLE}
     outputs = {"extra": V_DQ}
 
-    def __init__(self, cfg, unit, sequencer):
-        super().__init__(cfg, unit, sequencer)
+    def __init__(self, cfg, unit, startup):
+        super().__init__(cfg, unit, startup)
         self.r_a = cfg.r_a_pu
         self.hpf = HighPass1(cfg.alpha_d / (2.0 * math.pi), cfg.period, init_on_first=False, y0=0j)
 
@@ -791,8 +791,8 @@ class UnitDelay(Loop):
     type = "unit_delay"
     delayed = frozenset({"value"})
 
-    def __init__(self, cfg, unit, sequencer):
-        super().__init__(cfg, unit, sequencer)
+    def __init__(self, cfg, unit, startup):
+        super().__init__(cfg, unit, startup)
         self.inputs = self.outputs = {"value": _DELAY_SIGNALS[cfg.signal]}
         electrical = cfg.signal.endswith("_pu")
         initial = cfg.initial_pu if electrical else cfg.initial

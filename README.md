@@ -121,7 +121,7 @@ SI `Measurement` and returns `ControlOutput` with duty ratios, PWM enable, start
 synchronization data. It does not own or decide protection. Its only host input affecting operation
 is `command(run, ramp)`.
 
-The controller's `Sequencer` counts its own interrupts. A connect command releases PWM with the
+The controller's `Startup` state counts its own interrupts. A connect command releases PWM with the
 first computed duty word, ramps the active-power setpoint, and reports when the ramp ends; the unit
 uses that status to arm its sampled protection. A disconnect command blocks PWM and resets that
 ramp. Grid-forming synchronization laws track a usable terminal voltage before starting, avoiding
@@ -187,7 +187,7 @@ and PWM loads.
 | `units.<u>.ctrl.type` | `gfl` \| `gfm` \| `custom` |
 | `units.<u>.ctrl.period` / `.computation` | control-interrupt period and computation time, s |
 | `units.<u>.ctrl.loops.<loop>.period` | loop period, an integer multiple of `ctrl.period` |
-| `units.<u>.meas.period` / `.average` | ADC period; `instantaneous` \| `window` (with `window`) |
+| `units.<u>.meas.period` / `.average` | ADC period; window-averaged channels chosen from `[u_g, i_c, u_dc]` |
 | `units.<u>.pwm.update` | `single` (valleys) \| `double` (valleys and peaks) |
 | `units.<u>.pwm.method` / `.sync` | `spwm` \| `svpwm`; `asynchronous` \| `synchronous` |
 | `simulation.output.states` / `.signals` / `.energy` | which files are written |
@@ -283,12 +283,12 @@ pyproject.toml
 src/peslite/            the package: __init__.py and four code parts
   components/           what the system is made of
     network.py            three-phase source, R-L branch, bus (R-C node), element types
-    converter.py          bridge and dc link
+    converter.py          bridge models (including their actuation timing) and dc link
     adc.py                sampling of a converter's measurements, averaging window, oversampling
-    pwm.py                PWM timer, duty registers, carrier and modulators
+    pwm.py                PWM timer, duty registers, carrier and modulators used inside a bridge
   control/              the converter's controller
     loops.py              what each loop type computes: its parameters, ports and update
-    controller.py         controller interface, Sequencer, loop network, GFL/GFM wiring, UniteType
+    controller.py         controller interface, Startup, loop network, GFL/GFM wiring, UniteType
     modulation.py         output stage: voltage command to duty ratios, limiter, anti-windup
     blocks.py             transforms, filters and timers
   assembly/             a system built from a simulation file

@@ -8,7 +8,7 @@ import pytest
 
 import peslite
 from conftest import EXAMPLES
-from peslite.control import Measurement, Sequencer
+from peslite.control import Measurement, Startup
 from peslite.control.blocks import smoothstep
 
 
@@ -28,22 +28,22 @@ def _current(result):
                   + 1j * result.states["vsc.branch_f.i.im"])
 
 
-def test_sequencer_counts_startup_on_controller_interrupts():
-    sequence = Sequencer(T=0.25, run=False)
-    sequence.step()
-    assert (sequence.running, sequence.ramp_value, sequence.complete) == (False, 0.0, False)
-    sequence.command(True, 1.0)
+def test_startup_counts_only_controller_interrupts():
+    startup = Startup(T=0.25, run=False)
+    startup.advance()
+    assert (startup.active, startup.value, startup.complete) == (False, 0.0, False)
+    startup.command(True, 1.0)
     seen = []
     for _ in range(6):
-        sequence.step()
-        seen.append((sequence.running, sequence.ramp_value, sequence.complete, sequence.steps))
+        startup.advance()
+        seen.append((startup.active, startup.value, startup.complete, startup.steps))
     assert seen == [(True, smoothstep(x), x >= 1.0, min(4, n + 1))
                     for n, x in enumerate((0.0, 0.25, 0.5, 0.75, 1.0, 1.0))]
-    sequence.set_state({"steps": 100})
-    assert sequence.steps == 4
-    sequence.command(False)
-    sequence.step()
-    assert (sequence.running, sequence.steps) == (False, 0)
+    startup.set_state({"steps": 100})
+    assert startup.steps == 4
+    startup.command(False)
+    startup.advance()
+    assert (startup.active, startup.steps) == (False, 0)
 
 
 def test_controller_needs_only_samples_and_host_commands(gfl):
@@ -65,7 +65,7 @@ def test_controller_needs_only_samples_and_host_commands(gfl):
     armed = []
     for k in range(1, 8):
         output = controller(k * T, sample(k))
-        armed.append(controller.sequencer.complete)
+        armed.append(controller.startup.complete)
         assert output.gates and np.all((0.0 <= output.d_abc) & (output.d_abc <= 1.0))
     assert armed == [False, False, False, False, True, True, True]
     controller.command(False)
@@ -90,7 +90,7 @@ def test_pwm_stays_blocked_until_first_controller_word_is_loaded(gfl, tmp_path):
     assert np.all(_current(result)[t <= release + 1e-9] == 0.0)
 
 
-def test_disconnect_stops_sequence_and_connect_restarts_ramp(gfl, tmp_path):
+def test_disconnect_stops_startup_and_connect_restarts_ramp(gfl, tmp_path):
     params = gfl(
         **{"events.connect_vsc.ramp": 0.0, "simulation.t_end": 0.003,
            "simulation.output.period": T},
@@ -98,7 +98,7 @@ def test_disconnect_stops_sequence_and_connect_restarts_ramp(gfl, tmp_path):
         **_event("on", type="connect", target="vsc", t=0.002, ramp=0.0005),
     )
     result = _run(params, tmp_path)
-    t, steps = result.states["t"], result.states["vsc.ctrl.sequence.steps"]
+    t, steps = result.states["t"], result.states["vsc.ctrl.startup.steps"]
     assert np.all(steps[(t > 0.001 + 1e-9) & (t < 0.002 - 1e-9)] == 0.0)
     after = t > 0.002 - 1e-9
     end = round(0.0005 / T)
@@ -170,7 +170,7 @@ def test_fast_and_sampled_paths_share_one_trip_latch():
 
 def test_controller_block_states_use_entity_first_names(gfl):
     names = set(peslite.Simulation(gfl()).state_names())
-    assert {"vsc.ctrl.sequence.run", "vsc.ctrl.sequence.ramp", "vsc.ctrl.sequence.steps",
+    assert {"vsc.ctrl.startup.run", "vsc.ctrl.startup.ramp", "vsc.ctrl.startup.steps",
             "vsc.tripped", "vsc.fault", "vsc.pwm.on", "vsc.pwm.shadow.on"} <= names
     assert "vsc.prot.hold_uv" in names
     assert not any(".ctrl.prot." in name for name in names)
@@ -191,7 +191,7 @@ def test_grid_forming_controller_presynchronises_to_terminal_voltage(name, tmp_p
     assert not result.tripped and result.summary["vsc.max_current_pu"] < 0.3
 
 
-def test_split_bound_holds_sequence_and_pwm_modes(gfl, tmp_path):
+def test_split_bound_holds_startup_and_pwm_modes(gfl, tmp_path):
     params = gfl(**{
         "events.connect_vsc.t": 0.003,
         "simulation.solver.linearisations": 2,
@@ -201,7 +201,7 @@ def test_split_bound_holds_sequence_and_pwm_modes(gfl, tmp_path):
     assert summary["split_bound"].startswith("linearised loop at t = 0.002, 0.004 s")
 
 
-def test_startup_sequence_and_registers_continue_from_a_saved_row(gfl, tmp_path):
+def test_startup_and_registers_continue_from_a_saved_row(gfl, tmp_path):
     params = gfl(**{
         "events.connect_vsc.t": 0.001,
         "events.connect_vsc.ramp": 0.001,

@@ -406,7 +406,11 @@ class Simulation:
             self.solver = make_solver(p.simulation.solver, model=self.system.model,
                                       ratings=self._ratings())
         for unit in self.system.units.values():
-            for obj, proto in ((unit.ctrl, Controller), (unit.pwm.modulator, Modulator)):
+            parts = [(unit.ctrl, Controller)]
+            modulator = getattr(unit.bridge, "modulator", None)
+            if modulator is not None:
+                parts.append((modulator, Modulator))
+            for obj, proto in parts:
                 if not isinstance(obj, proto):
                     raise TypeError(f"{unit.name}: {type(obj).__name__} does not satisfy the "
                                     f"{proto.__name__} protocol")
@@ -507,7 +511,9 @@ class Simulation:
         else:  # custom systems written for the original aggregate Stateful interface
             parts = [("", self.system)]
             for name, unit in self.system.units.items():
-                parts.extend([(f"{name}.ctrl", unit.ctrl), (f"{name}.pwm", unit.pwm)])
+                bridge = unit.bridge
+                parts.extend([(f"{name}.ctrl", unit.ctrl),
+                              (f"{name}.{bridge.state_prefix}", bridge.state_owner)])
                 if unit.adc.averaging:
                     parts.append((f"{name}.meas", unit.adc))
         parts.append(("solver", self.solver))
@@ -576,8 +582,9 @@ class Simulation:
         self._continued = set()
         self._windows_given = set()
         for name, unit in system.units.items():
-            self._states.load(values, [f"{name}.ctrl", f"{name}.pwm"])
-            if any(key.startswith((f"{name}.ctrl.", f"{name}.pwm.")) for key in values):
+            bridge_prefix = f"{name}.{unit.bridge.state_prefix}"
+            self._states.load(values, [f"{name}.ctrl", bridge_prefix])
+            if any(key.startswith((f"{name}.ctrl.", bridge_prefix + ".")) for key in values):
                 self._continued.add(name)
             if unit.adc.averaging:
                 self._states.load(values, [f"{name}.meas"])
@@ -918,7 +925,7 @@ class SystemLoop:
         self._flags = {name for name in flags
                        if name.rpartition(".")[2] in ("tripped", "fault")}
         self._modes = (flags - self._flags) | {
-            name for name in sim._states.names if ".sequence." in name
+            name for name in sim._states.names if ".startup." in name
         }
         self._plant_columns = set(sim._states.read_flat(["", *sim.units]))
         rated = sim.solver.rated_effort
@@ -1166,7 +1173,7 @@ def main(argv=None) -> int:
         return (f"averaging over the {unit.averaging.over.replace('_', ' ')}"
                 if unit.averaging.enable else "switching")
 
-    units = ", ".join(f"{n} ({u.ctrl.type}, {bridge_model(u)}, {sim.units[n].pwm.describe()})"
+    units = ", ".join(f"{n} ({u.ctrl.type}, {bridge_model(u)}, {sim.units[n].bridge.describe()})"
                       for n, u in p.units.items())
     print(f"peslite: {config}  units={units}  "
           f"solver={p.simulation.solver.type}/{p.simulation.solver.method}  "
