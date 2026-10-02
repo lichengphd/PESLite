@@ -16,7 +16,7 @@ from .assembly import (Params, Protection, SourceScenario, System, Unit, dump, d
 from .solver.simulation import Simulation, SimulationResult, main
 from .assembly.exporter import ExportResult, export
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 __all__ = [
     "solver", "control", "components", "assembly",
