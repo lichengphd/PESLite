@@ -128,10 +128,10 @@ def test_to_dict_preserves_following_defaults_but_dumps_resolves_them():
     complete = yaml.safe_load(dumps(p))
     assert compact["units"]["vsc"]["ctrl"]["period"] is None
     assert compact["units"]["vsc"]["ctrl"]["references"]["omega"] is None
-    assert complete["units"]["vsc"]["ctrl"]["period"] is None
-    assert complete["units"]["vsc"]["ctrl"]["computation"] is None
+    assert complete["units"]["vsc"]["ctrl"]["period"] == pytest.approx(5e-5)
+    assert complete["units"]["vsc"]["ctrl"]["computation"] == pytest.approx(1e-6)
     assert complete["units"]["vsc"]["ctrl"]["references"]["omega"] == pytest.approx(100 * math.pi)
-    assert complete["units"]["vsc"]["meas"]["period"] is None
+    assert complete["units"]["vsc"]["meas"]["period"] == pytest.approx(5e-5)
     assert complete["units"]["vsc"]["s_base"] == 2e6
     assert dumps(from_dict(complete)) == dumps(p)
 
@@ -139,7 +139,7 @@ def test_to_dict_preserves_following_defaults_but_dumps_resolves_them():
 def test_resolved_cli_and_meta_contract(capsys):
     assert peslite.main(["gfl-example", "--resolved", "--set", "units.vsc.pwm.f_sw=10000"]) == 0
     resolved = yaml.safe_load(capsys.readouterr().out)
-    assert resolved["units"]["vsc"]["ctrl"]["period"] is None
+    assert resolved["units"]["vsc"]["ctrl"]["period"] == pytest.approx(1e-4)
     from_dict(resolved)
 
     assert peslite.main(["gfl-example", "--switching", "--resolved",

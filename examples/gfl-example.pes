@@ -61,7 +61,7 @@ units:                     # converters, one entry each
       # sync: asynchronous # asynchronous | synchronous (carrier locked to the controller angle)
       # carrier_phase: 0.0 # carrier position at t = 0, in periods
 
-    # bridge: {model: averaging}  # averaging (default) | pwm_averaging | switching
+    # bridge: {model: pwm_averaging}  # pwm_averaging (default) | averaging | switching
     #                              # CLI: --averaging | --pwm-averaging | --switching
 
     ctrl:
@@ -139,8 +139,8 @@ simulation:                # how the model is simulated
   t_end: 3.0
   solver:
     dt: 25e-6              # fixed: maximum step
-    # type: fixed          # fixed | adaptive
-    # method: rk4          # fixed: euler | heun | rk4; adaptive: RK45 | DOP853 | Radau | BDF | LSODA | DP45
+    # type: fixed          # fixed | adaptive; presets: --averaging adaptive, the other two fixed
+    # method: rk4          # presets: --averaging DP45, the other two rk4; --set has priority
     # rtol: 1.0e-6         # adaptive tolerances
     # atol: 1.0e-9
     # max_step: .inf       # adaptive: largest step, s

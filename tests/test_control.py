@@ -87,7 +87,10 @@ def test_registered_loop_owns_its_schema_and_uses_default_role_wiring(tmp_path):
 
 
 def test_sampled_custom_loop_must_supply_its_own_continuous_equations_for_averaging():
-    p = peslite.load(EXAMPLES / "gfm-psc-example.pes", **QUIET)
+    p = peslite.load(
+        EXAMPLES / "gfm-psc-example.pes", **QUIET,
+        **{"units.vsc.bridge.model": "averaging"},
+    )
     p = p.replace(**{"units.vsc.ctrl.loops.sync": {
         "type": "test_fixed_frequency", "period": 5e-5,
     }})
@@ -96,7 +99,10 @@ def test_sampled_custom_loop_must_supply_its_own_continuous_equations_for_averag
 
 
 def test_continuous_control_graph_automatically_solves_feedback_between_loops():
-    p = peslite.load(EXAMPLES / "gfl-example.pes", **QUIET)
+    p = peslite.load(
+        EXAMPLES / "gfl-example.pes", **QUIET,
+        **{"units.vsc.bridge.model": "averaging"},
+    )
     unit = peslite.Simulation(p).unit().cfg
     loops = {
         **unit.ctrl.loops,
@@ -128,11 +134,11 @@ def test_loop_registration_and_loop_owned_validation():
         register_loop_type(NoParams)
     with pytest.raises(ValueError):
         register_loop_type(LOOP_TYPES["psc"])
-    with pytest.raises(ConfigError, match="loops.va.x_v_pu must be positive"):
-        peslite.load(
-            EXAMPLES / "gfm-droop-example.pes",
-            **{"units.vsc.ctrl.loops.va.x_v_pu": 0.0},
-        )
+    params = peslite.load(EXAMPLES / "gfm-psc-example.pes")
+    with pytest.raises(ConfigError, match="loops.vi.x_v_pu must be positive"):
+        params.replace(**{"units.vsc.ctrl.loops.vi": {
+            "type": "virtual_admittance", "x_v_pu": 0.0,
+        }})
 
 
 def test_controller_interfaces_have_one_definition():

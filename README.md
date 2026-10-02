@@ -44,12 +44,11 @@ peslite case
 # bundled examples use the -example suffix
 peslite gfl-example
 peslite gfm-psc-example
-peslite gfm-droop-example
 
 # override any parameter by its dotted path
 peslite gfl-example --set simulation.t_end=1 --set units.vsc.ctrl.computation=2e-6
 peslite gfl-example --set simulation.solver.type=adaptive --set simulation.solver.method=DP45
-peslite gfm-droop-example --set units.vsc.bridge.model=switching
+peslite gfm-psc-example --set units.vsc.bridge.model=switching
 
 # override the bridge model for every converter in this run
 peslite gfl-example --switching
@@ -145,7 +144,7 @@ Each converter selects its own bridge model, so all three models can share a sys
 ```yaml
 units:
   vsc:
-    bridge: {model: averaging}  # default; or pwm_averaging | switching
+    bridge: {model: pwm_averaging}  # default; or averaging | switching
 ```
 
 | `model` | Behaviour |
@@ -154,10 +153,10 @@ units:
 | `pwm_averaging` | the active duty ratios are continuous bridge values until the next PWM register load; no carrier ripple |
 | `averaging` | an ideal controlled voltage source with continuous measurements and controller equations; no ADC or PWM timing |
 
-When `bridge.model` is omitted, a converter uses `averaging`. `--switching`, `--pwm-averaging`
-and `--averaging` select that model for every converter for one run without editing the file.
-The three options are mutually exclusive, take precedence over a `bridge.model` command-line
-override and append the selected mode to the default output directory name.
+When `bridge.model` is omitted, a converter uses `pwm_averaging`. `--switching`, `--pwm-averaging`
+and `--averaging` are run presets: respectively `switching + fixed/rk4`,
+`pwm_averaging + fixed/rk4` and `averaging + adaptive/DP45`. The priority is
+`--set` > run preset > simulation file.
 
 PWM averaging supports fixed and adaptive solvers and asynchronous or synchronous PWM. It keeps
 the same timer, active/shadow registers, computation eligibility and single/double register-load
@@ -188,7 +187,6 @@ networks retain their single-pass evaluation path.
 |---|---|
 | `gfl-example.pes` | Grid-following converter; every key is annotated |
 | `gfm-psc-example.pes` | Grid-forming, power-synchronization control |
-| `gfm-droop-example.pes` | Grid-forming, droop with virtual admittance and current loop |
 | `gfm-vsg-example.pes` | Grid-forming, virtual synchronous generator |
 | `gfm-dvoc-example.pes` | Grid-forming, dispatchable virtual oscillator control |
 | `gfm-matching-example.pes` | Grid-forming, matching control |
@@ -205,7 +203,7 @@ networks retain their single-pass evaluation path.
 | `simulation.output.period` | snapshot interval, s |
 | `simulation.energy_check` | `warn` \| `strict` \| `off` |
 | `simulation.progress` | `{enable: 1, period: 0.1, watch: [...]}`; CLI: `--progress`, `--watch` |
-| `units.<u>.bridge.model` | `averaging` (default) \| `pwm_averaging` \| `switching`; CLI: `--averaging`, `--pwm-averaging`, `--switching` |
+| `units.<u>.bridge.model` | `pwm_averaging` (default) \| `averaging` \| `switching`; CLI: `--pwm-averaging`, `--averaging`, `--switching` |
 | `units.<u>.ctrl.type` | `gfl` \| `gfm` \| `custom` |
 | `units.<u>.ctrl.period` / `.computation` | sampled-mode control-interrupt period and computation time, s; ignored by `averaging` |
 | `units.<u>.ctrl.loops.<loop>.period` | sampled-mode loop period, an integer multiple of `ctrl.period`; ignored by `averaging` |

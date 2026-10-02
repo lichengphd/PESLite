@@ -432,7 +432,7 @@ class BridgeParams:
     timing.
     """
 
-    model: str = "averaging"
+    model: str = "pwm_averaging"
 
     _choices = {"model": ("switching", "pwm_averaging", "averaging")}
 

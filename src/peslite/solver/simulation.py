@@ -1131,6 +1131,14 @@ def parse_override(text: str):
     return key, value
 
 
+def _solver_choice_is_set(overrides: Mapping[str, Any]) -> bool:
+    """Whether ``--set`` selected a solver family or method for this run."""
+    return any(
+        path in ("simulation.solver.type", "simulation.solver.method")
+        for path in overrides
+    )
+
+
 def main(argv=None) -> int:
     """Run a simulation file and save its states, summary and configured signals."""
     ap = argparse.ArgumentParser(description=main.__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1144,12 +1152,11 @@ def main(argv=None) -> int:
                     help="with a states.csv: start from the row at time T instead of the last row")
     bridge = ap.add_mutually_exclusive_group()
     bridge.add_argument("--switching", action="store_true",
-                        help="run every unit with exact switching; this option wins over --set")
+                        help="exact-switching bridge with fixed-step RK4; --set has priority")
     bridge.add_argument("--pwm-averaging", action="store_true",
-                        help="run every unit with PWM-period averaging; this option wins over --set")
+                        help="PWM-period-averaged bridge with fixed-step RK4; --set has priority")
     bridge.add_argument("--averaging", action="store_true",
-                        help="run every unit as a delayed ideal averaged voltage source; "
-                             "this option wins over --set")
+                        help="ideal averaged bridge with adaptive DP45; --set has priority")
     ap.add_argument("--out", default=None,
                     help="output directory (default: output/<file name>, or "
                          "a bridge-mode suffix with --switching/--pwm-averaging/--averaging)")
@@ -1171,7 +1178,8 @@ def main(argv=None) -> int:
     except FileNotFoundError as exc:
         ap.error(str(exc))
 
-    overrides = dict(args.set)
+    set_overrides = dict(args.set)
+    overrides = dict(set_overrides)
     if args.progress is not None:
         overrides["simulation.progress.enable"] = 1
         overrides["simulation.progress.period"] = args.progress
@@ -1180,12 +1188,25 @@ def main(argv=None) -> int:
                                                    for name in value.split(",") if name]
     p = load(config, initial=args.initial,
                     initial_time=args.initial_time, **overrides)
-    if args.switching:
-        p = p.replace(**{f"units.{name}.bridge.model": "switching" for name in p.units})
-    elif args.pwm_averaging:
-        p = p.replace(**{f"units.{name}.bridge.model": "pwm_averaging" for name in p.units})
-    elif args.averaging:
-        p = p.replace(**{f"units.{name}.bridge.model": "averaging" for name in p.units})
+    preset = (("switching", "fixed", "rk4") if args.switching else
+              ("pwm_averaging", "fixed", "rk4") if args.pwm_averaging else
+              ("averaging", "adaptive", "DP45") if args.averaging else None)
+    if preset is not None:
+        model, solver_type, method = preset
+        changes = {f"units.{name}.bridge.model": model for name in p.units
+                   if f"units.{name}.bridge.model" not in set_overrides}
+        if not _solver_choice_is_set(set_overrides):
+            changes.update({
+                "simulation.solver.type": solver_type,
+                "simulation.solver.method": method,
+            })
+            if solver_type == "adaptive" and not any(
+                    path == "simulation.solver.subsystems"
+                    or path.startswith("simulation.solver.subsystems.")
+                    for path in set_overrides):
+                changes["simulation.solver.subsystems"] = {}
+        if changes:
+            p = p.replace(**changes)
     if args.watch and not p.simulation.progress.enable:
         ap.error("--watch prints on the progress lines: add --progress SECONDS")
     if args.resolved:
