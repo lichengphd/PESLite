@@ -1,0 +1,135 @@
+# Extending PESLite
+
+PESLite uses registries and small typed protocols for custom control loops, circuit elements and
+events. Register custom types before loading a simulation file that names them.
+
+Executable examples live in `tests/test_custom_parts.py`; Python implementation files are not
+placed in the root `examples/` directory.
+
+## Custom control loops
+
+Register a loop class with `register_loop_type`:
+
+```python
+from dataclasses import dataclass
+from peslite.control import SyncLaw, register_loop_type
+
+@register_loop_type
+class LaggedSync(SyncLaw):
+    @dataclass(frozen=True, kw_only=True)
+    class Params:
+        period: float
+        k_p_pu: float
+        tau: float
+        type: str = "lagged_sync"
+
+    type = "lagged_sync"
+    state_names = {"theta": "theta", "p_f_pu": "p_f"}
+
+    def __init__(self, cfg, unit, scenario):
+        super().__init__(cfg, unit, scenario)
+        self.p_f = 0.0
+
+    def step(self, period, p_pu, q_pu, v_mag_pu, v_dc_pu,
+             p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
+        self.p_f += period / self.cfg.tau * (p_pu - self.p_f)
+        self.omega = self.w0 + self.cfg.k_p_pu * (p_ref_pu - self.p_f)
+        self.theta += period * self.omega
+        self.v_mag = v_ref_pu
+```
+
+The nested frozen `Params` dataclass defines the file schema and defaults. The registered name is
+then available at `units.<u>.ctrl.loops.<loop>.type`.
+
+A loop used by sampled bridges implements `step()`. A loop used with ideal averaging also provides
+continuous outputs and state derivatives through its continuous interface, such as `flow()` for a
+`SyncLaw`. Typed input/output ports let the controller graph validate connections before running.
+
+## Custom circuit elements
+
+An element class registered by `register_element_type` owns:
+
+- a frozen `Params` dataclass including its `type` and bus fields;
+- `subsystems()` for its physical model objects;
+- `connections()` for internal/external port wiring;
+- `bus_name` and `injection` for network assembly;
+- optional `connect()`, `disconnect()` or `retune()` behavior.
+
+```python
+from peslite.components import Element, register_element_type
+
+@register_element_type
+class MyElement(Element):
+    type = "my_element"
+    # Params and assembly methods...
+```
+
+The file can then use:
+
+```yaml
+elements:
+  device: {type: my_element, bus: pcc}
+```
+
+Built-in elements follow the same mechanism. Public names are namespaced by the element instance,
+so two instances do not share state paths.
+
+## Custom events
+
+Register an `Event` subclass with `register_event_type`. Its `Params` dataclass contains at least
+`type` and `t`, and `apply(event, system, t)` performs the action:
+
+```python
+from dataclasses import dataclass
+from peslite.assembly import Event, register_event_type
+
+@register_event_type
+class Marker(Event):
+    @dataclass(frozen=True, kw_only=True)
+    class Params:
+        t: float
+        type: str = "marker"
+
+    type = "marker"
+
+    @staticmethod
+    def apply(event, system, t):
+        pass
+```
+
+Custom events receive the same exact-boundary scheduling as built-in events.
+
+## Custom solvers
+
+A user solver is a callable receiving `(rhs, t0, t1, y0)` and returning `SolverStep`. It owns its
+RHS count and must finish exactly at `t1`. Optional hooks are:
+
+- `settle(t, y)`: finish deferred work before a model-changing event;
+- `parameters_changed()`: refresh cached data after a `set` event;
+- named state methods when the solver has continuation state.
+
+Pass the object to `Simulation(params, solver=solver)`. A simple single-rate solver does not need
+the optional hooks.
+
+## Custom controllers and modulators
+
+`UniteType` builds a controller from a parameter tree, PWM method and output stage. A replacement
+controller satisfies the `Controller` protocol; a replacement modulator satisfies `Modulator` and
+returns a `SwitchingSequence`. The unit checks these protocols at assembly time.
+
+Keep protection decisions in the unit hardware layer. Controller output contains commands and
+startup status; it should not directly open breakers or mutate the system.
+
+## Validation and state rules
+
+- Validate custom scalar relationships in `Params.__post_init__` by raising `ConfigError`.
+- Declare stable public state names so restart and CSV output remain deterministic.
+- Preserve named state when rebuilding a retuned object.
+- Keep structural changes out of `set` events; expose only parameters that can be applied safely.
+- Use SI inside physical components and explicit per-unit conversion at controller boundaries.
+
+## C++ export
+
+Python registration alone does not automatically generate C++. A custom subsystem, loop, event or
+modulator needs corresponding C++ lowering support. The exporter rejects unsupported custom types
+instead of silently changing their behavior.

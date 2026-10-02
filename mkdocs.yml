@@ -1,0 +1,41 @@
+site_name: PESLite
+site_description: Open-source, lightweight, multirate, and extensible power electronics simulator in Python.
+repo_name: lonaparte/PESLite
+repo_url: https://github.com/lonaparte/PESLite
+edit_uri: edit/main/docs/
+docs_dir: docs
+site_dir: site
+strict: true
+exclude_docs: |
+  /requirements.txt
+
+theme:
+  name: readthedocs
+  locale: en
+
+nav:
+  - Home: index.md
+  - Getting Started: Getting-Started.md
+  - Simulation Files: Simulation-Files.md
+  - Simulation:
+      - Converter and Bridge Models: Converter-and-Bridge-Models.md
+      - Control and PWM Timing: Control-and-PWM-Timing.md
+      - Solvers: Solvers.md
+      - Multirate Simulation: Multirate-Simulation.md
+      - Events and Restart: Events-and-Restart.md
+      - Output and Results: Output-and-Results.md
+  - Advanced:
+      - C++ Export: Cpp-Export.md
+      - Extending PESLite: Extending-PESLite.md
+      - Architecture: Architecture.md
+  - Reference:
+      - CLI Reference: CLI-Reference.md
+      - Examples: Examples.md
+      - FAQ: FAQ.md
+
+markdown_extensions:
+  - admonition
+  - fenced_code
+  - tables
+  - toc:
+      permalink: true
