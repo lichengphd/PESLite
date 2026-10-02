@@ -15,6 +15,16 @@ jobs:
     name: Run the test suite
     runs-on: ubuntu-24.04
 
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.10"
+          - "3.11"
+          - "3.12"
+          - "3.13"
+          - "3.14"
+
     steps:
       - name: Checkout source
         uses: actions/checkout@v6
@@ -24,7 +34,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.13"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
         run: |
