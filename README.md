@@ -1,12 +1,12 @@
 # PESLite
 
-PESLite is a Python time-domain simulator for networks of power-electronic converters. It provides:
+PESLite is an open-source, lightweight, multirate power electronics simulator in Python. It is designed for time-domain simulation of power electronic converters and converter-based systems, supporting switching and averaged models, digital control, and flexible numerical integration for efficient simulations across multiple time scales. It provides:
 
-- YAML simulation files with buses, lines, sources, loads, converters and timed events;
 - grid-following and grid-forming control in sampled or continuous form;
 - switching, PWM-period-averaged and ideal averaged bridge models, selectable per converter;
 - fixed-step, adaptive and multirate integration;
 - ADC/PWM timing, converter-owned protection, energy accounting and restart from saved states;
+- YAML simulation files with buses, lines, sources, loads, converters and timed events;
 - export of a configured simulation as a standalone C++17 simulator.
 
 The power circuit uses SI units (V, A, H, F and ohm), controller quantities ending in `_pu` are
