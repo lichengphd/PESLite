@@ -11,6 +11,7 @@ import pytest
 
 import peslite
 from conftest import EXAMPLES
+from peslite.solver.simulation import convert_main
 
 
 def _compiler() -> str | None:
@@ -35,22 +36,37 @@ def test_python_export_api_uses_export_run(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     result = peslite.export(_quick("pwm_averaging"), "cpp")
     assert result.out_dir == Path("export/run")
-    assert {path.name for path in result.files} == {
-        "peslite.cpp", "simulation.pes", "CMakeLists.txt", "README.md",
-    }
+    assert tuple(path.name for path in result.files) == ("peslite.cpp",)
+    assert tuple(path.name for path in result.out_dir.iterdir()) == ("peslite.cpp",)
     assert "Standalone C++17" in (result.out_dir / "peslite.cpp").read_text()
 
 
-def test_cli_export_preserves_configuration_and_mode_name(tmp_path, monkeypatch):
+def test_cli_export_preserves_mode_name_and_emits_one_file(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert peslite.main([str(EXAMPLES / "gfl-example.pes"), "--averaging",
                          "--export", "cpp"]) == 0
     project = tmp_path / "export/gfl-example-averaging"
-    assert (project / "peslite.cpp").is_file()
-    resolved = peslite.load(project / "simulation.pes")
-    assert resolved.unit("vsc").bridge.model == "averaging"
-    assert (resolved.simulation.solver.type, resolved.simulation.solver.method) == (
-        "adaptive", "DP45")
+    source = project / "peslite.cpp"
+    assert tuple(project.iterdir()) == (source,)
+    text = source.read_text()
+    assert "if constexpr (false) integrate_fixed" in text
+    assert "else integrate_adaptive" in text
+
+
+def test_convert_alias_and_all_variables(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert convert_main([str(EXAMPLES / "gfl-example.pes"), "all"]) == 0
+    source = (tmp_path / "export/gfl-example/peslite.cpp").read_text()
+    assert "param_simulation_t_end" in source
+    assert "param_units_vsc_ctrl_references_p_ref_pu" in source
+    assert '"__PESLITE_RUNTIME_PARAMETER_1__"' in source
+    assert '"__PESLITE_RUNTIME_PARAMETER_10__"' in source
+
+
+def test_export_rejects_a_non_variable_parameter(tmp_path):
+    with pytest.raises(ValueError, match="is not variable"):
+        peslite.export(_quick("pwm_averaging"), "cpp", tmp_path,
+                       variables=["units.vsc.bridge.model"])
 
 
 @pytest.mark.parametrize("mode", ("switching", "pwm_averaging", "averaging"))
@@ -84,3 +100,55 @@ def test_cpp_export_rejects_an_already_run_simulation(tmp_path):
     simulation.run(out_dir=tmp_path / "output")
     with pytest.raises(RuntimeError, match="already-run"):
         simulation.export("cpp", tmp_path / "export")
+
+
+def test_generated_cpp_runtime_parameters(tmp_path):
+    compiler = _compiler()
+    if compiler is None:
+        pytest.skip("no C++17 compiler installed")
+    params = _quick("pwm_averaging")
+    project = tmp_path / "runtime-parameters"
+    peslite.export(params, "cpp", project, variables=[
+        "simulation.t_end", "units.vsc.ctrl.references.p_ref_pu",
+    ])
+    executable = project / "peslite"
+    subprocess.run([compiler, "-O3", "-DNDEBUG", "-std=c++17",
+                    str(project / "peslite.cpp"), "-o", str(executable)], check=True)
+
+    listed = subprocess.run([executable, "--list-params"], check=True,
+                            capture_output=True, text=True).stdout
+    assert "simulation.t_end" in listed
+    assert "units.vsc.ctrl.references.p_ref_pu" in listed
+
+    output = project / "changed-output"
+    subprocess.run([executable,
+                    "--set", "simulation.t_end=0.204",
+                    "--set", "units.vsc.ctrl.references.p_ref_pu=0.25",
+                    "--out", output], check=True)
+    resolved = peslite.load(output / "simulation.pes")
+    assert resolved.simulation.t_end == pytest.approx(0.204)
+    assert resolved.unit("vsc").ctrl.references.p_ref_pu == pytest.approx(0.25)
+
+    config = project / "runtime.pes"
+    peslite.dump(params.replace(**{
+        "simulation.t_end": 0.203,
+        "units.vsc.ctrl.references.p_ref_pu": 0.4,
+    }), config)
+    configured_output = project / "configured-output"
+    configured = subprocess.run([
+        executable, "--config", config,
+        "--set", "simulation.t_end=0.205",
+        "--out", configured_output,
+    ], capture_output=True, text=True)
+    assert configured.returncode == 0
+    assert "warning:" in configured.stderr
+    configured_params = peslite.load(configured_output / "simulation.pes")
+    assert configured_params.simulation.t_end == pytest.approx(0.205)
+    assert configured_params.unit("vsc").ctrl.references.p_ref_pu == pytest.approx(0.4)
+
+    rejected = subprocess.run(
+        [executable, "--set", "units.vsc.ctrl.references.q_ref_pu=0.2"],
+        capture_output=True, text=True,
+    )
+    assert rejected.returncode == 1
+    assert "parameter 'units.vsc.ctrl.references.q_ref_pu' is not variable" in rejected.stderr

@@ -91,11 +91,30 @@ Export a resolved configuration as a standalone, parameter-specialised C++17 sim
 
 ```bash
 peslite gfl-example --export cpp
-cmake -S export/gfl-example -B export/gfl-example/build
-cmake --build export/gfl-example/build --config Release
-export/gfl-example/build/peslite
+c++ -O3 -DNDEBUG -std=c++17 export/gfl-example/peslite.cpp \
+  -o export/gfl-example/peslite
+export/gfl-example/peslite
 ```
 
+Paths after the format remain variable in the compiled program. `peslite-convert` is the shorter
+C++-specific spelling, and `all` retains every parameter supported by that export:
+
+```bash
+peslite gfl-example --export cpp simulation.t_end units.vsc.ctrl.references.p_ref_pu
+peslite-convert gfl-example simulation.t_end units.vsc.ctrl.references.p_ref_pu
+peslite-convert gfl-example all
+```
+
+The executable uses the same override form. A `.pes` file may provide the retained values; other
+values in that file are ignored with a warning, and command-line `--set` has priority:
+
+```bash
+export/gfl-example/peslite --list-params
+export/gfl-example/peslite --config run.pes \
+  --set simulation.t_end=5.0 --out output/test
+```
+
+The export directory initially contains only the self-contained `peslite.cpp` translation unit.
 The generated executable uses only the C++17 standard library. It performs the simulation itself
 and writes the same `states.csv`, optional signal CSVs, `summary.json` and `simulation.pes` file
 layout as the Python runner. Its default result directory is `output/<configuration-name>`; an
@@ -105,8 +124,8 @@ The same export is available from Python. With no directory argument it mirrors 
 `output/run` convention under `export/run`:
 
 ```python
-project = peslite.export(p, "cpp")
-# equivalently: peslite.Simulation(p).export("cpp")
+project = peslite.export(p, "cpp", variables=["simulation.t_end"])
+# equivalently: peslite.Simulation(p).export("cpp", variables=["simulation.t_end"])
 ```
 
 ## Simulation files and events

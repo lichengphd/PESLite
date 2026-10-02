@@ -15,6 +15,7 @@ import argparse
 import dataclasses
 import json
 import math
+import sys
 import sysconfig
 import time
 import warnings
@@ -41,7 +42,7 @@ from .model import ConfigError, StateRegistry, expand_aliases, flatten, resolve
 from .multirate import make_solver
 from .splitbound import split_error_bound
 
-__all__ = ["Simulation", "SimulationResult", "Recorder", "main", "read_csv", "align", "window_ptp",
+__all__ = ["Simulation", "SimulationResult", "Recorder", "main", "convert_main", "read_csv", "align", "window_ptp",
            "pointwise_errors"]
 
 
@@ -440,10 +441,11 @@ class Simulation:
         self.p.unit(name)  # checks the name
         return self.system.units[name if name is not None else next(iter(self.p.units))]
 
-    def export(self, format: str, out_dir: str | Path | None = None, *, name: str = "run"):
+    def export(self, format: str, out_dir: str | Path | None = None, *, name: str = "run",
+               variables=()):
         """Export this configured simulation as a standalone implementation."""
         from ..assembly.exporter import export
-        return export(self, format, out_dir, name=name)
+        return export(self, format, out_dir, name=name, variables=variables)
 
     def _actions(self) -> list[tuple[float, int, Any]]:
         """Return file-event actions as ``(time, file_order, action)``."""
@@ -1165,8 +1167,8 @@ def main(argv=None) -> int:
     ap.add_argument("--out", default=None,
                     help="output directory (default: output/<file name>, or "
                          "a bridge-mode suffix with --switching/--pwm-averaging/--averaging)")
-    ap.add_argument("--export", choices=("cpp",), default=None, metavar="FORMAT",
-                    help="export a standalone configured simulator instead of running it")
+    ap.add_argument("--export", nargs="+", default=None, metavar="FORMAT_OR_PARAM",
+                    help="export a standalone simulator: FORMAT followed by optional variable parameter paths")
     ap.add_argument("--progress", type=float, default=None, metavar="SECONDS",
                     help="print a progress line every SECONDS of simulated time")
     ap.add_argument("--watch", action="append", default=None, metavar="NAME",
@@ -1230,8 +1232,13 @@ def main(argv=None) -> int:
               "-pwm-averaging" if args.pwm_averaging else
               "-averaging" if args.averaging else "")
     if args.export:
+        export_format, *export_variables = args.export
         out = Path(args.out) if args.out else Path("export") / f"{config.stem}{suffix}"
-        result = sim.export(args.export, out, name=f"{config.stem}{suffix}")
+        try:
+            result = sim.export(export_format, out, name=f"{config.stem}{suffix}",
+                                variables=export_variables)
+        except (TypeError, ValueError) as exc:
+            ap.error(str(exc))
         print("wrote", ", ".join(str(path) for path in result.files))
         return 0
     units = ", ".join(f"{n} ({u.ctrl.type}, {u.bridge.model.replace('_', ' ')}, "
@@ -1271,6 +1278,19 @@ def main(argv=None) -> int:
             if name != "t":
                 print(f"  {name:<{width}}  {value: .10g}")
     return 0
+
+
+def convert_main(argv=None) -> int:
+    """Export a PESLite simulation file as C++ with optional variable parameter paths."""
+    values = list(sys.argv[1:] if argv is None else argv)
+    if values and values[0] in ("-h", "--help"):
+        print("usage: peslite-convert PESFILE [PARAM ...] [--out DIRECTORY]")
+        print("export one self-contained peslite.cpp; PARAM may be a variable path or all")
+        return 0
+    if not values:
+        print("usage: peslite-convert PESFILE [PARAM ...]", file=sys.stderr)
+        return 2
+    return main([values[0], "--export", "cpp", *values[1:]])
 
 
 if __name__ == "__main__":

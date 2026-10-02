@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Callable
 
 from .params import Params
@@ -28,7 +29,7 @@ class ExportResult:
     files: tuple[Path, ...]
 
 
-Exporter = Callable[["Simulation", Path, str], ExportResult]
+Exporter = Callable[["Simulation", Path, str, tuple[str, ...]], ExportResult]
 EXPORTERS: dict[str, Exporter] = {}
 
 
@@ -40,12 +41,14 @@ def _exporter(name: str):
 
 
 def export(what: Params | "Simulation", format: str, out_dir: str | Path | None = None,
-           *, name: str = "run") -> ExportResult:
+           *, name: str = "run", variables: Iterable[str] = ()) -> ExportResult:
     """Export a complete configured simulator in ``format``.
 
     ``what`` may be a resolved :class:`Params` tree or an unrun :class:`Simulation`.  With no
     explicit directory the result is written to ``export/<name>``; the Python API consequently
     uses ``export/run`` by default, matching ``Simulation.run()``'s ``output/run`` convention.
+    ``variables`` names parameters retained for run-time overrides by the exported program;
+    ``("all",)`` selects every parameter supported by that backend and configuration.
     """
     # The local imports avoid making the C++ backend part of ordinary simulation import time.
     from ..solver.simulation import Simulation
@@ -60,4 +63,5 @@ def export(what: Params | "Simulation", format: str, out_dir: str | Path | None 
     if simulation.result is not None:
         raise RuntimeError("an already-run Simulation cannot be exported; build one from its Params")
     destination = Path(out_dir) if out_dir is not None else Path("export") / name
-    return EXPORTERS[key](simulation, destination, name)
+    selected = tuple(str(path) for path in variables)
+    return EXPORTERS[key](simulation, destination, name, selected)

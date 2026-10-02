@@ -1,8 +1,8 @@
 """Parameter-specialised standalone C++17 simulator backend.
 
 The backend emits one translation unit.  The resolved configuration, state layout, connection
-plan and schedules are constants in that unit; the generated executable needs only the C++17
-standard library and never parses YAML or calls Python.
+plan and schedules are embedded in that unit; the generated executable needs only the C++17
+standard library and never calls Python.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import json
 import math
 import re
 from contextlib import contextmanager
+from dataclasses import dataclass, fields
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -22,7 +23,7 @@ from ..control.controller import UniteType
 from ..control.loops import (ActiveDamping, CurrentLoop, DCVoltageLoop, Droop, DVOC,
                              Matching, PowerLoop, PSC, SRFPLL, SyncLaw, UnitDelay,
                              VirtualAdmittance, VirtualImpedance, VSG)
-from .params import dump, dumps
+from .params import _written_out, dumps
 from .exporter import ExportResult, _exporter
 
 __all__ = []
@@ -68,12 +69,128 @@ def _complex(value: complex) -> str:
     return f"Complex{{{_number(value.real)}, {_number(value.imag)}}}"
 
 
+@dataclass(frozen=True)
+class _RuntimeParameter:
+    path: str
+    member: str
+    default: float
+    positive: bool = False
+    above: float | None = None
+
+
+class _RuntimeParameters:
+    """The explicitly selected scalar parameters retained by a generated executable."""
+
+    def __init__(self, p: Any, requested: tuple[str, ...]) -> None:
+        available: dict[str, _RuntimeParameter] = {}
+
+        def add(path: str, value: Any, *, positive: bool = False,
+                above: float | None = None) -> None:
+            if value is not None and not isinstance(value, bool):
+                available[path] = _RuntimeParameter(
+                    path, "param_" + _identifier(path), float(value), positive, above)
+
+        simulation = p.simulation
+        add("simulation.t_end", simulation.t_end, above=simulation.initial.t)
+        add("simulation.output.period", simulation.output.period, positive=True)
+        solver = simulation.solver
+        if solver.type == "fixed":
+            add("simulation.solver.dt", solver.dt, positive=True)
+        elif solver.type == "adaptive":
+            add("simulation.solver.rtol", solver.rtol, positive=True)
+            add("simulation.solver.atol", solver.atol, positive=True)
+            add("simulation.solver.max_step", solver.max_step, positive=True)
+        for name, source in p.sources.items():
+            add(f"sources.{name}.v", source.v)
+            add(f"sources.{name}.f", source.f if source.f is not None else p.base.f0,
+                positive=True)
+            add(f"sources.{name}.angle", source.angle)
+        for unit_name, unit in p.units.items():
+            references = unit.ctrl.references
+            for field in fields(references):
+                add(f"units.{unit_name}.ctrl.references.{field.name}",
+                    getattr(references, field.name))
+
+        if "all" in requested:
+            selected = list(available)
+        else:
+            selected = list(dict.fromkeys(requested))
+        unknown = [path for path in selected if path not in available]
+        if unknown:
+            known = ", ".join(available)
+            raise ValueError(
+                f"parameter {unknown[0]!r} is not variable"
+                + (f"; available: {known}" if known else "")
+            )
+        self.available = available
+        self.selected = tuple(available[path] for path in selected)
+        self.by_path = {item.path: item for item in self.selected}
+
+    def value(self, path: str, value: Any) -> str:
+        item = self.by_path.get(path)
+        return f"parameters.{item.member}" if item is not None else _number(value)
+
+    def declarations(self) -> str:
+        members = "\n    ".join(
+            f"double {item.member} = {_number(item.default)};" for item in self.selected
+        )
+        return f"struct RuntimeParameters {{\n    {members}\n}};" if members else "struct RuntimeParameters {};"
+
+    def setters(self) -> str:
+        cases: list[str] = []
+        for item in self.selected:
+            checks = []
+            if item.positive:
+                checks.append("!(value > 0.0)")
+            if item.above is not None:
+                checks.append(f"!(value > {_number(item.above)})")
+            if item.path != "simulation.solver.max_step":
+                checks.append("!std::isfinite(value)")
+            condition = " || ".join(checks)
+            validation = (
+                f" if ({condition}) throw std::runtime_error(\"invalid value for {item.path}\");"
+                if condition else ""
+            )
+            cases.append(
+                f"if (path == {_cpp_string(item.path)}) {{ const double value = parse_number(text);"
+                f"{validation} parameters.{item.member} = value; return true; }}"
+            )
+        return "\n    ".join(cases)
+
+    def listing(self) -> str:
+        return "\n    ".join(
+            f"std::cout << {_cpp_string(item.path + '  value=')} << parameters.{item.member} << '\\n';"
+            for item in self.selected
+        )
+
+    def resolved_template(self, p: Any) -> tuple[str, list[tuple[str, str]]]:
+        if not self.selected:
+            return dumps(p), []
+        tree = _written_out(p)
+        replacements: list[tuple[str, str]] = []
+        for index, item in enumerate(self.selected):
+            marker = f"__PESLITE_RUNTIME_PARAMETER_{index}__"
+            node = tree
+            keys = item.path.split(".")
+            for key in keys[:-1]:
+                node = node[key]
+            node[keys[-1]] = marker
+            replacements.append((marker, f"parameters.{item.member}"))
+        try:
+            import yaml  # type: ignore
+            body = yaml.safe_dump(tree, sort_keys=False)
+        except ImportError:  # pragma: no cover
+            body = json.dumps(tree, indent=2) + "\n"
+        return body, replacements
+
+
 class _ModelGenerator:
     """Turn Model's fixed state and connection plans into straight-line C++."""
 
-    def __init__(self, simulation: Any) -> None:
+    def __init__(self, simulation: Any, runtime: _RuntimeParameters) -> None:
         self.simulation = simulation
         self.p = simulation.p
+        self.runtime = runtime
         self.system = simulation.system
         self.model = self.system.model
         self.subsystem_name = {id(sub): name for name, sub in zip(self.model.names, self.model.subsystems)}
@@ -155,9 +272,12 @@ class _ModelGenerator:
         return " + ".join(terms) if terms else "0.0"
 
     def _source_values(self, source: ThreePhaseSource) -> tuple[str, str]:
-        wrapper = next((item for item in self.system.sources.values() if item.emf is source), None)
+        entry = next(((name, item) for name, item in self.system.sources.items()
+                      if item.emf is source), None)
+        wrapper = entry[1] if entry is not None else None
         if wrapper is None:
             return _number(source.e_peak), "0.0"
+        source_name = entry[0]
         scenario = wrapper.scenario
 
         def piecewise(starts, expressions):
@@ -166,15 +286,33 @@ class _ModelGenerator:
                 result = f"(t >= {_number(start)} ? {expression} : {result})"
             return result
 
-        magnitude = piecewise(scenario._v_from, [_number(value) for value in scenario._v])
+        magnitudes = [_number(value) for value in scenario._v]
+        magnitudes[0] = self.runtime.value(f"sources.{source_name}.v", scenario._v[0])
+        magnitude = piecewise(scenario._v_from, magnitudes)
         phases = []
-        for start, (frequency, angle, phase) in zip(scenario._angle_from, scenario._angle):
-            slope = 2.0 * math.pi * (frequency - scenario.f0)
+        accumulated = "0.0"
+        previous_start = 0.0
+        previous_frequency = ""
+        for index, (start, (frequency, angle, _phase)) in enumerate(
+                zip(scenario._angle_from, scenario._angle)):
+            if index:
+                duration = start - previous_start
+                accumulated = (
+                    f"({accumulated} + 2.0 * pi * ({previous_frequency} - "
+                    f"{_number(scenario.f0)}) * {_number(duration)})"
+                )
+            if index == 0:
+                frequency_value = self.runtime.value(f"sources.{source_name}.f", frequency)
+                angle_value = self.runtime.value(f"sources.{source_name}.angle", angle)
+            else:
+                frequency_value = _number(frequency)
+                angle_value = _number(angle)
             origin = max(start, 0.0)
             phases.append(
-                _number(phase + angle) if slope == 0.0 else
-                f"({_number(phase + angle)} + {_number(slope)} * (t - {_number(origin)}))"
+                f"({accumulated} + {angle_value} + 2.0 * pi * "
+                f"({frequency_value} - {_number(scenario.f0)}) * (t - {_number(origin)}))"
             )
+            previous_start, previous_frequency = origin, frequency_value
         return magnitude, piecewise(scenario._angle_from, phases)
 
     def _output(self, method: Any) -> list[str]:
@@ -302,10 +440,12 @@ class _ModelGenerator:
         label = self.subsystem_name.get(id(sub), type(sub).__name__)
         raise TypeError(f"C++ export: subsystem {label!r} ({type(sub).__name__}) has no C++ RHS implementation")
 
-    def body(self) -> list[str]:
+    def body(self, derivatives: bool = True) -> list[str]:
         lines = self.declarations()
         for operation in self.model._plan:
             lines.extend(self._operation(operation))
+        if not derivatives:
+            return lines
         for sub, entries in self.model._rhs_layout:
             derivatives = self._rhs(sub)
             if len(derivatives) != len(entries):
@@ -606,7 +746,8 @@ class _ContinuousUnitGenerator(_ProtectionGenerator):
             current = getattr(change.params.units[self.name].ctrl.references, name)
             if current != values[-1][1]:
                 values.append((change.t, current))
-        result = self._literal(values[0][1])
+        path = f"units.{self.name}.ctrl.references.{name}"
+        result = self.model.runtime.value(path, values[0][1])
         for at, value in values[1:]:
             result = f"(t >= {_number(at)} ? {self._literal(value)} : {result})"
         return result
@@ -1003,7 +1144,8 @@ class _UnitGenerator(_ProtectionGenerator):
             current = getattr(change.params.units[self.name].ctrl.references, name)
             if current != values[-1][1]:
                 values.append((change.t, current))
-        expression = self._literal(values[0][1])
+        path = f"units.{self.name}.ctrl.references.{name}"
+        expression = self.model.runtime.value(path, values[0][1])
         for at, value in values[1:]:
             expression = f"(t >= {_number(at)} ? {self._literal(value)} : {expression})"
         return expression
@@ -1705,12 +1847,13 @@ class _UnitGenerator(_ProtectionGenerator):
 class _CppGenerator:
     """Generate a straight-line C++ model for one assembled simulation."""
 
-    def __init__(self, simulation: Any, name: str) -> None:
+    def __init__(self, simulation: Any, name: str, variables: tuple[str, ...]) -> None:
         self.simulation = simulation
         self.p = simulation.p
         self.system = simulation.system
         self.model = self.system.model
         self.name = name
+        self.runtime = _RuntimeParameters(self.p, variables)
 
     def _state_layout(self, model: _ModelGenerator, sampled: dict[str, _UnitGenerator],
                       continuous: dict[str, _ContinuousUnitGenerator]) -> tuple[list[str], list[str]]:
@@ -1966,7 +2109,7 @@ class _CppGenerator:
 
     def source(self) -> str:
         """Return the complete generated translation unit."""
-        model = _ModelGenerator(self.simulation)
+        model = _ModelGenerator(self.simulation, self.runtime)
         sampled = {name: _UnitGenerator(name, unit, model)
                    for name, unit in self.system.units.items() if not unit.continuous}
         continuous = {name: model.continuous_units[id(unit.ctrl)]
@@ -1981,6 +2124,7 @@ class _CppGenerator:
             member_lines.extend(generator.members())
         members = "\n    ".join(member_lines)
         rhs = "\n        ".join(model.body())
+        sync_body = "\n        ".join(model.body(derivatives=False))
         observation_members, observation_assignments = model.observations()
         observations = "\n        ".join(observation_assignments)
         members = "\n    ".join([members, *observation_members])
@@ -2014,7 +2158,12 @@ class _CppGenerator:
         times = ", ".join(_number(value) for value in action_times)
         snapshot_values = "\n            ".join(f"states << ',' << ({value});" for value in state_values)
         output = self.p.simulation.output
-        resolved_text = _cpp_string(dumps(self.p))
+        resolved_template, resolved_replacements = self.runtime.resolved_template(self.p)
+        resolved_text = _cpp_string(resolved_template)
+        resolved_replace = "\n    ".join(
+            f"replace_all(text, {_cpp_string(marker)}, yaml_number({expression}));"
+            for marker, expression in resolved_replacements
+        )
         plant_names, plant_values = self._signal_layout(sampled, continuous)
         plant_snapshot = (self._csv_values("plant", plant_values, "                ")
                           if output.signals else "")
@@ -2141,12 +2290,22 @@ class _CppGenerator:
                 f"C++ export supports fixed euler/heun/rk4 and adaptive DP45, not "
                 f"{solver.type}/{solver.method}"
             )
+        runtime_declarations = self.runtime.declarations()
+        runtime_setters = self.runtime.setters()
+        runtime_listing = self.runtime.listing()
+        fixed_dt = self.runtime.value("simulation.solver.dt", solver.dt)
+        adaptive_max_step = self.runtime.value("simulation.solver.max_step", solver.max_step)
+        adaptive_atol = self.runtime.value("simulation.solver.atol", solver.atol)
+        adaptive_rtol = self.runtime.value("simulation.solver.rtol", solver.rtol)
+        run_end = self.runtime.value("simulation.t_end", self.p.simulation.t_end)
+        output_period_value = self.runtime.value("simulation.output.period", output.period)
         # The execution backend is deliberately emitted as one TU: whole-program optimisation can
         # inline the configured RHS and remove unused output paths without crossing a library ABI.
-        return f'''// Generated by PESLite.  Do not edit: regenerate from simulation.pes.
+        return f'''// Generated by PESLite.  Do not edit: regenerate from the source simulation file.
 // Standalone C++17; no Python, NumPy, SciPy or YAML dependency at run time.
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <complex>
@@ -2159,6 +2318,7 @@ class _CppGenerator:
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <sstream>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -2170,6 +2330,116 @@ constexpr std::size_t state_count = {len(state_names)};
 using State = std::array<double, state_count>;
 constexpr double pi = 3.141592653589793238462643383279502884;
 constexpr double time_eps = 1e-10;
+
+{runtime_declarations}
+
+inline std::string_view trim(std::string_view text) {{
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) text.remove_prefix(1);
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) text.remove_suffix(1);
+    return text;
+}}
+
+inline double parse_number(std::string_view text) {{
+    text = trim(text);
+    if (text.size() >= 2 && ((text.front() == static_cast<char>(39) && text.back() == static_cast<char>(39)) ||
+                             (text.front() == static_cast<char>(34) && text.back() == static_cast<char>(34)))) {{
+        text.remove_prefix(1); text.remove_suffix(1);
+    }}
+    if (text == ".inf" || text == "+.inf") return std::numeric_limits<double>::infinity();
+    if (text == "-.inf") return -std::numeric_limits<double>::infinity();
+    if (text == ".nan") return std::numeric_limits<double>::quiet_NaN();
+    std::string value(text);
+    std::size_t used = 0;
+    double result = 0.0;
+    try {{ result = std::stod(value, &used); }}
+    catch (const std::exception&) {{ throw std::runtime_error("invalid numeric value '" + value + "'"); }}
+    if (used != value.size()) throw std::runtime_error("invalid numeric value '" + value + "'");
+    return result;
+}}
+
+inline bool try_set_parameter(RuntimeParameters& parameters, std::string_view path,
+                              std::string_view text) {{
+    path = trim(path);
+    text = trim(text);
+    {runtime_setters}
+    return false;
+}}
+
+inline void set_parameter(RuntimeParameters& parameters, std::string_view assignment) {{
+    const auto equal = assignment.find('=');
+    if (equal == std::string_view::npos || equal == 0 || equal + 1 == assignment.size())
+        throw std::runtime_error("--set expects PATH=VALUE");
+    const auto path = assignment.substr(0, equal);
+    if (!try_set_parameter(parameters, path, assignment.substr(equal + 1)))
+        throw std::runtime_error("parameter '" + std::string(trim(path)) + "' is not variable");
+}}
+
+inline std::string yaml_key(std::string_view value) {{
+    value = trim(value);
+    if (value.size() >= 2 && ((value.front() == static_cast<char>(39) && value.back() == static_cast<char>(39)) ||
+                              (value.front() == static_cast<char>(34) && value.back() == static_cast<char>(34))))
+        value = value.substr(1, value.size() - 2);
+    return std::string(value);
+}}
+
+inline void load_config(RuntimeParameters& parameters, const std::filesystem::path& file) {{
+    std::ifstream input(file);
+    if (!input) throw std::runtime_error("cannot open config '" + file.string() + "'");
+    std::vector<std::pair<std::size_t, std::string>> levels;
+    std::size_t ignored = 0;
+    std::string line;
+    while (std::getline(input, line)) {{
+        std::size_t indent = 0;
+        while (indent < line.size() && line[indent] == ' ') ++indent;
+        std::string_view content = trim(std::string_view(line).substr(indent));
+        if (content.empty() || content.front() == '#' || content == "---" ||
+                content == "..." || content.front() == '-') continue;
+        const auto colon = content.find(':');
+        if (colon == std::string_view::npos) continue;
+        const std::string key = yaml_key(content.substr(0, colon));
+        std::string_view value = trim(content.substr(colon + 1));
+        while (!levels.empty() && levels.back().first >= indent) levels.pop_back();
+        std::string path;
+        for (const auto& level : levels) {{ if (!path.empty()) path += '.'; path += level.second; }}
+        if (!path.empty()) path += '.';
+        path += key;
+        if (value.empty()) {{ levels.emplace_back(indent, key); continue; }}
+        const auto comment = value.find(" #");
+        if (comment != std::string_view::npos) value = trim(value.substr(0, comment));
+        if (!try_set_parameter(parameters, path, value)) ++ignored;
+    }}
+    if (ignored)
+        std::cerr << "peslite: warning: " << ignored << " parameter"
+                  << (ignored == 1 ? " in '" : "s in '") << file.string()
+                  << (ignored == 1 ? "' is" : "' are")
+                  << " not variable and were ignored\\n";
+}}
+
+inline void list_parameters(const RuntimeParameters& parameters) {{
+    {runtime_listing}
+}}
+
+inline void replace_all(std::string& text, std::string_view from, const std::string& to) {{
+    std::size_t position = 0;
+    while ((position = text.find(from, position)) != std::string::npos) {{
+        text.replace(position, from.size(), to);
+        position += to.size();
+    }}
+}}
+
+inline std::string yaml_number(double value) {{
+    if (std::isnan(value)) return ".nan";
+    if (std::isinf(value)) return value < 0.0 ? "-.inf" : ".inf";
+    std::ostringstream stream;
+    stream << std::setprecision(17) << value;
+    return stream.str();
+}}
+
+inline std::string resolved_parameters(const RuntimeParameters& parameters) {{
+    std::string text = {resolved_text};
+    {resolved_replace}
+    return text;
+}}
 
 inline double smoothstep(double x) noexcept {{
     x = std::clamp(x, 0.0, 1.0);
@@ -2207,6 +2477,7 @@ constexpr State initial_state{{{values}}};
 
 class Simulator {{
 public:
+    RuntimeParameters parameters;
     State y = initial_state;
     std::size_t n_rhs = 0;
     std::size_t n_rejected = 0;
@@ -2214,19 +2485,21 @@ public:
     double adaptive_error = 1.0;
     {members}
 
-    inline void evaluate(double t, const State& y, State* derivative) {{
-        State local_derivative{{}};
-        State& dy = derivative ? *derivative : local_derivative;
+    explicit Simulator(RuntimeParameters configured = {{}}) : parameters(std::move(configured)) {{}}
+
+    inline void evaluate(double t, const State& y, State& dy) {{
         {rhs}
-        {observations}
     }}
 
     inline void rhs(double t, const State& y, State& dy) {{
         ++n_rhs;
-        evaluate(t, y, &dy);
+        evaluate(t, y, dy);
     }}
 
-    inline void sync(double t) {{ evaluate(t, y, nullptr); }}
+    inline void sync(double t) {{
+        {sync_body}
+        {observations}
+    }}
 
     inline void step(double& t, double h) {{
         State a{{}}, b{{}}, c{{}}, d{{}}, x{{}};
@@ -2255,7 +2528,7 @@ public:
     void integrate_fixed(double& t, double target) {{
         const double span = target - t;
         if (span <= 0.0) return;
-        const std::size_t count = std::max<std::size_t>(1, static_cast<std::size_t>(std::ceil(span / {_number(solver.dt)} - 1e-9)));
+        const std::size_t count = std::max<std::size_t>(1, static_cast<std::size_t>(std::ceil(span / {fixed_dt} - 1e-9)));
         const double h = span / static_cast<double>(count);
         for (std::size_t k = 0; k < count; ++k) step(t, h);
         t = target;
@@ -2265,7 +2538,7 @@ public:
         const double span = target - t;
         if (span <= 0.0) return;
         double h = std::isfinite(adaptive_h) ? adaptive_h : span;
-        h = std::min(h, std::min(span, {_number(solver.max_step)}));
+        h = std::min(h, std::min(span, {adaptive_max_step}));
         State k1{{}}, k2{{}}, k3{{}}, k4{{}}, k5{{}}, k6{{}}, k7{{}}, x{{}}, y1{{}};
         rhs(t, y, k1);
         const double end_epsilon = 1e-15 * std::max(1.0, std::abs(target));
@@ -2286,7 +2559,7 @@ public:
             double error = 0.0;
             for (std::size_t i = 0; i < state_count; ++i) {{
                 const double estimate = std::abs(h * ((71.0 / 57600.0) * k1[i] - (71.0 / 16695.0) * k3[i] + (71.0 / 1920.0) * k4[i] - (17253.0 / 339200.0) * k5[i] + (22.0 / 525.0) * k6[i] - (1.0 / 40.0) * k7[i]));
-                error = std::max(error, estimate / ({_number(solver.atol)} + {_number(solver.rtol)} * std::max(std::abs(y[i]), std::abs(y1[i]))));
+                error = std::max(error, estimate / ({adaptive_atol} + {adaptive_rtol} * std::max(std::abs(y[i]), std::abs(y1[i]))));
             }}
             if (error <= 1.0 || h <= 1e-15) {{
                 t += h;
@@ -2295,7 +2568,7 @@ public:
                 double factor = error == 0.0 ? 5.0 : 0.9 * std::pow(error, -0.14) * std::pow(adaptive_error, 0.08);
                 factor = std::clamp(factor, 0.2, 5.0);
                 adaptive_error = std::max(error, 1e-4);
-                h = std::min(h * factor, {_number(solver.max_step)});
+                h = std::min(h * factor, {adaptive_max_step});
             }} else {{
                 ++n_rejected;
                 h *= std::max(0.1, 0.9 * std::pow(error, -0.25));
@@ -2330,8 +2603,8 @@ public:
         {energy_declarations_text}
         {energy_header}
         double t = {_number(self.p.simulation.initial.t)};
-        const double end = {_number(self.p.simulation.t_end)};
-        const double output_period = {_number(output.period)};
+        const double end = {run_end};
+        const double output_period = {output_period_value};
         long long output_index = std::max<long long>(0, static_cast<long long>(std::ceil(t / output_period - 1e-9)));
         double next_output = output_index * output_period;
         constexpr std::array<double, {len(action_times)}> action_times{{{times}}};
@@ -2406,19 +2679,60 @@ public:
         {energy_summary}
         summary << "\\n}}\\n";
         std::ofstream resolved(out / "simulation.pes");
-        resolved << {resolved_text};
+        resolved << resolved_parameters(parameters);
         return 0;
     }}
 }};
 
-int run(const std::filesystem::path& out) {{ return Simulator{{}}.run(out); }}
+int run(const std::filesystem::path& out, RuntimeParameters parameters = {{}}) {{
+    return Simulator{{std::move(parameters)}}.run(out);
+}}
 
 }}  // namespace peslite_generated
 
 int main(int argc, char** argv) {{
     try {{
-        const std::filesystem::path out = argc > 1 ? argv[1] : std::filesystem::path({_cpp_string('output/' + self.name)});
-        return peslite_generated::run(out);
+        peslite_generated::RuntimeParameters parameters;
+        std::filesystem::path out = {_cpp_string('output/' + self.name)};
+        std::filesystem::path config;
+        bool out_given = false;
+        bool config_given = false;
+        bool list_params = false;
+        std::vector<std::string> assignments;
+        for (int index = 1; index < argc; ++index) {{
+            const std::string_view argument(argv[index]);
+            if (argument == "--set") {{
+                if (++index >= argc) throw std::runtime_error("--set expects PATH=VALUE");
+                assignments.emplace_back(argv[index]);
+            }} else if (argument.substr(0, 6) == "--set=") {{
+                assignments.emplace_back(argument.substr(6));
+            }} else if (argument == "--config") {{
+                if (++index >= argc) throw std::runtime_error("--config expects PESFILE");
+                config = argv[index]; config_given = true;
+            }} else if (argument.substr(0, 9) == "--config=") {{
+                config = std::string(argument.substr(9)); config_given = true;
+            }} else if (argument == "--out") {{
+                if (++index >= argc) throw std::runtime_error("--out expects DIRECTORY");
+                out = argv[index]; out_given = true;
+            }} else if (argument.substr(0, 6) == "--out=") {{
+                out = std::string(argument.substr(6)); out_given = true;
+            }} else if (argument == "--list-params") {{
+                list_params = true;
+            }} else if (argument == "--help" || argument == "-h") {{
+                std::cout << "usage: peslite [--config PESFILE] [--set PATH=VALUE]... "
+                             "[--out DIRECTORY] [--list-params]\\n";
+                return 0;
+            }} else if (!argument.empty() && argument.front() != '-' && !out_given) {{
+                out = std::string(argument); out_given = true;
+            }} else {{
+                throw std::runtime_error("unknown argument '" + std::string(argument) + "'");
+            }}
+        }}
+        if (config_given) peslite_generated::load_config(parameters, config);
+        for (const auto& assignment : assignments)
+            peslite_generated::set_parameter(parameters, assignment);
+        if (list_params) {{ peslite_generated::list_parameters(parameters); return 0; }}
+        return peslite_generated::run(out, std::move(parameters));
     }} catch (const std::exception& error) {{
         std::cerr << "peslite: " << error.what() << '\\n';
         return 1;
@@ -2428,8 +2742,9 @@ int main(int argc, char** argv) {{
 
 
 @_exporter("cpp")
-def _export_cpp(simulation: Any, out_dir: Path, name: str) -> ExportResult:
-    """Write one self-contained, parameter-specialised C++17 simulator project."""
+def _export_cpp(simulation: Any, out_dir: Path, name: str,
+                variables: tuple[str, ...]) -> ExportResult:
+    """Write one self-contained, parameter-specialised C++17 translation unit."""
     # Assemble a private copy and execute only the ordinary initialisation path.  Besides avoiding
     # mutation of the user's Simulation, this replaces the diagnostic values temporarily used by
     # the port-Hamiltonian structure probe with the real initial held inputs and controller state.
@@ -2471,32 +2786,5 @@ def _export_cpp(simulation: Any, out_dir: Path, name: str) -> ExportResult:
 
     out_dir.mkdir(parents=True, exist_ok=True)
     source = out_dir / "peslite.cpp"
-    params = out_dir / "simulation.pes"
-    readme = out_dir / "README.md"
-    cmake = out_dir / "CMakeLists.txt"
-    source.write_text(_CppGenerator(prepared, name).source(), encoding="utf-8")
-    dump(prepared.p, params)
-    cmake.write_text(
-        "cmake_minimum_required(VERSION 3.12)\n"
-        f"project(peslite_{_identifier(name)} LANGUAGES CXX)\n"
-        "add_executable(peslite peslite.cpp)\n"
-        "target_compile_features(peslite PRIVATE cxx_std_17)\n"
-        "if(MSVC)\n"
-        "  target_compile_options(peslite PRIVATE /O2)\n"
-        "else()\n"
-        "  target_compile_options(peslite PRIVATE -O3 -DNDEBUG)\n"
-        "endif()\n",
-        encoding="utf-8",
-    )
-    readme.write_text(
-        "# PESLite C++ export\n\n"
-        "Build with any C++17 compiler:\n\n"
-        "```sh\n"
-        "c++ -O3 -DNDEBUG -std=c++17 peslite.cpp -o peslite\n"
-        "```\n\n"
-        "Run with an optional output directory argument. The executable needs only the C++17 "
-        "standard library and does not read `simulation.pes` at run time. Its output uses the "
-        "same CSV, summary and resolved-file names as the Python simulation.\n",
-        encoding="utf-8",
-    )
-    return ExportResult("cpp", out_dir, (source, params, cmake, readme))
+    source.write_text(_CppGenerator(prepared, name, variables).source(), encoding="utf-8")
+    return ExportResult("cpp", out_dir, (source,))
