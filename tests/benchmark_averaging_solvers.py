@@ -29,7 +29,7 @@ from peslite.solver.simulation import read_csv  # noqa: E402
 
 
 CASES = {
-    "fixed-rk4": {},
+    "fixed-rk4": {"type": "fixed", "method": "rk4"},
     "fixed-rk4-25us": {"type": "fixed", "method": "rk4", "dt": 25e-6},
     "fixed-rk4-50us": {"type": "fixed", "method": "rk4", "dt": 50e-6},
     "dp45-1e-1": {"type": "adaptive", "method": "DP45", "rtol": 1e-1},
