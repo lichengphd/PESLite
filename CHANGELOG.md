@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.2
+
+- Added the complete user documentation under `docs/` for Read the Docs.
+- Added automatic synchronization from `docs/` to the GitHub Wiki.
+- Added strict documentation validation for pull requests.
+- No simulation behavior changes.
+
 ## 0.2.0
 
 - The default per-unit bridge model is now `pwm_averaging`. The mutually exclusive run presets
