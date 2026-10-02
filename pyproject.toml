@@ -25,6 +25,7 @@ peslite-convert = "peslite.solver.simulation:convert_main"
 
 [project.urls]
 Homepage = "https://github.com/lonaparte/PESLite"
+Documentation = "https://github.com/lonaparte/PESLite/wiki"
 Repository = "https://github.com/lonaparte/PESLite"
 Issues = "https://github.com/lonaparte/PESLite/issues"
 
