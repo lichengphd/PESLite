@@ -156,6 +156,7 @@ def test_resolved_cli_prints_a_loadable_complete_file():
     tree = yaml.safe_load(stream.getvalue())
     assert tree["simulation"]["t_end"] == 0.5
     assert tree["units"]["vsc"]["ctrl"]["period"] == pytest.approx(1e-4)
+    assert tree["units"]["vsc"]["ctrl"]["computation"] == pytest.approx(1e-6)
     from_dict(tree)
 
 

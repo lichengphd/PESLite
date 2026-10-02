@@ -352,15 +352,17 @@ class ReferenceParams:
 class ControlParams:
     """Digital controller interrupt, computation, loops, wiring and references.
 
-    ``period`` defaults to one carrier period. ``computation`` is the time from its ADC sample
-    until the newly computed shadow duty ratios may be loaded into the active PWM registers.
+    For switching and PWM-period averaging, ``period`` defaults to one carrier period and
+    ``computation`` defaults to 1 us: the time from the ADC sample until the new shadow duty
+    ratios may be loaded.  With the ideal averaging bridge the controller is continuous; these
+    discrete timing settings are retained in the file but ignored.
     ``type`` selects the default wiring; ``connections`` and ``outputs`` override it.
     Each ``loops`` entry is validated against the schema registered for its ``type``.
     """
 
     type: str  # "gfl" | "gfm" | "custom"
     period: Optional[float] = None  # s; default: one carrier period
-    computation: float = 1.0e-6  # s; 0 <= computation < period
+    computation: Optional[float] = None  # s; sampled default 1 us; ignored by continuous averaging
     loops: dict[str, Any] = field(metadata={"entries": "loop"})  # each built with the parameters of its type
     connections: dict = field(default_factory=dict)  # input port -> output port
     outputs: dict = field(default_factory=dict)  # u_dq, theta, omega -> output port
@@ -425,11 +427,12 @@ class BridgeParams:
 
     ``"switching"`` follows the exact carrier-comparison edges. ``"pwm_averaging"`` keeps the
     PWM timer, duty registers and load timing but applies each active duty ratio continuously until
-    the next compare-register load. ``"averaging"`` is an ideal controlled voltage source with the
-    PWM-equivalent output delay and no PWM peripheral.
+    the next compare-register load. ``"averaging"`` is an ideal controlled voltage source driven
+    by continuous measurement and control equations, with no ADC, interrupt, computation or PWM
+    timing.
     """
 
-    model: str = "averaging"
+    model: str = "pwm_averaging"
 
     _choices = {"model": ("switching", "pwm_averaging", "averaging")}
 
@@ -473,22 +476,29 @@ class UnitParams:
     def resolved(self, system_base: BaseValues, events: tuple = ()) -> UnitParams:
         """Return a copy with its base, target events and dependent defaults resolved.
 
-        The control period defaults to one carrier period, every loop period to the control
-        period, and the reference frequency to the system frequency. Derived paths stay dependent
-        through :meth:`Params.replace`.
+        A sampled controller's period defaults to one carrier period and every loop period to the
+        control period.  An ideal averaged bridge instead resolves a continuous controller:
+        omitted periods and computation stay unset; explicitly written sampled timing remains
+        stored so the same file can switch models, but is ignored by the
+        continuous implementation.  The reference frequency defaults to the system frequency in
+        either case. Derived paths stay dependent through :meth:`Params.replace`.
         """
         derived = set()
         ctrl = self.ctrl
-        if ctrl.period is None:
+        continuous = self.bridge.model == "averaging"
+        if not continuous and ctrl.period is None:
             ctrl = replace(ctrl, period=self.pwm.switching_period)
             derived.add("ctrl.period")
+        if not continuous and ctrl.computation is None:
+            ctrl = replace(ctrl, computation=1.0e-6)
+            derived.add("ctrl.computation")
         references = ctrl.references
         if references.omega is None:
             references = replace(references, omega=system_base.w0)
             derived.add("ctrl.references.omega")
         loops = dict(ctrl.loops)
         for name, loop in loops.items():
-            if loop.period is None:
+            if not continuous and loop.period is None:
                 loops[name] = replace(loop, period=ctrl.period)
                 derived.add(f"ctrl.loops.{name}.period")
         ctrl = replace(ctrl, references=references, loops=loops)

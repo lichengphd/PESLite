@@ -67,7 +67,11 @@ def test_state_control_and_summary_names_have_no_unit_suffix(gfl, tmp_path):
 
 def test_controller_states_in_pu_are_named_as_pu(examples):
     gfl_names = peslite.Simulation(peslite.load(examples / "gfl-example.pes")).state_names()
-    psc_names = peslite.Simulation(peslite.load(examples / "gfm-psc-example.pes")).state_names()
+    psc_names = peslite.Simulation(peslite.load(
+        examples / "gfm-psc-example.pes",
+        **{"units.vsc.ctrl.loops.power.filter.enable": 1,
+           "units.vsc.ctrl.loops.power.filter.bandwidth": 5.0},
+    )).state_names()
     assert {
         "vsc.ctrl.pll.integral_pu",
         "vsc.ctrl.dvc.integral_pu",

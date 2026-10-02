@@ -1,9 +1,9 @@
 """The components of a converter system: the power circuit and the converter's hardware.
 
 The power circuit (:mod:`.network`, including registered ``elements``, and :mod:`.converter`) is
-continuous-time, in SI, connected through :class:`peslite.solver.model.Model`; the ADC
-(:mod:`.adc`) samples it and each bridge owns the PWM timing/register implementation it needs from
-:mod:`.pwm`.
+continuous-time, in SI, connected through :class:`peslite.solver.model.Model`. Sampled bridge
+models use the ADC (:mod:`.adc`) and own their PWM timing/register implementation from
+:mod:`.pwm`; the ideal averaging bridge connects directly to continuous controller equations.
 """
 
 from .network import (ELEMENT_TYPES, Element, Load, RCNode, RLBranch, ThreePhaseSource,

@@ -1,9 +1,10 @@
 """The run of a simulation: the system and solver built from its parameters, the initial states, the
 event loop, and the command line (the ``peslite`` command).
 
-Between events the solver integrates the model; the events are those of the file, each unit's ADC
-samples, control interrupts, PWM loads or delayed average-source updates, averaging-window
-openings and switching instants, and the snapshots. Order at a coincident instant: file events,
+Between events the solver integrates the model; the events are those of the file, sampled units'
+ADC samples, control interrupts, PWM loads, averaging-window openings and switching instants, and
+the snapshots. Ideal averaged units have continuous controller and bridge equations instead.
+Order at a coincident instant: file events,
 over-current check, ADC samples, control interrupts, actuation, window opening, switching instants,
 snapshot.
 """
@@ -484,7 +485,8 @@ class Simulation:
         hold = None
         if hasattr(solver, "window") and hasattr(solver, "dt"):
             hold = {"step": solver.dt, "window": solver.window}
-        zoh = {unit.zoh: 0.7 + 0.2j for unit in self.system.units.values()}
+        zoh = {unit.zoh: 0.7 + 0.2j for unit in self.system.units.values()
+               if not getattr(unit, "continuous", False)}
         self.ph_report = report = model.ph_report(zoh=zoh, groups=groups, hold=hold)
         problems = list(report.problems)
         if report.defaulted:
@@ -515,7 +517,7 @@ class Simulation:
                 bridge = unit.bridge
                 parts.extend([(f"{name}.ctrl", unit.ctrl),
                               (f"{name}.{bridge.state_prefix}", bridge.state_owner)])
-                if unit.adc.averaging:
+                if unit.adc is not None and unit.adc.averaging:
                     parts.append((f"{name}.meas", unit.adc))
         parts.append(("solver", self.solver))
         return parts
@@ -587,7 +589,7 @@ class Simulation:
             self._states.load(values, [f"{name}.ctrl", bridge_prefix])
             if any(key.startswith((f"{name}.ctrl.", bridge_prefix + ".")) for key in values):
                 self._continued.add(name)
-            if unit.adc.averaging:
+            if unit.adc is not None and unit.adc.averaging:
                 self._states.load(values, [f"{name}.meas"])
                 if any(key.startswith(f"{name}.meas.") for key in values):
                     self._windows_given.add(name)
@@ -652,6 +654,7 @@ class Simulation:
         energy_on = mode != "off" and hasattr(mdl, "energy_balance")
         phs_check_step = p.simulation.solver.phs_check_step
         snapshot_index = 0
+        continuous_record_index = 0
         worst = {"tellegen": 0.0, "balance": 0.0}
         stop_reason = ""
         coarse_reported = False
@@ -671,12 +674,20 @@ class Simulation:
             zoh_changed = False
 
         def snapshot(t_now: float, final: bool = False) -> None:
-            nonlocal snapshot_index
+            nonlocal snapshot_index, continuous_record_index
             audit_due = energy_on and (snapshot_index % phs_check_step == 0 or final)
             snapshot_index += 1
             try:
                 with np.errstate(over="raise"):
                     sync_if_needed(t_now)
+                    for unit in units:
+                        log = (unit.ctrl.continuous_log(t_now)
+                               if getattr(unit, "continuous", False) else None)
+                        if log is not None:
+                            rec.last_ctrl_log[unit.name] = log
+                            if continuous_record_index % record_every == 0:
+                                rec.ctrl_sample(unit.name, t_now, log)
+                    continuous_record_index += 1
                     signals = system.signals(t_now) if rec.keep_signals else {}
                     rec.plant_snapshot(t_now, signals)
                     if rec.keep_states or final:
@@ -777,6 +788,9 @@ class Simulation:
         for unit in units:
             unit.begin(t_start, plant, unit.name in self._continued,
                        unit.name in self._windows_given)
+        # Continuous controllers may pre-synchronise their ODE states in begin().
+        y = mdl.get_initial_values()
+        synced_at = None
         while True:
             adc_inputs_changed = False
             t_log = n_log * log_period
@@ -908,6 +922,8 @@ _LOOPMAP_EPS = 1e-9
 
 def macro_period(periods: list[float], limit: int = 64) -> float | None:
     """Return the smallest common multiple of ``periods`` (s), or ``None`` beyond ``limit`` longest periods."""
+    if not periods:
+        return None
     longest = max(periods)
     for n in range(1, limit + 1):
         T = n * longest
@@ -1115,6 +1131,14 @@ def parse_override(text: str):
     return key, value
 
 
+def _solver_choice_is_set(overrides: Mapping[str, Any]) -> bool:
+    """Whether ``--set`` selected a solver family or method for this run."""
+    return any(
+        path in ("simulation.solver.type", "simulation.solver.method")
+        for path in overrides
+    )
+
+
 def main(argv=None) -> int:
     """Run a simulation file and save its states, summary and configured signals."""
     ap = argparse.ArgumentParser(description=main.__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1128,12 +1152,11 @@ def main(argv=None) -> int:
                     help="with a states.csv: start from the row at time T instead of the last row")
     bridge = ap.add_mutually_exclusive_group()
     bridge.add_argument("--switching", action="store_true",
-                        help="run every unit with exact switching; this option wins over --set")
+                        help="exact-switching bridge with fixed-step RK4; --set has priority")
     bridge.add_argument("--pwm-averaging", action="store_true",
-                        help="run every unit with PWM-period averaging; this option wins over --set")
+                        help="PWM-period-averaged bridge with fixed-step RK4; --set has priority")
     bridge.add_argument("--averaging", action="store_true",
-                        help="run every unit as a delayed ideal averaged voltage source; "
-                             "this option wins over --set")
+                        help="ideal averaged bridge with adaptive DP45; --set has priority")
     ap.add_argument("--out", default=None,
                     help="output directory (default: output/<file name>, or "
                          "a bridge-mode suffix with --switching/--pwm-averaging/--averaging)")
@@ -1155,7 +1178,8 @@ def main(argv=None) -> int:
     except FileNotFoundError as exc:
         ap.error(str(exc))
 
-    overrides = dict(args.set)
+    set_overrides = dict(args.set)
+    overrides = dict(set_overrides)
     if args.progress is not None:
         overrides["simulation.progress.enable"] = 1
         overrides["simulation.progress.period"] = args.progress
@@ -1164,12 +1188,25 @@ def main(argv=None) -> int:
                                                    for name in value.split(",") if name]
     p = load(config, initial=args.initial,
                     initial_time=args.initial_time, **overrides)
-    if args.switching:
-        p = p.replace(**{f"units.{name}.bridge.model": "switching" for name in p.units})
-    elif args.pwm_averaging:
-        p = p.replace(**{f"units.{name}.bridge.model": "pwm_averaging" for name in p.units})
-    elif args.averaging:
-        p = p.replace(**{f"units.{name}.bridge.model": "averaging" for name in p.units})
+    preset = (("switching", "fixed", "rk4") if args.switching else
+              ("pwm_averaging", "fixed", "rk4") if args.pwm_averaging else
+              ("averaging", "adaptive", "DP45") if args.averaging else None)
+    if preset is not None:
+        model, solver_type, method = preset
+        changes = {f"units.{name}.bridge.model": model for name in p.units
+                   if f"units.{name}.bridge.model" not in set_overrides}
+        if not _solver_choice_is_set(set_overrides):
+            changes.update({
+                "simulation.solver.type": solver_type,
+                "simulation.solver.method": method,
+            })
+            if solver_type == "adaptive" and not any(
+                    path == "simulation.solver.subsystems"
+                    or path.startswith("simulation.solver.subsystems.")
+                    for path in set_overrides):
+                changes["simulation.solver.subsystems"] = {}
+        if changes:
+            p = p.replace(**changes)
     if args.watch and not p.simulation.progress.enable:
         ap.error("--watch prints on the progress lines: add --progress SECONDS")
     if args.resolved:

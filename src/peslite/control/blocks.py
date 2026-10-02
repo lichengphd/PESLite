@@ -78,8 +78,9 @@ class LowPass1:
     Named state: ``y``, NaN while not yet seeded.
     """
 
-    def __init__(self, bw_hz: float, T: float, y0=0.0, init_on_first: bool = True) -> None:
-        self.alpha = 1.0 - math.exp(-2.0 * math.pi * bw_hz * T) if bw_hz > 0.0 else 1.0
+    def __init__(self, bw_hz: float, T: float | None, y0=0.0, init_on_first: bool = True) -> None:
+        self.alpha = (0.0 if T is None else
+                      1.0 - math.exp(-2.0 * math.pi * bw_hz * T) if bw_hz > 0.0 else 1.0)
         self.y = y0
         self._y0 = y0
         self._init_on_first = init_on_first

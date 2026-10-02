@@ -97,19 +97,23 @@ def test_switched_sections_require_settings_and_write_zero_or_one():
 
 def test_dependent_defaults_follow_replace_and_stay_fixed_when_explicit():
     p = peslite.load(EXAMPLES / "gfl-example.pes")
-    u = p.replace(**{"units.vsc.pwm.f_sw": 10_000.0, "base.f0": 60.0}).unit("vsc")
+    u = p.replace(**{"units.vsc.bridge.model": "switching",
+                     "units.vsc.pwm.f_sw": 10_000.0,
+                     "base.f0": 60.0}).unit("vsc")
     assert u.ctrl.period == pytest.approx(1e-4)
     assert all(loop.period == pytest.approx(1e-4) for loop in u.ctrl.loops.values())
     assert u.ctrl.references.omega == pytest.approx(120 * math.pi)
     assert u.meas.period is None and u.meas.window is None and u.meas.average == []
 
-    fixed = p.replace(**{"units.vsc.ctrl.period": 5e-5})
+    fixed = p.replace(**{"units.vsc.bridge.model": "switching",
+                         "units.vsc.ctrl.period": 5e-5})
     fixed = fixed.replace(**{"units.vsc.pwm.f_sw": 10_000.0})
     assert fixed.unit("vsc").ctrl.period == 5e-5
 
     rebased = p.replace(**{"base.s_base": 1e6})
     assert rebased.unit("vsc").base.s_base == 1e6
-    averaged = p.replace(**{"units.vsc.meas.average": ["u_g", "i_c"],
+    averaged = p.replace(**{"units.vsc.bridge.model": "pwm_averaging",
+                            "units.vsc.meas.average": ["u_g", "i_c"],
                             "units.vsc.pwm.f_sw": 10_000.0})
     written = yaml.safe_load(dumps(averaged))
     assert written["units"]["vsc"]["meas"]["period"] == pytest.approx(1e-4)
@@ -125,6 +129,7 @@ def test_to_dict_preserves_following_defaults_but_dumps_resolves_them():
     assert compact["units"]["vsc"]["ctrl"]["period"] is None
     assert compact["units"]["vsc"]["ctrl"]["references"]["omega"] is None
     assert complete["units"]["vsc"]["ctrl"]["period"] == pytest.approx(5e-5)
+    assert complete["units"]["vsc"]["ctrl"]["computation"] == pytest.approx(1e-6)
     assert complete["units"]["vsc"]["ctrl"]["references"]["omega"] == pytest.approx(100 * math.pi)
     assert complete["units"]["vsc"]["meas"]["period"] == pytest.approx(5e-5)
     assert complete["units"]["vsc"]["s_base"] == 2e6
@@ -136,6 +141,11 @@ def test_resolved_cli_and_meta_contract(capsys):
     resolved = yaml.safe_load(capsys.readouterr().out)
     assert resolved["units"]["vsc"]["ctrl"]["period"] == pytest.approx(1e-4)
     from_dict(resolved)
+
+    assert peslite.main(["gfl-example", "--switching", "--resolved",
+                         "--set", "units.vsc.pwm.f_sw=10000"]) == 0
+    sampled = yaml.safe_load(capsys.readouterr().out)
+    assert sampled["units"]["vsc"]["ctrl"]["period"] == pytest.approx(1e-4)
 
     tree = _tree()
     tree["meta"] = {"title": "A case", "description": "Text only."}
