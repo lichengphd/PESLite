@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.3
+
+- Added an optional `peslite.addons` plotting function and `--plot` post-processing interface for
+  recorded simulation waveforms.
+- Added IEEE single/double-column vector PDF output with LaTeX/Computer Modern styling, direct plot
+  options and automatic seconds, milliseconds or microseconds on the time axis.
+- Matplotlib remains an optional dependency, is imported only for plotting and is not included in
+  exported C++ simulators.
+
 ## 0.2.2
 
 - Added the complete user documentation under `docs/` for Read the Docs.

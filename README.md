@@ -22,6 +22,7 @@ and a Python API.
 - Connect, disconnect and validated parameter-change events, plus continuation from saved states.
 - Streamed CSV output, energy accounting, port-Hamiltonian structure reporting and a lazy Python
   result API.
+- Optional IEEE/LaTeX-style vector PDF plots from completed CSV results.
 - Registration APIs for custom control loops, circuit elements, events and solvers.
 - Export as a parameter-specialized, standalone C++17 simulator with no third-party C++ runtime
   dependencies.
@@ -34,6 +35,8 @@ per-unit base.
 ```bash
 pip install peslite
 ```
+
+Use `pip install "peslite[all]"` to include every optional runtime add-on.
 
 PESLite requires Python 3.10 or newer.
 

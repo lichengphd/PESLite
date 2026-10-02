@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "peslite"
-version = "0.2.2"
+version = "0.2.3"
 description = "Open-source, lightweight, multirate, and extensible Power Electronics Simulator on a port-Hamiltonian solver kernel: connected subsystem models, energy accounting, fixed/adaptive/multirate integration and converter control."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,7 +17,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=7"]
+plot = ["matplotlib>=3.7"]
+all = ["matplotlib>=3.7"]
+test = ["pytest>=7", "matplotlib>=3.7"]
 
 [project.scripts]
 peslite = "peslite.solver.simulation:main"

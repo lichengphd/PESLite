@@ -103,6 +103,27 @@ files = result.files
 CSV-backed properties are loaded lazily from their final files when first requested. They are not
 part of the write hot path.
 
+The optional plotting add-on operates only after the CSV streams have closed:
+
+```python
+figure = result.plot(
+    ["vsc.dclink.u_C", "vsc.ctrl.pll.theta"],
+    labels=[r"$u_{dc}$", r"$\theta$"],
+    ylabel=r"$x$ (pu)",
+)
+
+# The same function can process Python or standalone C++ output directly.
+from peslite.addons import plot_csv
+
+figure = plot_csv(
+    "output/run/states.csv",
+    "vsc.dclink.u_C",
+)
+```
+
+It is implemented under `peslite.addons`, imports Matplotlib only when called and is not included in
+the generated C++ simulator. Install it with `pip install "peslite[plot]"`.
+
 Controller logs are grouped by unit under `result.ctrl`. The final-state mapping can be passed back
 as initial state through a saved CSV or used programmatically.
 

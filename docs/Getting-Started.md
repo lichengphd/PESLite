@@ -9,6 +9,12 @@ resolved example into a new simulation file.
 python -m pip install peslite
 ```
 
+To include every optional runtime add-on, including PDF plotting:
+
+```bash
+python -m pip install "peslite[all]"
+```
+
 Check the command-line interface:
 
 ```bash
