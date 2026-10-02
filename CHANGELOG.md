@@ -8,6 +8,10 @@
   options and automatic seconds, milliseconds or microseconds on the time axis.
 - Matplotlib remains an optional dependency, is imported only for plotting and is not included in
   exported C++ simulators.
+- Organised add-ons into automatically discovered `controllers` and `components` extension
+  packages plus an optional `functions` package containing IEEE PDF plotting.
+- Added a voltage-adaptive PLL add-on and a simulation-file example that combines it with the
+  built-in grid-following control loops.
 
 ## 0.2.2
 

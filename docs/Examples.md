@@ -1,6 +1,6 @@
 # Examples
 
-PESLite ships six simulation files with the Python wheel. They can be run by name from any
+PESLite ships seven simulation files with the Python wheel. They can be run by name from any
 directory, so cloning the repository is not required.
 
 ```bash
@@ -19,6 +19,7 @@ peslite case.pes
 
 | Name | System and control purpose |
 |---|---|
+| `custom-pll-example` | Grid-following control assembled from built-in current/DC-voltage loops and an automatically discovered voltage-adaptive PLL under `addons/controllers`. |
 | `gfl-example` | One grid-following converter with PLL, dc-voltage control, current control and unit protection. This is the most extensively annotated configuration. |
 | `gfm-psc-example` | Grid-forming power-synchronization control with virtual impedance and active damping. |
 | `gfm-vsg-example` | Grid-forming virtual synchronous generator control. |

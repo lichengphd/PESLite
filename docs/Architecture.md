@@ -12,15 +12,21 @@ src/peslite/
 ├── control/      control loops, graphs, startup and modulation
 ├── assembly/     parameters, events, protection, units, systems and exporters
 ├── solver/       connected model kernel, energy model, integrators and simulation run
-└── addons/       optional post-processing features, loaded only when requested
+└── addons/       custom extension entry points and optional functions
+    ├── controllers/  automatically discovered custom control-loop modules
+    ├── components/   automatically discovered custom circuit-element modules
+    └── functions/    optional user-facing functions such as IEEE PDF plotting
 ```
 
 Dependencies point inward through small interfaces: components use the model kernel, controller
 logic uses typed signals, assembly wires both into a system, and `solver.simulation` schedules the
 assembled system.
 
-Optional dependencies stay behind the `addons` boundary. For example, IEEE-style plotting reads
-closed result CSV files after a run and is absent from the solver path and generated C++ source.
+Controller and component modules in their respective add-on packages are imported once at package
+initialisation. Their decorators populate the same registries used by built-in types, so there is
+no add-on lookup or dispatch in the simulation hot path. Optional dependencies stay behind the
+`addons/functions` boundary. IEEE-style plotting reads closed result CSV files after a run and is
+absent from the solver path and generated C++ source.
 
 ## Components
 

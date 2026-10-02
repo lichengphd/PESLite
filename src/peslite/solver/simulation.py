@@ -1108,6 +1108,9 @@ _CONFIG_SUFFIXES = (".pes", ".yaml", ".yml", ".json")
 
 def _config_path(value: str | None) -> Path:
     if value is None:
+        default = _EXAMPLE_CONFIGS / "gfl-example.pes"
+        if default.is_file():
+            return default.resolve()
         configs = sorted(
             p for p in _EXAMPLE_CONFIGS.iterdir()
             if p.is_file() and p.suffix.lower() in _CONFIG_SUFFIXES

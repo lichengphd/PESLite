@@ -8,6 +8,7 @@ from peslite.solver import simulation
 from peslite.solver.simulation import _config_path
 
 EXPECTED = {
+    "custom-pll-example.pes",
     "gfl-example.pes",
     "gfm-dvoc-example.pes",
     "gfm-matching-example.pes",

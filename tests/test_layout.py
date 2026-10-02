@@ -16,7 +16,7 @@ BELOW = {
     "control": {"solver", "control"},
     "components": {"solver", "control", "components"},
     "assembly": {"solver", "control", "components", "assembly"},
-    "addons": {"addons"},
+    "addons": {"control", "components", "addons"},
 }
 TOP = {"solver/simulation.py"}
 

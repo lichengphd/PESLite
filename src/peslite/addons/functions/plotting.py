@@ -1,4 +1,4 @@
-"""Optional IEEE-style PDF plotting add-on for numeric CSV results.
+"""Optional IEEE-style PDF plotting function for numeric CSV results.
 
 Matplotlib is imported only when :func:`plot_csv` is called.  Simulation and C++ export therefore
 do not depend on, import, or execute plotting code.

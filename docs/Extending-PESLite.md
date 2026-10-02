@@ -1,10 +1,18 @@
 # Extending PESLite
 
 PESLite uses registries and small typed protocols for custom control loops, circuit elements and
-events. Register custom types before loading a simulation file that names them.
+events. Modules placed in `peslite/addons/controllers/` or `peslite/addons/components/` are imported
+automatically when PESLite starts and register into the same type tables as built-in modules.
+Types kept elsewhere can still be imported and registered explicitly before loading a simulation
+file that names them.
 
 Executable examples live in `tests/test_custom_parts.py`; Python implementation files are not
 placed in the root `examples/` directory.
+
+The bundled `custom-pll-example` demonstrates this layout: its `.pes` file remains in `examples/`,
+while `peslite.addons.controllers.voltage_adaptive_pll` contains the executable custom loop. It
+uses a filtered measured-voltage magnitude and grid-frequency state, then joins the same GFL graph
+as the built-in current and DC-voltage loops.
 
 ## Custom control loops
 
@@ -12,7 +20,7 @@ Register a loop class with `register_loop_type`:
 
 ```python
 from dataclasses import dataclass
-from peslite.control import SyncLaw, register_loop_type
+from peslite.addons.controllers import SyncLaw, register_loop_type
 
 @register_loop_type
 class LaggedSync(SyncLaw):
@@ -38,8 +46,9 @@ class LaggedSync(SyncLaw):
         self.v_mag = v_ref_pu
 ```
 
-The nested frozen `Params` dataclass defines the file schema and defaults. The registered name is
-then available at `units.<u>.ctrl.loops.<loop>.type`.
+The nested frozen `Params` dataclass defines the file schema and defaults. A module stored under
+`peslite/addons/controllers/` is discovered automatically; the registered name is then available at
+`units.<u>.ctrl.loops.<loop>.type` exactly like a built-in loop.
 
 A loop used by sampled bridges implements `step()`. A loop used with ideal averaging also provides
 continuous outputs and state derivatives through its continuous interface, such as `flow()` for a
@@ -56,7 +65,7 @@ An element class registered by `register_element_type` owns:
 - optional `connect()`, `disconnect()` or `retune()` behavior.
 
 ```python
-from peslite.components import Element, register_element_type
+from peslite.addons.components import Element, register_element_type
 
 @register_element_type
 class MyElement(Element):
@@ -71,7 +80,8 @@ elements:
   device: {type: my_element, bus: pcc}
 ```
 
-Built-in elements follow the same mechanism. Public names are namespaced by the element instance,
+Modules under `peslite/addons/components/` are discovered automatically. Built-in and add-on
+elements follow the same registry mechanism. Public names are namespaced by the element instance,
 so two instances do not share state paths.
 
 ## Custom events
