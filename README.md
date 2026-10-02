@@ -19,7 +19,7 @@ converter's own base. Time is in s, angles in rad.
 ## Installation
 
 ```bash
-python -m pip install -e .            # numpy, scipy, PyYAML
+pip install peslite
 ```
 
 Python 3.10 or newer.
@@ -69,7 +69,7 @@ peslite gfl-example --resolved        # complete resolved simulation file
 peslite --help
 ```
 
-From Python (in this folder, or anywhere after `pip install -e .`):
+From Python after `pip install peslite`:
 
 ```python
 import peslite
