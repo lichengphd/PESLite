@@ -9,8 +9,9 @@ import pytest
 
 import peslite
 from conftest import EXAMPLES
-from peslite.control import LOOP_TYPES, Loop, Measurement, SyncLaw, register_loop_type
-from peslite.control.loops import V_DQ
+from peslite.control import (ANGLE, CONTROL_INTERFACE, FREQUENCY, I, I_AB, I_DQ, LOOP_TYPES,
+                             POWER, PQ, V, V_AB, V_DQ, Loop, Measurement, SignalType, SyncLaw,
+                             register_loop_type)
 from peslite.solver.model import ConfigError
 
 CONTROL = Path(peslite.control.__file__).parent
@@ -145,6 +146,43 @@ def test_controller_interfaces_have_one_definition():
     from peslite.components.adc import Measurement as ADCMeasurement
 
     assert ADCMeasurement is Measurement
+
+
+def test_control_graph_has_one_typed_boundary_for_inputs_and_outputs(gfl):
+    graph = peslite.Simulation(gfl()).unit().ctrl.graph
+
+    assert graph.interface is CONTROL_INTERFACE
+    assert set(CONTROL_INTERFACE.inputs) == {
+        "meas.u_g", "meas.i_c", "meas.u_dc",
+        "references.id_ref_pu", "references.iq_ref_pu", "references.theta",
+        "references.omega", "references.p_ref_pu", "references.q_ref_pu",
+        "references.v_ref_pu", "references.vdc_ref_pu", "references.zero_v_pu",
+    }
+    assert set(CONTROL_INTERFACE.outputs) == {"u_dq", "theta", "omega"}
+    assert set(graph._boundary_sources) == set(CONTROL_INTERFACE.inputs)
+    for port, source in graph.outputs.items():
+        assert port in CONTROL_INTERFACE.outputs
+        owner, _, source_port = source.partition(".")
+        assert graph.nodes[owner].outputs[source_port] == CONTROL_INTERFACE.outputs[port]
+
+
+def test_control_ports_have_the_canonical_signal_types():
+    signals = (I_AB, V_AB, I_DQ, V_DQ, I, V, ANGLE, FREQUENCY, POWER, PQ)
+
+    assert all(isinstance(signal, SignalType) for signal in signals)
+    assert len(set(signals)) == 10
+    assert {signal for signal in signals if signal.complex_value} == {
+        I_AB, V_AB, I_DQ, V_DQ, PQ,
+    }
+    assert not any(hasattr(peslite.control, old) for old in (
+        "CURRENT", "VOLTAGE", "DC_VOLTAGE", "POWER_PU", "SignalPort",
+    ))
+
+
+def test_unknown_controller_output_boundary_port_is_rejected(gfl):
+    params = gfl().replace(**{"units.vsc.ctrl.outputs": {"status": "cc.u_dq"}})
+    with pytest.raises(ConfigError, match="unknown output ports.*status"):
+        peslite.Simulation(params)
 
 
 def test_control_imports_only_itself_and_the_solver_kernel():

@@ -17,8 +17,9 @@ from typing import Any, ClassVar, Mapping, Optional
 from ..solver.model import ConfigError, assign, gather, scatter
 from .blocks import HighPass1, LowPass1, clamp
 
-__all__ = ["SignalType", "V_AB", "I_AB", "V_DQ", "VOLTAGE", "DC_VOLTAGE", "CURRENT", "ANGLE", "FREQUENCY",
-           "POWER_PU", "ROLES", "Loop", "LOOP_TYPES", "register_loop_type", "PowerFilterParams",
+__all__ = ["SignalType", "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
+           "ANGLE", "FREQUENCY", "POWER", "PQ",
+           "ROLES", "Loop", "LOOP_TYPES", "register_loop_type", "PowerFilterParams",
            "CurrentLimitParams",
            "SRFPLL", "CurrentLoop", "DCVoltageLoop", "PowerLoop", "SyncLaw", "PSC", "Droop", "VSG", "DVOC",
            "Matching", "VirtualImpedance", "VirtualAdmittance", "ActiveDamping", "UnitDelay"]
@@ -28,20 +29,23 @@ __all__ = ["SignalType", "V_AB", "I_AB", "V_DQ", "VOLTAGE", "DC_VOLTAGE", "CURRE
 
 @dataclass(frozen=True)
 class SignalType:
+    """The physical quantity and representation carried by one directed control port."""
+
     unit: str
     frame: str = "scalar"
     complex_value: bool = False
 
 
-V_AB = SignalType("pu_voltage_ac", "alpha_beta", True)
-I_AB = SignalType("pu_current_ac", "alpha_beta", True)
-V_DQ = SignalType("pu_voltage_ac", "dq", True)
-VOLTAGE = SignalType("pu_voltage_ac")
-DC_VOLTAGE = SignalType("pu_voltage_dc")
-CURRENT = SignalType("pu_current_ac")
+I_AB = SignalType("pu_current", "alpha_beta", True)
+V_AB = SignalType("pu_voltage", "alpha_beta", True)
+I_DQ = SignalType("pu_current", "dq", True)
+V_DQ = SignalType("pu_voltage", "dq", True)
+I = SignalType("pu_current")
+V = SignalType("pu_voltage")
 ANGLE = SignalType("rad")
 FREQUENCY = SignalType("rad/s")
-POWER_PU = SignalType("pu_power")
+POWER = SignalType("pu_power")
+PQ = SignalType("pu_power", "pq", True)
 
 
 # ------------------------------------------------------------------ the base class and the registry
@@ -297,7 +301,10 @@ class CurrentLoop(Loop):
 
     type = "dq_current_pi"
     role = "current"
-    inputs = {"id_ref": CURRENT, "iq_ref": CURRENT, "v": V_AB, "i": I_AB, "frame": ANGLE, "omega": FREQUENCY,
+    inputs = {"id_ref": I, "iq_ref": I,
+              "v": V_AB,
+              "i": I_AB,
+              "frame": ANGLE, "omega": FREQUENCY,
               "extra": V_DQ}
     outputs = {"u_dq": V_DQ, "extra": V_DQ}
     continuous_path_inputs = ("id_ref", "iq_ref", "v", "i", "frame", "omega", "extra")
@@ -415,8 +422,8 @@ class DCVoltageLoop(Loop):
 
     type = "dc_voltage_pi"
     role = "dc_voltage"
-    inputs = {"u_dc": DC_VOLTAGE, "vdc_ref": DC_VOLTAGE}
-    outputs = {"id_ref": CURRENT}
+    inputs = {"u_dc": V, "vdc_ref": V}
+    outputs = {"id_ref": I}
     continuous_path_inputs = ("u_dc", "vdc_ref")
     carried = ("n_updates", "n_clamped", "n_reverse", "first_clamp_t")
 
@@ -513,7 +520,7 @@ class PowerLoop(Loop):
     type = "power"
     role = "power"
     inputs = {"v": V_AB, "i": I_AB}
-    outputs = {"p": POWER_PU, "q": POWER_PU}
+    outputs = {"p": POWER, "q": POWER}
     continuous_path_inputs = ("v", "i")
 
     def __init__(self, cfg, unit, startup):
@@ -580,9 +587,10 @@ class SyncLaw(Loop):
 
     role = "sync"
     outputs_from_state = True
-    inputs = {"p": POWER_PU, "q": POWER_PU, "v": V_AB, "i": I_AB, "u_dc": DC_VOLTAGE,
-              "p_ref": POWER_PU, "q_ref": POWER_PU, "v_ref": VOLTAGE}
-    outputs = {"theta": ANGLE, "frame": ANGLE, "omega": FREQUENCY, "v_ref": VOLTAGE}
+    inputs = {"p": POWER, "q": POWER,
+              "v": V_AB, "i": I_AB, "u_dc": V,
+              "p_ref": POWER, "q_ref": POWER, "v_ref": V}
+    outputs = {"theta": ANGLE, "frame": ANGLE, "omega": FREQUENCY, "v_ref": V}
     state_names = ("theta",)
 
     def __init__(self, cfg, unit, startup):
@@ -986,7 +994,8 @@ class VirtualImpedance(Loop):
 
     type = "virtual_impedance"
     role = "impedance"
-    inputs = {"v_ref": VOLTAGE, "i": I_AB, "frame": ANGLE, "omega": FREQUENCY, "extra": V_DQ}
+    inputs = {"v_ref": V, "i": I_AB, "frame": ANGLE, "omega": FREQUENCY,
+              "extra": V_DQ}
     outputs = {"u_dq": V_DQ}
     continuous_path_inputs = ("v_ref", "i", "frame", "omega", "extra")
 
@@ -1032,8 +1041,8 @@ class VirtualAdmittance(Loop):
 
     type = "virtual_admittance"
     role = "admittance"
-    inputs = {"v_ref": VOLTAGE, "v": V_AB, "frame": ANGLE, "omega": FREQUENCY}
-    outputs = {"id_ref": CURRENT, "iq_ref": CURRENT}
+    inputs = {"v_ref": V, "v": V_AB, "frame": ANGLE, "omega": FREQUENCY}
+    outputs = {"id_ref": I, "iq_ref": I}
     continuous_path_inputs = ("v_ref", "v", "frame", "omega")
 
     def __init__(self, cfg, unit, startup):
@@ -1152,9 +1161,18 @@ class ActiveDamping(Loop):
 
 # ------------------------------------------------------------------ delay
 
-_DELAY_SIGNALS = {"current_pu": CURRENT, "voltage_pu": VOLTAGE, "dc_voltage_pu": DC_VOLTAGE, "voltage_dq_pu": V_DQ,
-                  "voltage_ab_pu": V_AB, "current_ab_pu": I_AB, "angle": ANGLE, "frequency": FREQUENCY,
-                  "power_pu": POWER_PU}
+_DELAY_SIGNALS = {
+    "i_ab": I_AB,
+    "v_ab": V_AB,
+    "i_dq": I_DQ,
+    "v_dq": V_DQ,
+    "i": I,
+    "v": V,
+    "angle": ANGLE,
+    "frequency": FREQUENCY,
+    "power": POWER,
+    "pq": PQ,
+}
 
 
 @register_loop_type
@@ -1169,20 +1187,20 @@ class UnitDelay(Loop):
         period: Optional[float] = None
         initial: Optional[float] = None  # angle (rad) or frequency (rad/s)
         initial_pu: Optional[float] = None  # electrical signals
-        signal: str = "current_pu"
+        signal: str = "i"
         type: str = "unit_delay"
 
         _choices = {"signal": tuple(_DELAY_SIGNALS)}
 
         @staticmethod
         def _signal_quantities(values):
-            scale = {"current_pu": "current", "current_ab_pu": "current",
-                     "voltage_pu": "voltage", "voltage_dq_pu": "voltage", "voltage_ab_pu": "voltage",
-                     "dc_voltage_pu": "dc_voltage", "power_pu": "power"}.get(values.get("signal", "current_pu"))
+            scale = {"i": "current", "i_ab": "current", "i_dq": "current",
+                     "v": "voltage", "v_ab": "voltage", "v_dq": "voltage",
+                     "power": "power", "pq": "power"}.get(values.get("signal", "i"))
             return {"initial_pu": scale} if scale else {}
 
         def __post_init__(self) -> None:
-            if self.initial_pu is not None and not self.signal.endswith("_pu"):
+            if self.initial_pu is not None and self.signal in {"angle", "frequency"}:
                 raise ConfigError("initial_pu: angle/frequency delays use initial in rad or rad/s")
 
     type = "unit_delay"
@@ -1191,9 +1209,11 @@ class UnitDelay(Loop):
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
         self.inputs = self.outputs = {"value": _DELAY_SIGNALS[cfg.signal]}
-        electrical = cfg.signal.endswith("_pu")
+        electrical = cfg.signal not in {"angle", "frequency"}
         initial = cfg.initial_pu if electrical else cfg.initial
         self.value = 0.0 if initial is None else initial
+        if _DELAY_SIGNALS[cfg.signal].complex_value:
+            self.value = complex(self.value)
         self.state_name = "value_pu" if electrical else "value"
 
     def initial_outputs(self):

@@ -9,14 +9,17 @@ solver's kernel: the hardware adapts to its interface (:class:`Measurement`, :cl
 """
 
 from ..solver import ConfigError
-from .loops import (ANGLE, CURRENT, DC_VOLTAGE, FREQUENCY, I_AB, LOOP_TYPES, POWER_PU, V_AB,
-                    V_DQ, VOLTAGE, Loop, SignalType, SyncLaw, register_loop_type)
+from .loops import (ANGLE, FREQUENCY, I, I_AB, I_DQ, LOOP_TYPES, POWER, PQ, V, V_AB, V_DQ,
+                    Loop, SignalType, SyncLaw, register_loop_type)
 from .modulation import ModulationLimiter, OutputStage
-from .controller import (ControlGraph, ControlMeasurement, ControlOutput, Controller, Measurement,
-                         Startup, UniteType, default_wiring, make_controller)
+from .controller import (CONTROL_INTERFACE, ControlGraph, ControlInterface, ControlMeasurement,
+                         ControlOutput, Controller, Measurement, Startup, UniteType,
+                         default_wiring, make_controller)
 
-__all__ = ["Loop", "SyncLaw", "SignalType", "ConfigError", "V_AB", "I_AB", "V_DQ", "VOLTAGE",
-           "DC_VOLTAGE", "CURRENT", "ANGLE", "FREQUENCY", "POWER_PU",
-           "LOOP_TYPES", "register_loop_type", "ControlGraph", "default_wiring",
+__all__ = ["Loop", "SyncLaw", "SignalType", "ConfigError",
+           "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
+           "ANGLE", "FREQUENCY", "POWER", "PQ",
+           "LOOP_TYPES", "register_loop_type", "ControlInterface", "CONTROL_INTERFACE",
+           "ControlGraph", "default_wiring",
            "ModulationLimiter", "OutputStage", "Measurement", "ControlMeasurement", "ControlOutput",
            "Controller", "Startup", "UniteType", "make_controller"]

@@ -13,6 +13,7 @@ from __future__ import annotations
 import cmath
 import math
 from dataclasses import dataclass, field, fields
+from types import MappingProxyType
 from typing import Any, Mapping, Optional, Protocol, runtime_checkable
 
 import numpy as np
@@ -20,12 +21,13 @@ from numpy.typing import NDArray
 
 from ..solver.model import Bag, ConfigError, gather, scatter
 from .blocks import abc2complex, peak_abs, phases, smoothstep
-from .loops import (ANGLE, CURRENT, DC_VOLTAGE, FREQUENCY, I_AB, LOOP_TYPES, POWER_PU,
-                    V_AB, V_DQ, VOLTAGE, Loop, SyncLaw)
+from .loops import (ANGLE, FREQUENCY, I, I_AB, LOOP_TYPES, POWER, V, V_AB, V_DQ, Loop,
+                    SignalType, SyncLaw)
 from .modulation import CONFIGURED, OutputStage
 
 __all__ = ["Measurement", "ControlMeasurement", "ControlOutput", "Controller", "Startup",
-           "ControlGraph", "default_wiring", "UniteType", "make_controller"]
+           "ControlInterface", "CONTROL_INTERFACE", "ControlGraph", "default_wiring",
+           "UniteType", "make_controller"]
 
 
 # ------------------------------------------------------------------ the interface
@@ -92,6 +94,19 @@ class Controller(Protocol):
     """
 
     def __call__(self, t: float, meas: Measurement) -> ControlOutput: ...
+
+
+@dataclass(frozen=True)
+class ControlInterface:
+    """Typed directed ports at the boundary of a :class:`ControlGraph`.
+
+    ``inputs`` are sources available to loop input ports. ``outputs`` are controller output ports,
+    each driven by one loop output through ``ctrl.outputs``. Direction belongs to the mapping that
+    contains a port; its value is the same :class:`SignalType` used by loop port declarations.
+    """
+
+    inputs: Mapping[str, SignalType]
+    outputs: Mapping[str, SignalType]
 
 
 # ------------------------------------------------------------------ the start-up sequence
@@ -215,10 +230,24 @@ class ContinuousStartup:
 
 # kinds of input source
 _HELD, _MEASURED, _CONSTANT = 0, 1, 2
-_MEASUREMENTS = {"meas.u_g": "u_g", "meas.i_c": "i_c", "meas.u_dc": "u_dc"}
-_REFERENCES = {"id_ref_pu": CURRENT, "iq_ref_pu": CURRENT, "theta": ANGLE, "omega": FREQUENCY,
-               "p_ref_pu": POWER_PU, "q_ref_pu": POWER_PU, "v_ref_pu": VOLTAGE,
-               "vdc_ref_pu": DC_VOLTAGE, "zero_v_pu": V_DQ}
+
+CONTROL_INTERFACE = ControlInterface(
+    inputs=MappingProxyType({
+        "meas.u_g": V_AB,
+        "meas.i_c": I_AB,
+        "meas.u_dc": V,
+        "references.id_ref_pu": I,
+        "references.iq_ref_pu": I,
+        "references.theta": ANGLE,
+        "references.omega": FREQUENCY,
+        "references.p_ref_pu": POWER,
+        "references.q_ref_pu": POWER,
+        "references.v_ref_pu": V,
+        "references.vdc_ref_pu": V,
+        "references.zero_v_pu": V_DQ,
+    }),
+    outputs=MappingProxyType({"u_dq": V_DQ, "theta": ANGLE, "omega": FREQUENCY}),
+)
 
 
 class ControlGraph:
@@ -235,6 +264,7 @@ class ControlGraph:
 
     def __init__(self, cfg, startup, connections, outputs):
         self.cfg, self.startup = cfg, startup
+        self.interface = CONTROL_INTERFACE
         self._pending: list[Any] = []
         self.on_retune = None
         self.connections = {**connections, **cfg.ctrl.connections}
@@ -249,8 +279,13 @@ class ControlGraph:
         self.updated = set()
         refs = cfg.ctrl.references
         self.references = {f.name: getattr(refs, f.name) for f in fields(refs)}
-        types = {"meas.u_g": V_AB, "meas.i_c": I_AB, "meas.u_dc": DC_VOLTAGE,
-                 **{f"references.{k}": v for k, v in _REFERENCES.items()}}
+        declared_references = {
+            path.partition(".")[2] for path in self.interface.inputs
+            if path.startswith("references.")
+        }
+        if declared_references != set(self.references):
+            raise RuntimeError("controller reference fields and input ports differ")
+        types = dict(self.interface.inputs)
         for name, loop in cfg.ctrl.loops.items():
             cls = LOOP_TYPES.get(loop.type)
             if cls is None:
@@ -280,12 +315,14 @@ class ControlGraph:
                     dependencies[name].add(owner)
         if set(self.connections) - targets:
             raise ConfigError(f"ctrl.connections: unknown input ports {sorted(set(self.connections) - targets)}")
-        for port, spec in {"u_dq": V_DQ, "theta": ANGLE, "omega": FREQUENCY}.items():
+        unknown_outputs = set(self.outputs) - set(self.interface.outputs)
+        if unknown_outputs:
+            raise ConfigError(f"ctrl.outputs: unknown output ports {sorted(unknown_outputs)}; "
+                              f"known: {sorted(self.interface.outputs)}")
+        for port, spec in self.interface.outputs.items():
             source = self.outputs.get(port)
             if source not in types or types[source] != spec:
                 raise ConfigError(f"ctrl.outputs.{port}: missing or incompatible source {source!r}")
-        if set(self.outputs) - {"u_dq", "theta", "omega"}:
-            raise ConfigError("ctrl.outputs: only u_dq, theta and omega are supported")
         self.order = []
         if not self.continuous:
             pending = {name: set(deps) for name, deps in dependencies.items()}
@@ -401,8 +438,18 @@ class ControlGraph:
 
     def _rewire(self):
         """Resolve loop inputs and graph outputs against the current references."""
-        self._constants = {f"references.{k}": complex(v) if k == "zero_v_pu" else v
-                           for k, v in self.references.items()}
+        self._boundary_sources = {}
+        for path, spec in self.interface.inputs.items():
+            owner, _, port = path.partition(".")
+            if owner == "meas":
+                self._boundary_sources[path] = (_MEASURED, port)
+            elif owner == "references":
+                value = self.references[port]
+                self._boundary_sources[path] = (
+                    _CONSTANT, complex(value) if spec.complex_value else value
+                )
+            else:  # ControlInterface is a package-owned declaration, not user input.
+                raise RuntimeError(f"unknown controller input owner {owner!r}")
         self._wiring = {}
         self._immediate = {}
         self._port_source = {}
@@ -578,10 +625,8 @@ class ControlGraph:
             self.on_retune(name)
 
     def _resolve(self, source):
-        if source in _MEASUREMENTS:
-            return _MEASURED, _MEASUREMENTS[source]
-        if source in self._constants:
-            return _CONSTANT, self._constants[source]
+        if source in self._boundary_sources:
+            return self._boundary_sources[source]
         return _HELD, source
 
     def _read(self, kind, key, meas):

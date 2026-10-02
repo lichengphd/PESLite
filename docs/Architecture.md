@@ -50,6 +50,14 @@ checks wiring and creates an execution plan. Sampled graphs require an explicit 
 cycle; continuous graphs identify strongly connected loop groups and solve only those cyclic
 groups iteratively.
 
+The graph has one typed, directed boundary. Its input ports are the measured feedback signals
+(`meas.*`) and controller references (`references.*`); its output ports are `u_dq`, `theta` and
+`omega`. A connection always binds a loop input to a boundary or loop output. Default GFL/GFM
+wiring and explicit custom wiring are both lowered to this same graph before the run.
+
+Control ports use one canonical set of signal representations: complex vectors `I_AB`, `V_AB`,
+`I_DQ`, `V_DQ` and `PQ`; scalar `I`, `V` and `POWER`; and scalar `ANGLE` and `FREQUENCY`.
+
 `Startup` owns run/stop and reference-ramp progress. The modulation output stage converts controller
 voltage commands into duty ratios. Protection does not belong to the controller.
 
