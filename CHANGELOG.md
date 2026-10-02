@@ -1,9 +1,10 @@
 # Changelog
 
-## 0.1.5
+## 0.2.0
 
-- The default per-unit bridge model is now ideal `averaging`. The mutually exclusive
-  `--switching`, `--pwm-averaging` and `--averaging` options override every unit for one run.
+- The default per-unit bridge model is now `pwm_averaging`. The mutually exclusive run presets
+  select `switching + fixed/rk4`, `pwm_averaging + fixed/rk4` or
+  `averaging + adaptive/DP45`; `--set` overrides a preset, and a preset overrides the file.
 - Ideal `averaging` now integrates controller states and instantaneous measurements with the plant
   ODE and directly drives the controlled voltage-source bridge. ADC, control-interrupt,
   computation and PWM timing values remain loadable but are silently ignored in this mode, so one
@@ -13,7 +14,7 @@
   therefore read the actual DC terminal voltage without substituting the capacitor state or
   requiring per-case loop ordering. Direct feedback between continuous custom control loops is
   likewise detected and solved, while acyclic controllers retain a single-pass path.
-- Bundled examples use the default averaged bridge and a fixed solver step of 25 us.
+- Bundled examples use the default PWM-period-averaged bridge and a fixed solver step of 25 us.
 - `simulation.output.record_every` controls controller-log decimation; the former
   `ctrl_every` name is removed.
 
