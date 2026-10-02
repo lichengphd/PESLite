@@ -1,0 +1,181 @@
+# CLI Reference
+
+PESLite installs two commands:
+
+- `peslite`: run, inspect or export a simulation;
+- `peslite-convert`: export a standalone C++ simulator.
+
+Use `peslite --help` and `peslite-convert --help` for the interface of the installed version.
+
+## Select a simulation
+
+With no argument, `peslite` runs the first bundled case by filename:
+
+```bash
+peslite
+```
+
+Pass a bundled case name or a file path:
+
+```bash
+peslite gfl-example
+peslite case.pes
+peslite ./cases/my-converter.pes
+```
+
+For a local file, the suffix may be omitted when the path resolves unambiguously:
+
+```bash
+peslite case
+```
+
+The default result directory is `output/<name>/`.
+
+## Override parameters
+
+`--set PATH=VALUE` is repeatable and accepts the same dotted paths as `Params.replace()`:
+
+```bash
+peslite case.pes \
+  --set simulation.t_end=1.0 \
+  --set units.vsc.ctrl.computation=2e-6
+```
+
+Select another solver explicitly:
+
+```bash
+peslite case.pes \
+  --set simulation.solver.type=adaptive \
+  --set simulation.solver.method=DP45 \
+  --set simulation.solver.rtol=1e-3
+```
+
+`--set` has priority over a command preset, file value and default.
+
+## Select a bridge/solver preset
+
+```bash
+peslite case.pes --switching
+peslite case.pes --pwm-averaging
+peslite case.pes --averaging
+```
+
+The flags select, respectively, switching + fixed RK4, PWM-period averaging + fixed RK4, and ideal
+averaging + adaptive DP45 for the run. They change every unit unless a unit path is explicitly
+overridden with `--set`.
+
+## Choose the output directory
+
+```bash
+peslite case.pes --out output/my-run
+```
+
+Without `--out`, a bridge preset adds its mode name to the default directory. Files and output
+settings are documented in [Output and Results](Output-and-Results.md).
+
+## Progress and watched values
+
+```bash
+peslite case.pes --progress 0.1 --watch vsc.vdc_pu
+peslite case.pes --progress 0.1 --watch vsc.i_c,vsc.u_dc
+```
+
+`--progress SECONDS` uses simulated time. `--watch` may be repeated or contain comma-separated
+names. It does not enable result signal files and does not change simulation results.
+
+## Continue from saved state
+
+```bash
+peslite case.pes --out output/part-a
+peslite output/part-a/simulation.pes \
+  --initial output/part-a/states.csv \
+  --out output/part-b
+```
+
+By default, `--initial` selects the last CSV row. Select another saved time with:
+
+```bash
+peslite output/part-a/simulation.pes \
+  --initial output/part-a/states.csv \
+  --initial-time 0.75 \
+  --out output/part-b
+```
+
+See [Events and Restart](Events-and-Restart.md) for what is restored.
+
+## Inspect without running
+
+```bash
+peslite case.pes --resolved
+peslite case.pes --list-states
+peslite case.pes --ph-report
+```
+
+- `--resolved` prints the complete configuration after defaults, presets and overrides;
+- `--list-states` prints the generated `states.csv` state columns;
+- `--ph-report` prints the assembled port-Hamiltonian structure and coverage.
+
+The inspection command respects `--set` and the bridge/solver presets supplied with it.
+
+## Export through `peslite`
+
+The general command can invoke a registered exporter:
+
+```bash
+peslite case.pes --export cpp
+peslite case.pes --export cpp simulation.t_end units.vsc.ctrl.references.p_ref_pu
+peslite case.pes --export cpp all --out export/my-simulator
+```
+
+The first item after `--export` is the format; later items are variable parameter paths for that
+backend.
+
+## Export through `peslite-convert`
+
+`peslite-convert` is the C++-specific spelling:
+
+```bash
+peslite-convert case.pes
+peslite-convert case.pes simulation.t_end units.vsc.ctrl.references.p_ref_pu
+peslite-convert case.pes all --out export/my-simulator
+```
+
+It emits `peslite.cpp` in `export/<name>/` or the explicit `--out` directory. Compilation and
+backend limitations are documented in [C++ Export](Cpp-Export.md).
+
+## Generated C++ executable
+
+After compilation, inspect and run it with familiar override/output options:
+
+```bash
+export/case/peslite --list-params
+export/case/peslite --config another.pes \
+  --set simulation.t_end=5.0 \
+  --out output/cpp-run
+```
+
+Only paths shown by `--list-params` are mutable. The generated executable applies compiled defaults,
+then `--config`, then repeatable `--set` values.
+
+## Common command patterns
+
+Print a short run with live values:
+
+```bash
+peslite case.pes --set simulation.t_end=0.5 \
+  --progress 0.05 --watch vsc.vdc_pu,vsc.i_c
+```
+
+Compare bridge presets without editing the file:
+
+```bash
+peslite case.pes --switching
+peslite case.pes --pwm-averaging
+peslite case.pes --averaging
+```
+
+Create an editable, fully resolved starting file:
+
+```bash
+peslite gfl-example --resolved > case.pes
+```
