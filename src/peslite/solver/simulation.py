@@ -440,6 +440,11 @@ class Simulation:
         self.p.unit(name)  # checks the name
         return self.system.units[name if name is not None else next(iter(self.p.units))]
 
+    def export(self, format: str, out_dir: str | Path | None = None, *, name: str = "run"):
+        """Export this configured simulation as a standalone implementation."""
+        from ..assembly.exporter import export
+        return export(self, format, out_dir, name=name)
+
     def _actions(self) -> list[tuple[float, int, Any]]:
         """Return file-event actions as ``(time, file_order, action)``."""
         order = {name: index for index, name in enumerate(self.p.events)}
@@ -1160,6 +1165,8 @@ def main(argv=None) -> int:
     ap.add_argument("--out", default=None,
                     help="output directory (default: output/<file name>, or "
                          "a bridge-mode suffix with --switching/--pwm-averaging/--averaging)")
+    ap.add_argument("--export", choices=("cpp",), default=None, metavar="FORMAT",
+                    help="export a standalone configured simulator instead of running it")
     ap.add_argument("--progress", type=float, default=None, metavar="SECONDS",
                     help="print a progress line every SECONDS of simulated time")
     ap.add_argument("--watch", action="append", default=None, metavar="NAME",
@@ -1219,6 +1226,14 @@ def main(argv=None) -> int:
     if args.ph_report:
         print(sim.ph_report)
         return 0
+    suffix = ("-switching" if args.switching else
+              "-pwm-averaging" if args.pwm_averaging else
+              "-averaging" if args.averaging else "")
+    if args.export:
+        out = Path(args.out) if args.out else Path("export") / f"{config.stem}{suffix}"
+        result = sim.export(args.export, out, name=f"{config.stem}{suffix}")
+        print("wrote", ", ".join(str(path) for path in result.files))
+        return 0
     units = ", ".join(f"{n} ({u.ctrl.type}, {u.bridge.model.replace('_', ' ')}, "
                       f"{sim.units[n].bridge.describe()})"
                       for n, u in p.units.items())
@@ -1229,9 +1244,6 @@ def main(argv=None) -> int:
     if sim.ph_report is not None:
         print(f"structure: {sim.ph_report.verdict} (state coverage {sim.ph_report.coverage:.0%}"
               f"{'; ' + '; '.join(sim.energy_problems) if sim.energy_problems else ''})")
-    suffix = ("-switching" if args.switching else
-              "-pwm-averaging" if args.pwm_averaging else
-              "-averaging" if args.averaging else "")
     out = Path(args.out) if args.out else _RESULTS / f"{config.stem}{suffix}"
     r = sim.run(out_dir=out, info={"config": str(config)})
     s = r.summary

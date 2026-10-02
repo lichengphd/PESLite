@@ -14,13 +14,14 @@ from .components import (ADC, PWM, PWMBridge, ZOH, AveragingBridge, CarrierCompa
 from .assembly import (Params, Protection, SourceScenario, System, Unit, dump, dumps, load,
                        register_event_type)
 from .solver.simulation import Simulation, SimulationResult, main
+from .assembly.exporter import ExportResult, export
 
 __version__ = "0.2.0"
 
 __all__ = [
     "solver", "control", "components", "assembly",
     "Params", "load", "dump", "dumps", "System", "Unit", "Protection", "MeasurementPorts", "Model", "SourceScenario",
-    "Simulation", "SimulationResult", "UniteType", "main", "make_controller", "make_modulator", "make_solver",
+    "Simulation", "SimulationResult", "ExportResult", "export", "UniteType", "main", "make_controller", "make_modulator", "make_solver",
     "register_loop_type", "register_element_type", "register_event_type",
     "OutputStage", "ADC", "PWM", "PWMBridge", "AveragingBridge", "make_bridge",
     "CarrierComparison", "ZOH",

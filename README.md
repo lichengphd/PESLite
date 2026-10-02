@@ -85,6 +85,30 @@ r.summary                          # trips, alarms, peaks
 r.files                            # files already written by run()
 ```
 
+## Export as C++
+
+Export a resolved configuration as a standalone, parameter-specialised C++17 simulator:
+
+```bash
+peslite gfl-example --export cpp
+cmake -S export/gfl-example -B export/gfl-example/build
+cmake --build export/gfl-example/build --config Release
+export/gfl-example/build/peslite
+```
+
+The generated executable uses only the C++17 standard library. It performs the simulation itself
+and writes the same `states.csv`, optional signal CSVs, `summary.json` and `simulation.pes` file
+layout as the Python runner. Its default result directory is `output/<configuration-name>`; an
+explicit directory may be passed as its first argument.
+
+The same export is available from Python. With no directory argument it mirrors the normal
+`output/run` convention under `export/run`:
+
+```python
+project = peslite.export(p, "cpp")
+# equivalently: peslite.Simulation(p).export("cpp")
+```
+
 ## Simulation files and events
 
 A simulation file contains the model (`base`, `buses`, `branches`, `sources`, `units` and
@@ -326,6 +350,8 @@ src/peslite/            the package: __init__.py and four code parts
     protection.py         fast and sampled criteria, timers, alarms and the unit's trip latch
     unit.py               power stage, ADC/PWM peripherals, controller, protection and trip actions
     system.py             the network, units and elements as one model; applies events
+    exporter.py           format-neutral export API and backend registry
+    cpp.py                parameter-specialised standalone C++17 simulator generator
   solver/               the numerical kernel and the run
     model.py              subsystems, connections, automatic algebraic-loop solving and named states
     energy.py             energy declarations, power balance, port-Hamiltonian report
