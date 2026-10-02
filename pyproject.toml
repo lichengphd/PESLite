@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "peslite"
 version = "0.2.1"
-description = "Power-electronics simulation on a port-Hamiltonian solver kernel: connected subsystem models, energy accounting, fixed/adaptive/multirate integration and converter control."
+description = "Open-source, lightweight, multirate Power Electronics Simulator on a port-Hamiltonian solver kernel: connected subsystem models, energy accounting, fixed/adaptive/multirate integration and converter control."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "AGPL-3.0-only"
