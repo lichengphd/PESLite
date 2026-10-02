@@ -83,6 +83,41 @@ peslite case.pes --progress 0.1 --watch vsc.i_c,vsc.u_dc
 `--progress SECONDS` uses simulated time. `--watch` may be repeated or contain comma-separated
 names. It does not enable result signal files and does not change simulation results.
 
+## Plot recorded waveforms
+
+Install the optional plotting dependency, then name the recorded columns after `--plot`:
+
+```bash
+pip install "peslite[plot]"
+peslite case.pes --plot vsc.dclink.u_C vsc.ctrl.pll.theta \
+  --plot-ylabel '$x$ (pu)'
+```
+
+`pip install "peslite[all]"` installs every optional runtime add-on in one step.
+
+PESLite always runs the simulation first. It finds the actual generated CSV that contains all the
+requested columns and writes `fig_<table>.pdf` beside it. The columns must belong to one CSV; no
+implicit resampling is performed between output grids. Plant and controller waveforms require
+`simulation.output.signals: 1`, as they do for CSV output generally.
+
+The horizontal column defaults to `t`. Its labels automatically use seconds, milliseconds or
+microseconds instead of a scientific multiplier. Use `--plot-time-unit s|ms|us` to override that
+choice. Common presentation options include:
+
+```bash
+peslite case.pes --plot vsc.dclink.u_C \
+  --plot-title 'DC-link voltage' \
+  --plot-label '$u_{dc}$' \
+  --plot-ylabel '$u_{dc}$ (V)' \
+  --plot-xlim 0.1 0.2 \
+  --plot-width double \
+  --plot-output dc-link.pdf
+```
+
+`--plot-xlim` remains in the CSV time unit (seconds); only its presentation is scaled. The default
+style uses IEEE dimensions, serif/Computer Modern text, inward ticks, restrained colors and vector
+PDF output. External LaTeX is used when available, with a bundled Computer Modern-style fallback.
+
 ## Continue from saved state
 
 ```bash

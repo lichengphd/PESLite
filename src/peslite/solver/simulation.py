@@ -131,6 +131,15 @@ class SimulationResult:
         """Return the last row of the state table (``t`` included)."""
         return dict(self._records.final_states)
 
+    def plot(self, columns: str | Iterable[str], **options: Any) -> Path:
+        """Plot recorded columns from one result CSV through the optional plotting add-on."""
+        from ..addons import plot_result
+
+        path = plot_result(self, columns, **options)
+        if path not in self.files:
+            self.files.append(path)
+        return path
+
 
 
 class _CSVTable:
@@ -1180,7 +1189,46 @@ def main(argv=None) -> int:
                     help="print the port-Hamiltonian structure report of the system (always built) and exit")
     ap.add_argument("--resolved", action="store_true",
                     help="print the complete resolved simulation file and exit")
+    plots = ap.add_argument_group("IEEE-style PDF plot (after simulation)")
+    plots.add_argument("--plot", nargs="+", default=None, metavar="NAME",
+                       help="plot these recorded columns against time; all must belong to one result CSV")
+    plots.add_argument("--plot-output", default=None, metavar="PDF",
+                       help="PDF path relative to the run directory (default: fig_<table>.pdf)")
+    plots.add_argument("--plot-x", default="t", metavar="NAME",
+                       help="horizontal-axis column (default: t)")
+    plots.add_argument("--plot-time-unit", choices=("auto", "s", "ms", "us"), default="auto",
+                       help="time-axis unit (default: choose s, ms, or us from the range)")
+    plots.add_argument("--plot-title", default=None, metavar="TEXT")
+    plots.add_argument("--plot-xlabel", default=None, metavar="TEXT")
+    plots.add_argument("--plot-ylabel", default=None, metavar="TEXT")
+    plots.add_argument("--plot-label", action="append", default=None, metavar="TEXT",
+                       help="legend label for each waveform, in --plot order; repeatable")
+    plots.add_argument("--plot-color", action="append", default=None, metavar="COLOR",
+                       help="Matplotlib color for each waveform, in --plot order; repeatable")
+    plots.add_argument("--plot-style", action="append", default=None, metavar="STYLE",
+                       help="line style for each waveform, in --plot order; repeatable")
+    plots.add_argument("--plot-width", choices=("single", "double"), default="single",
+                       help="IEEE single- or double-column width (default: single)")
+    plots.add_argument("--plot-height", type=float, default=None, metavar="INCHES")
+    plots.add_argument("--plot-linewidth", type=float, default=1.5, metavar="POINTS")
+    plots.add_argument("--plot-xlim", type=float, nargs=2, default=None, metavar=("MIN", "MAX"))
+    plots.add_argument("--plot-ylim", type=float, nargs=2, default=None, metavar=("MIN", "MAX"))
+    plots.add_argument("--plot-no-grid", action="store_true", help="disable the background grid")
+    plots.add_argument("--plot-no-legend", action="store_true", help="disable the legend")
     args = ap.parse_args(argv)
+
+    plot_option_without_plot = (
+        args.plot_output is not None or args.plot_x != "t" or args.plot_time_unit != "auto"
+        or args.plot_title is not None or args.plot_xlabel is not None or args.plot_ylabel is not None
+        or args.plot_label is not None or args.plot_color is not None or args.plot_style is not None
+        or args.plot_width != "single" or args.plot_height is not None or args.plot_linewidth != 1.5
+        or args.plot_xlim is not None or args.plot_ylim is not None
+        or args.plot_no_grid or args.plot_no_legend
+    )
+    if args.plot is None and plot_option_without_plot:
+        ap.error("plot presentation options require --plot NAME [NAME ...]")
+    if args.plot is not None and (args.export or args.list_states or args.ph_report or args.resolved):
+        ap.error("--plot requires a simulation run and cannot be combined with inspection or export")
 
     try:
         config = _config_path(args.config)
@@ -1269,6 +1317,36 @@ def main(argv=None) -> int:
     if "split_error_bound_rated" in s:
         print(f"split error, from the linearised closed loop: <= {s['split_error_bound_rated']:.2e} of rating "
               f"({s['split_bound']})")
+    if args.plot:
+        plot_output = None
+        if args.plot_output:
+            plot_output = Path(args.plot_output)
+            if not plot_output.is_absolute():
+                plot_output = out / plot_output
+            if not plot_output.suffix:
+                plot_output = plot_output.with_suffix(".pdf")
+        try:
+            r.plot(
+                args.plot,
+                output=plot_output,
+                x=args.plot_x,
+                time_unit=args.plot_time_unit,
+                labels=args.plot_label,
+                title=args.plot_title,
+                xlabel=args.plot_xlabel,
+                ylabel=args.plot_ylabel,
+                width=args.plot_width,
+                height=args.plot_height,
+                xlim=tuple(args.plot_xlim) if args.plot_xlim else None,
+                ylim=tuple(args.plot_ylim) if args.plot_ylim else None,
+                colors=args.plot_color,
+                linestyles=args.plot_style,
+                linewidth=args.plot_linewidth,
+                grid=not args.plot_no_grid,
+                legend=not args.plot_no_legend,
+            )
+        except (FileNotFoundError, RuntimeError, TypeError, ValueError) as exc:
+            ap.error(str(exc))
     print("wrote", ", ".join(str(w) for w in r.files))
     final = r.final_states()
     if final:

@@ -1,8 +1,8 @@
 # Architecture
 
-PESLite separates physical components, controller logic, system assembly and numerical execution.
-The separation keeps model ownership explicit while allowing the same configuration to run with
-different bridge and solver implementations.
+PESLite separates physical components, controller logic, system assembly, numerical execution and
+optional add-ons. The five core directories keep ownership explicit while allowing the same
+configuration to run with different bridge and solver implementations.
 
 ## Package layers
 
@@ -11,12 +11,16 @@ src/peslite/
 ├── components/   network, converter, ADC and PWM hardware
 ├── control/      control loops, graphs, startup and modulation
 ├── assembly/     parameters, events, protection, units, systems and exporters
-└── solver/       connected model kernel, energy model, integrators and simulation run
+├── solver/       connected model kernel, energy model, integrators and simulation run
+└── addons/       optional post-processing features, loaded only when requested
 ```
 
 Dependencies point inward through small interfaces: components use the model kernel, controller
 logic uses typed signals, assembly wires both into a system, and `solver.simulation` schedules the
 assembled system.
+
+Optional dependencies stay behind the `addons` boundary. For example, IEEE-style plotting reads
+closed result CSV files after a run and is absent from the solver path and generated C++ source.
 
 ## Components
 

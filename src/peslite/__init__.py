@@ -1,9 +1,9 @@
 """Power-electronics converter simulation on a port-Hamiltonian model kernel.
 
-The package has four parts: :mod:`.components` (power circuit and converter hardware),
+The package has five parts: :mod:`.components` (power circuit and converter hardware),
 :mod:`.control` (the converter's controller), :mod:`.assembly` (a system built from a simulation
-file) and :mod:`.solver` (the model kernel, the integrators and the run). Plant quantities are in
-SI; controllers work in each unit's pu bases.
+file), :mod:`.solver` (the model kernel, integrators and run), and :mod:`.addons` (optional
+post-processing). Plant quantities are in SI; controllers work in each unit's pu bases.
 """
 
 from . import solver, control, components, assembly
@@ -16,7 +16,7 @@ from .assembly import (Params, Protection, SourceScenario, System, Unit, dump, d
 from .solver.simulation import Simulation, SimulationResult, main
 from .assembly.exporter import ExportResult, export
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 __all__ = [
     "solver", "control", "components", "assembly",

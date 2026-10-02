@@ -1,4 +1,4 @@
-"""The package has four code parts; the root examples directory contains YAML-format .pes files."""
+"""The package has five code parts; the root examples directory contains YAML-format .pes files."""
 
 import ast
 from pathlib import Path
@@ -7,7 +7,7 @@ import peslite
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "src" / "peslite"
-PARTS = ("solver", "control", "components", "assembly")
+PARTS = ("solver", "control", "components", "assembly", "addons")
 
 # What each part may import. The numerical solver kernel is at the bottom; the application runner
 # (solver.simulation) is deliberately at the top.
@@ -16,6 +16,7 @@ BELOW = {
     "control": {"solver", "control"},
     "components": {"solver", "control", "components"},
     "assembly": {"solver", "control", "components", "assembly"},
+    "addons": {"addons"},
 }
 TOP = {"solver/simulation.py"}
 
@@ -34,7 +35,7 @@ def _imports(path):
     return out
 
 
-def test_the_package_has_four_code_parts():
+def test_the_package_has_five_code_parts():
     entries = {p.name for p in PACKAGE.iterdir() if p.name != "__pycache__"}
     assert entries == {"__init__.py", *PARTS}
 
