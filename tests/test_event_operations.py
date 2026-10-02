@@ -26,7 +26,7 @@ def _load(tree, name="load", **values):
 def _line(tree):
     tree["buses"]["remote"] = {"c_pu": 0.02, "r_d_pu": 0.5}
     tree.setdefault("branches", {})["line"] = {
-        "from_bus": "pcc", "to_bus": "remote", "x_pu": 0.1, "r_pu": 0.01,
+        "bus1": "pcc", "bus2": "remote", "x_pu": 0.1, "r_pu": 0.01,
     }
     return tree
 
@@ -52,22 +52,17 @@ class _PassiveShunt(Element):
     type = "test_passive_shunt"
 
     def __init__(self, name, cfg, buses, p):
-        self.name, self.cfg, self.bus = name, cfg, buses[cfg.bus]
+        self.name, self.cfg = name, cfg
         self.branch = RLBranch(cfg.l, cfg.r)
 
     def subsystems(self):
         return {f"{self.name}.branch": self.branch}
 
     def connections(self):
-        return {(self.branch, "u_from"): (self.bus, "u")}
+        return {}
 
-    @property
-    def bus_name(self):
-        return self.cfg.bus
-
-    @property
-    def injection(self):
-        return self.branch, "i", -1.0
+    def terminals(self):
+        return ((self.cfg.bus, self.branch.terminal1),)
 
 
 def test_builtin_load_is_typed_scaled_built_and_written(tmp_path):

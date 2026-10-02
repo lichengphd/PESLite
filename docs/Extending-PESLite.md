@@ -58,14 +58,14 @@ continuous outputs and state derivatives through its continuous interface, such 
 
 An element class registered by `register_element_type` owns:
 
-- a frozen `Params` dataclass including its `type` and bus fields;
+- a frozen `Params` dataclass including its `type` and `bus` or `busN` fields;
 - `subsystems()` for its physical model objects;
-- `connections()` for internal/external port wiring;
-- `bus_name` and `injection` for network assembly;
+- `connections()` for its internal and auxiliary signal wiring;
+- `terminals()` binding each configured bus to an electrical `Terminal`;
 - optional `connect()`, `disconnect()` or `retune()` behavior.
 
 ```python
-from peslite.addons.components import Element, register_element_type
+from peslite.addons.components import Element, Terminal, register_element_type
 
 @register_element_type
 class MyElement(Element):
@@ -83,6 +83,12 @@ elements:
 Modules under `peslite/addons/components/` are discovered automatically. Built-in and add-on
 elements follow the same registry mechanism. Public names are namespaced by the element instance,
 so two instances do not share state paths.
+
+An electrical `Terminal` names a subsystem voltage input and current output once. Its direction is
+`+1` when positive current enters the subsystem and `-1` when it leaves. A one-terminal element
+uses `bus` and returns one binding; a multi-terminal element uses `bus1`, `bus2`, and so on and
+returns one binding per terminal. System assembly converts these declarations to direct model
+connections, so terminal metadata adds no work to the integration loop.
 
 ## Custom events
 

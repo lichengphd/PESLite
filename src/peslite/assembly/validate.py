@@ -215,10 +215,10 @@ def _network(p: Params) -> None:
         if bus not in p.buses:
             raise ConfigError(f"{where}: unknown bus {bus!r}; known: {sorted(p.buses)}")
     for name, br in p.branches.items():
-        _bus_of(f"branches.{name}.from_bus", br.from_bus)
-        _bus_of(f"branches.{name}.to_bus", br.to_bus)
-        if br.from_bus == br.to_bus:
-            raise ConfigError(f"branches.{name}: both ends are {br.from_bus!r}")
+        _bus_of(f"branches.{name}.bus1", br.bus1)
+        _bus_of(f"branches.{name}.bus2", br.bus2)
+        if br.bus1 == br.bus2:
+            raise ConfigError(f"branches.{name}: both ends are {br.bus1!r}")
         if br.l <= 0.0:
             raise ConfigError(f"branches.{name}.l must be > 0")
     for name, src in p.sources.items():

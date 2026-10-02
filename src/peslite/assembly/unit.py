@@ -15,7 +15,7 @@ import numpy as np
 
 from ..components.adc import ADC, MeasurementPorts
 from ..components.converter import make_bridge, make_dclink
-from ..components.network import RLBranch
+from ..components.network import RLBranch, Terminal
 from ..components.pwm import TIME_EPS, Modulator
 from ..control.blocks import phases
 from ..control.controller import Controller, Measurement, make_controller
@@ -120,9 +120,8 @@ class Unit:
         return parts
 
     def connections(self) -> dict:
-        """Return this unit's internal wiring and its filter branch's connection to the bus."""
+        """Return this unit's internal and measurement wiring."""
         connections = {
-            (self.branch_f, "u_to"): (self.bus, "u"),
             **self.bridge.connections(self.dclink, self.branch_f),
         }
         if self.continuous:
@@ -137,14 +136,9 @@ class Unit:
     def zoh_connections(self) -> dict:
         return {} if self.continuous else self.bridge.zoh_connections(self.zoh)
 
-    @property
-    def bus_name(self) -> str:
-        return self.cfg.bus
-
-    @property
-    def injection(self) -> tuple:
-        """Current this unit feeds into its bus: the filter branch current, positive into the node."""
-        return (self.branch_f, "i")
+    def terminals(self) -> tuple[tuple[str, Terminal], ...]:
+        """Bind the filter's second terminal to the unit bus."""
+        return ((self.cfg.bus, self.branch_f.terminal2),)
 
     def aliases(self) -> dict[str, str]:
         """Return the aliases ``<unit>.i_c`` (filter current) and ``<unit>.u_dc`` (dc-link voltage)."""

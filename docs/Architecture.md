@@ -38,6 +38,11 @@ converter peripherals.
 Physical component state and parameters are SI quantities. Components declare ports, state,
 derivatives and energy/storage relationships without knowing the global system order.
 
+Every physical network attachment uses the same construction-time `Terminal` contract. A terminal
+names its voltage and current once, with positive direction defined into the component; a one-port
+component binds `bus`, while a branch or other two-port component binds `bus1` and `bus2`. System
+assembly lowers this metadata to direct model connections before integration begins.
+
 ## Control
 
 Each loop owns its parameter schema, typed ports, state and sampled/continuous update. `ControlGraph`

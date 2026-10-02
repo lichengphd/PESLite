@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Optional
 
-from ..components.network import ELEMENT_TYPES, RCNode, RLBranch, ThreePhaseSource
+from ..components.network import ELEMENT_TYPES, RCNode, RLBranch, Terminal, ThreePhaseSource
 from ..solver.energy import spec_of
 from ..solver.model import ConfigError, Model, gather
 from .events import SWITCHING, SourceScenario
@@ -20,8 +20,8 @@ __all__ = ["System"]
 class _Source:
     """Voltage source (emf) behind a series R-L branch."""
 
-    def __init__(self, name: str, cfg, base, bus, steps, t0: float) -> None:
-        self.name, self.cfg, self.bus = name, cfg, bus
+    def __init__(self, name: str, cfg, base, steps, t0: float) -> None:
+        self.name, self.cfg = name, cfg
         self.scenario = SourceScenario(cfg, base.f0, steps)
         self.emf = ThreePhaseSource(base.w0, *self.scenario.law(t0))
         self.branch = RLBranch(cfg.l, cfg.r)
@@ -42,20 +42,32 @@ class _Source:
         return {f"{self.name}.emf": self.emf, f"{self.name}.branch": self.branch}
 
     def connections(self) -> dict:
-        return {(self.branch, "u_from"): (self.emf, "e_g"),
-                (self.branch, "u_to"): (self.bus, "u"),
+        return {(self.branch, "u1"): (self.emf, "e_g"),
                 (self.emf, "i"): (self.branch, "i")}  # energy accounting only
 
-    @property
-    def bus_name(self) -> str:
-        return self.cfg.bus
-
-    @property
-    def injection(self) -> tuple:
-        return (self.branch, "i")
+    def terminals(self) -> tuple[tuple[str, Terminal], ...]:
+        return ((self.cfg.bus, self.branch.terminal2),)
 
     def signals(self) -> dict[str, float | complex]:
         return {f"{self.name}.i": self.branch.out.i, f"{self.name}.angle": self.emf.out.phi}
+
+
+class _BranchAssembly:
+    """Give a configured bare RLBranch the common network-component assembly interface."""
+
+    def __init__(self, name: str, cfg, branch: RLBranch) -> None:
+        self.name, self.cfg, self.branch = name, cfg, branch
+
+    def subsystems(self) -> dict[str, RLBranch]:
+        return {self.name: self.branch}
+
+    @staticmethod
+    def connections() -> dict:
+        return {}
+
+    def terminals(self) -> tuple[tuple[str, Terminal], ...]:
+        return ((self.cfg.bus1, self.branch.terminal1),
+                (self.cfg.bus2, self.branch.terminal2))
 
 
 class System:
@@ -76,7 +88,7 @@ class System:
                       for name, cfg in p.buses.items()}
         self.branches = {name: RLBranch(cfg.l, cfg.r)
                          for name, cfg in p.branches.items()}
-        self.sources = {name: _Source(name, cfg, base, self.buses[cfg.bus], [
+        self.sources = {name: _Source(name, cfg, base, [
                             (change.t, change.params.sources[name]) for change in p.changes
                             if set(change.touches(f"sources.{name}.")) & {"v", "f", "angle"}],
                             p.simulation.initial.t)
@@ -89,28 +101,42 @@ class System:
 
         # ---------------------------------------------------------- the wiring
         subsystems: dict[str, Any] = dict(self.buses)
-        subsystems.update(self.branches)
         connections: dict = {}
-        into: dict[str, list] = {name: [] for name in self.buses}
+        bus_currents: dict[str, list] = {name: [] for name in self.buses}
         self.named_elements = {name: ELEMENT_TYPES[cfg.type](name, cfg, self.buses, p)
                                for name, cfg in p.elements.items()}
-        for element in (*self.sources.values(), *self.units.values(), *self.named_elements.values()):
+        branch_assemblies = tuple(_BranchAssembly(name, p.branches[name], branch)
+                                  for name, branch in self.branches.items())
+        elements = (*branch_assemblies, *self.sources.values(), *self.units.values(),
+                    *self.named_elements.values())
+        for element in elements:
             subsystems.update(element.subsystems())
             connections.update(element.connections())
-        # bus injections: units, sources, registered elements, then branches
-        for element in (*self.units.values(), *self.sources.values(), *self.named_elements.values()):
-            if element.injection is not None:
-                into[element.bus_name].append(element.injection)
-        for name, cfg in p.branches.items():
-            branch = self.branches[name]
-            connections[(branch, "u_from")] = (self.buses[cfg.from_bus], "u")
-            connections[(branch, "u_to")] = (self.buses[cfg.to_bus], "u")
-            into[cfg.from_bus].append((branch, "i", -1.0))  # leaves the sending end
-            into[cfg.to_bus].append((branch, "i", 1.0))     # arrives at the receiving end
+        # Every network component uses the same terminal contract. Direction is positive into the
+        # component, so the current injected into a bus has the opposite sign.
+        for element in elements:
+            for bus_name, terminal in element.terminals():
+                if not isinstance(terminal, Terminal):
+                    raise TypeError(
+                        f"{type(element).__name__}.terminals() returned "
+                        f"{type(terminal).__name__}, not Terminal"
+                    )
+                if bus_name not in self.buses:
+                    raise ConfigError(f"terminal refers to unknown bus {bus_name!r}")
+                target = (terminal.subsystem, terminal.voltage)
+                if target in connections:
+                    raise ConfigError(
+                        f"{type(terminal.subsystem).__name__}.{terminal.voltage} is connected both "
+                        "as an electrical terminal and by connections()"
+                    )
+                connections[target] = (self.buses[bus_name], "u")
+                bus_currents[bus_name].append(
+                    (terminal.subsystem, terminal.current, -terminal.direction)
+                )
         for name, node in self.buses.items():
-            if not into[name]:
+            if not bus_currents[name]:
                 raise ValueError(f"bus {name!r} has nothing attached to it")
-            connections[(node, "i_in")] = into[name]
+            connections[(node, "i")] = bus_currents[name]
         zoh: dict = {}
         for unit in self.units.values():
             zoh.update(unit.zoh_connections())

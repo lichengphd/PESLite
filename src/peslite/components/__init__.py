@@ -7,14 +7,14 @@ models use the ADC (:mod:`.adc`) and own their PWM timing/register implementatio
 """
 
 from ..solver import ConfigError
-from .network import (ELEMENT_TYPES, Element, Load, RCNode, RLBranch, ThreePhaseSource,
+from .network import (ELEMENT_TYPES, Element, Load, RCNode, RLBranch, Terminal, ThreePhaseSource,
                       register_element_type)
 from .converter import (AveragingBridge, Bridge, PWMBridge, DCCapacitor, DCCurrentSource, DCLink,
                         DCVoltageSource, make_bridge, make_dclink)
 from .adc import ADC, MeasurementPorts
 from .pwm import ZOH, CarrierComparison, PWM, SwitchingSequence, SynchronousCarrier, make_modulator
 
-__all__ = ["ThreePhaseSource", "RLBranch", "RCNode", "Element", "ELEMENT_TYPES", "ConfigError",
+__all__ = ["Terminal", "ThreePhaseSource", "RLBranch", "RCNode", "Element", "ELEMENT_TYPES", "ConfigError",
            "register_element_type", "Load", "Bridge", "PWMBridge", "make_bridge", "DCLink",
            "DCCapacitor", "DCCurrentSource", "DCVoltageSource", "make_dclink", "ADC",
            "MeasurementPorts", "AveragingBridge", "PWM", "SwitchingSequence",

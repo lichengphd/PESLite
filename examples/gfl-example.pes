@@ -17,7 +17,7 @@ buses:                     # ac nodes; every bus needs a shunt capacitor
     r_d_pu: 0.5            # damping resistor in series with it
 
 # branches:                # series R-L lines between buses
-#   line1: {from_bus: pcc, to_bus: bus2, x_pu: 0.05, r_pu: 0.005}  # connect/disconnect events switch it
+#   line1: {bus1: pcc, bus2: bus2, x_pu: 0.05, r_pu: 0.005}  # connect/disconnect events switch it
 
 sources:                   # emf behind an impedance, attached to a bus
   grid:

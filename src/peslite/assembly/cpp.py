@@ -329,7 +329,7 @@ class _ModelGenerator:
         if isinstance(owner, RLBranch):
             return [f"{self.value(out, 'i')} = {self.value(state, 'i')};"]
         if isinstance(owner, RCNode):
-            return [f"{self.value(out, 'u')} = {self.value(state, 'u_C')} + {_number(owner.R_d)} * {self.value(inp, 'i_in')};"]
+            return [f"{self.value(out, 'u')} = {self.value(state, 'u_C')} + {_number(owner.R_d)} * {self.value(inp, 'i')};"]
         if isinstance(owner, Bridge):
             if name == "set_dc_current":
                 return [f"{self.value(out, 'i_dc')} = 1.5 * std::real({self.value(inp, 'q')} * std::conj({self.value(inp, 'i_c')}));"]
@@ -414,11 +414,11 @@ class _ModelGenerator:
         if isinstance(sub, RLBranch):
             i = self.value(state, "i")
             derivative = (f"(breaker_open_{self.prefix[id(sub)]} ? Complex{{0.0, 0.0}} : "
-                          f"({self.value(inp, 'u_from')} - {self.value(inp, 'u_to')} - "
+                          f"({self.value(inp, 'u1')} - {self.value(inp, 'u2')} - "
                           f"{_number(sub.R)} * {i}) / {_number(sub.L)})")
             return [derivative]
         if isinstance(sub, RCNode):
-            return [f"{self.value(inp, 'i_in')} / {_number(sub.C)}"]
+            return [f"{self.value(inp, 'i')} / {_number(sub.C)}"]
         if isinstance(sub, (ThreePhaseSource, Bridge)):
             return []
         if isinstance(sub, DCLink):
@@ -2028,7 +2028,7 @@ class _CppGenerator:
                 current = model.value(sub.state, "i")
                 return "0.0", f"{_number(1.5 * sub.R)} * std::norm({current})"
             if isinstance(sub, RCNode):
-                current = model.value(sub.inp, "i_in")
+                current = model.value(sub.inp, "i")
                 return "0.0", f"{_number(1.5 * sub.R_d)} * std::norm({current})"
             if isinstance(sub, ThreePhaseSource):
                 supplied = product(sub.out, "e_g", sub.inp, "i")

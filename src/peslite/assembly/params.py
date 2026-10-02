@@ -190,13 +190,13 @@ class BusParams:
 
 @dataclass(frozen=True)
 class BranchParams:
-    """Series R-L branch between two buses; current positive from ``from_bus`` to ``to_bus``.
+    """Series R-L branch between two buses; current positive from ``bus1`` to ``bus2``.
 
     ``l`` in H, ``r`` in ohm; pu inputs use the system base. Connect/disconnect events switch it.
     """
 
-    from_bus: str
-    to_bus: str
+    bus1: str
+    bus2: str
     l: float
     r: float = 0.0
     _quantities = {"l": "inductance", "r": "resistance"}
