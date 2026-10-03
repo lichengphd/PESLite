@@ -15,7 +15,7 @@ from dataclasses import dataclass, field, is_dataclass
 from typing import Any, ClassVar, Mapping, Optional
 
 from ..solver.model import ConfigError, assign, gather, scatter
-from .blocks import HighPass1, LowPass1, clamp
+from .blocks import HighPass1, LowPass1, PI
 
 __all__ = ["SignalType", "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
            "ANGLE", "FREQUENCY", "POWER", "PQ",
@@ -145,7 +145,6 @@ class Loop:
         for name in self.carried:
             setattr(self, name, getattr(old, name))
 
-
 LOOP_TYPES: dict[str, type] = {}
 
 
@@ -224,10 +223,19 @@ class SRFPLL(Loop):
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
         self.kp, self.ki, self.w0, self.T = cfg.kp_pu, cfg.ki_pu, unit.base.w0, cfg.period
-        self.theta, self.omega, self.integral = 0.0, self.w0, 0.0
+        self.pi = PI(self.kp, self.ki, self.T)
+        self.theta, self.omega = 0.0, self.w0
         self.u_g = 1.0 if cfg.normalisation == "amplitude" else None
         self.state_names = {"theta": "theta", "integral_pu": "integral",
                             **({} if self.u_g is None else {"u_g_pu": "u_g"})}
+
+    @property
+    def integral(self):
+        return self.pi.integral
+
+    @integral.setter
+    def integral(self, value):
+        self.pi.integral = value
 
     def initial_outputs(self):
         return {"theta": self.theta, "frame": self.theta, "omega": self.omega}
@@ -240,8 +248,7 @@ class SRFPLL(Loop):
             eps = v.imag
         else:                                              # amplitude
             eps = v.imag / u_g if u_g > 0.0 else 0.0
-        self.integral += self.T * eps
-        self.omega = self.w0 + self.kp * eps + self.ki * self.integral
+        self.omega = self.pi.sample(eps, 0.0, self.w0)
         self.theta += self.T * self.omega
         if u_g is not None:
             self.u_g = u_g + self.T * self.kp * (v.real - u_g)
@@ -266,23 +273,29 @@ class SRFPLL(Loop):
             eps = v.imag
         else:
             eps = v.imag / self.u_g if self.u_g > 0.0 else 0.0
-        self.omega = self.w0 + self.kp * eps + self.ki * self.integral
+        self.omega, d_integral = self.pi.flow(eps, 0.0, self.w0)
         if self.u_g is not None:
-            return (self.theta, self.theta, self.omega, self.omega, eps,
+            return (self.theta, self.theta, self.omega, self.omega, d_integral,
                     self.kp * (v.real - self.u_g))
-        return self.theta, self.theta, self.omega, self.omega, eps
+        return self.theta, self.theta, self.omega, self.omega, d_integral
+
+    def continuous_state_bindings(self):
+        bindings = {"theta": (self, "theta"), "integral_pu": (self.pi, "integral")}
+        if self.u_g is not None:
+            bindings["u_g_pu"] = (self, "u_g")
+        return bindings
 
     def reset_integrator(self):
-        self.integral = 0.0
+        self.pi.reset()
 
 
 @register_loop_type
 class CurrentLoop(Loop):
     """dq PI current loop: ``u = u_ff + (r_pu + j*omega/w0*x_pu)*i + kp*e + ki*integral`` (+ ``extra``).
 
-    Gains default from ``bandwidth`` (Hz) and the unit's filter. Anti-windup: the
-    firmware uses ``rollback`` (conditional) or ``backcalculate`` when the modulation saturates.
-    Named state: ``integral_pu`` (complex dq, pu*s).
+    Gains default from ``bandwidth`` (Hz) and the unit's filter. The controller may constrain
+    ``u_dq`` and feed the applied output back to this PI's tracking anti-windup. Named state:
+    ``integral_pu`` (complex dq, pu*s).
     """
 
     @dataclass(frozen=True, kw_only=True)
@@ -292,11 +305,10 @@ class CurrentLoop(Loop):
         ki_pu: Optional[float] = None  # pu voltage / (pu current * s)
         decoupling: bool = True
         feedforward: bool = True
-        antiwindup: str = "conditional"  # "conditional" | "backcalc" | "none"
+        antiwindup: bool = True
         period: Optional[float] = None
         type: str = "dq_current_pi"
 
-        _choices = {"antiwindup": ("conditional", "backcalc", "none")}
         _quantities = {"kp_pu": "resistance", "ki_pu": "resistance"}
 
     type = "dq_current_pi"
@@ -315,10 +327,18 @@ class CurrentLoop(Loop):
         self.kp = cfg.kp_pu if cfg.kp_pu is not None else x / unit.base.w0 * 2 * math.pi * cfg.bandwidth
         self.ki = cfg.ki_pu if cfg.ki_pu is not None else r * 2 * math.pi * cfg.bandwidth
         self.x_pu, self.r_pu, self.w0, self.T = x, r, unit.base.w0, cfg.period
-        self.decoupling, self.feedforward, self.antiwindup = cfg.decoupling, cfg.feedforward, cfg.antiwindup
-        self.integral = self._prev_integral = 0j
-        self._last: tuple[complex, complex, complex, float] | None = None
+        self.decoupling, self.feedforward = cfg.decoupling, cfg.feedforward
+        self.antiwindup = cfg.antiwindup
+        self.pi = PI(self.kp, self.ki, self.T, antiwindup=cfg.antiwindup, initial=0j)
         self.extra = 0j
+
+    @property
+    def integral(self):
+        return self.pi.integral
+
+    @integral.setter
+    def integral(self, value):
+        self.pi.integral = complex(value)
 
     def initial_outputs(self):
         return {"u_dq": 0j, "extra": 0j}
@@ -327,14 +347,9 @@ class CurrentLoop(Loop):
         rot = _into(inputs["frame"])
         self.extra = inputs["extra"]
         i, u_ff, omega = inputs["i"] * rot, inputs["v"] * rot, inputs["omega"]
-        self._prev_integral = self.integral
-        if not self.startup.active:
-            e = 0j
-        else:
-            e = complex(inputs["id_ref"], inputs["iq_ref"]) - i
-            self.integral = self.integral + self.T * e
-        self._last = (e, i, u_ff, omega)
-        return {"u_dq": self.command(e, i, u_ff, omega) + self.extra, "extra": self.extra}
+        reference = i if not self.startup.active else complex(inputs["id_ref"], inputs["iq_ref"])
+        ff = self.feedforward_voltage(i, u_ff, omega, self.extra)
+        return {"u_dq": self.pi.sample(reference, i, ff), "extra": self.extra}
 
     def continuous(self, t, inputs):
         outputs, derivatives = {}, {}
@@ -354,55 +369,46 @@ class CurrentLoop(Loop):
         rot = _into(frame)
         self.extra = extra
         i, u_ff = current * rot, voltage * rot
-        e = 0j if not self.startup.active else complex(id_ref, iq_ref) - i
-        self._last = (e, i, u_ff, omega)
-        self._continuous_error = e
-        return self.command(e, i, u_ff, omega) + self.extra, self.extra, e
+        reference = i if not self.startup.active else complex(id_ref, iq_ref)
+        ff = self.feedforward_voltage(i, u_ff, omega, self.extra)
+        output, derivative = self.pi.flow(reference, i, ff)
+        return output, self.extra, derivative
 
-    def command(self, e: complex, i: complex, u_ff: complex, omega: float) -> complex:
-        """Voltage command (without ``extra``) from the integrator state (no integration)."""
-        u = self.kp * e + self.ki * self.integral
+    def feedforward_voltage(self, i: complex, u_ff: complex, omega: float,
+                            extra: complex = 0j) -> complex:
+        """Feed-forward and decoupling part of the voltage command."""
+        u = extra
         if self.feedforward:
             u += u_ff
         if self.decoupling:
             u += (self.r_pu + 1j * omega / self.w0 * self.x_pu) * i
         return u
 
-    def rollback(self) -> complex:
-        """Undo the last integration and return the recomputed command (without ``extra``)."""
-        self.integral = self._prev_integral
-        assert self._last is not None
-        return self.command(*self._last)
-
-    def backcalculate(self, u_cmd: complex, u_limited: complex) -> None:
-        if self.kp != 0.0:
-            self.integral = self.integral + self.T * (u_limited - u_cmd) / self.kp
-
     def get_state(self):
         return {"integral_pu": self.integral}
 
     def continuous_state_bindings(self):
-        return {"integral_pu": (self, "integral")}
+        return {"integral_pu": (self.pi, "integral")}
 
     def set_state(self, values):
         unknown = set(values) - {"integral_pu"}
         if unknown:
             raise KeyError(f"dq_current_pi has no state(s) {sorted(unknown)}")
         if "integral_pu" in values:
-            self.integral = self._prev_integral = complex(values["integral_pu"])
+            self.integral = values["integral_pu"]
 
     def reset_integrator(self):
-        self.integral = self._prev_integral = 0j
+        self.pi.reset()
 
 
 @register_loop_type
 class DCVoltageLoop(Loop):
-    """PI dc-voltage loop returning ``id_ref = ff + kp*e + ki*int(e)`` clamped to ``[floor, limit]``.
+    """PI dc-voltage loop producing ``id_ref = ff + kp*e + ki*int(e)``.
 
     ``e = u_dc - vdc_ref`` in dc pu; ``id_ref`` in ac current pu (positive = export); the
-    feed-forward ``id0_export_pu`` follows the connection ramp. ``frozen`` (set while tripped) zeroes
-    the output and holds the integrator. Named states: ``integral`` (pu*s) and, with conditional
-    anti-windup, ``clamped``.
+    feed-forward ``id0_export_pu`` follows the connection ramp. The controller constrains the
+    result to ``[floor, limit]``; this loop owns the PI and its tracking anti-windup. Named state:
+    ``integral`` (pu*s).
     """
 
     @dataclass(frozen=True, kw_only=True)
@@ -413,10 +419,9 @@ class DCVoltageLoop(Loop):
         bidirectional: bool = False  # False: id_ref limited to >= 0
         period: Optional[float] = None
         limit_pu: float = 1.0
-        antiwindup: str = "none"
+        antiwindup: bool = True
         type: str = "dc_voltage_pi"
 
-        _choices = {"antiwindup": ("none", "conditional")}
         _quantities = {"kp_pu": "current/dc_voltage", "ki_pu": "current/dc_voltage",
                        "id0_export_pu": "current", "limit_pu": "current"}
 
@@ -433,13 +438,21 @@ class DCVoltageLoop(Loop):
         self.limit = cfg.limit_pu
         self.floor = -cfg.limit_pu if cfg.bidirectional else 0.0
         self.antiwindup = cfg.antiwindup
-        self.integral = self.error = self.raw = 0.0
+        self.pi = PI(self.kp, self.ki, self.T, antiwindup=cfg.antiwindup)
+        self.error = self.raw = 0.0
         self.clamped = False
         self.n_updates = self.n_clamped = 0
         self.n_reverse = 0  # updates asking for reverse (import) current
         self.first_clamp_t: float | None = None
-        self.state_names = {"integral_pu": "integral",
-                            **({"clamped": "clamped"} if cfg.antiwindup == "conditional" else {})}
+        self.state_names = {"integral_pu": "integral"}
+
+    @property
+    def integral(self):
+        return self.pi.integral
+
+    @integral.setter
+    def integral(self, value):
+        self.pi.integral = float(value)
 
     def initial_outputs(self):
         return {"id_ref": 0.0}
@@ -451,18 +464,10 @@ class DCVoltageLoop(Loop):
         if not self.startup.active:
             self.raw = 0.0
         else:
-            if not (self.antiwindup == "conditional" and self.clamped):
-                self.integral += self.T * self.error
-            self.raw = ff + self.kp * self.error + self.ki * self.integral
-        id_ref = clamp(self.raw, self.floor, self.limit)
-        self.clamped = id_ref != self.raw
-        if self.clamped:
-            self.n_clamped += 1
-            if self.first_clamp_t is None:
-                self.first_clamp_t = t
+            self.raw = self.pi.sample(inputs["u_dc"], inputs["vdc_ref"], ff)
         if self.raw < 0.0:
             self.n_reverse += 1
-        return {"id_ref": id_ref}
+        return {"id_ref": self.raw}
 
     def continuous_state(self):
         # ``clamped`` is discrete bookkeeping in the sampled implementation.  The continuous
@@ -483,22 +488,25 @@ class DCVoltageLoop(Loop):
         """Positional form used by the construction-time compiled continuous graph."""
         ff = self.startup.value * self.cfg.id0_export_pu
         self.error = u_dc - vdc_ref
-        self.raw = 0.0 if not self.startup.active else (
-            ff + self.kp * self.error + self.ki * self.integral
-        )
-        id_ref = clamp(self.raw, self.floor, self.limit)
-        self.clamped = id_ref != self.raw
-        derivative = self.error if self.startup.active else 0.0
-        if self.antiwindup == "conditional" and self.clamped:
-            # Freeze only while the error would drive the integrator farther into the active
-            # limit.  An inward error must be allowed to release a saturated continuous PI.
-            if ((id_ref >= self.limit and derivative > 0.0)
-                    or (id_ref <= self.floor and derivative < 0.0)):
-                derivative = 0.0
-        return id_ref, derivative
+        if not self.startup.active:
+            self.raw, derivative = 0.0, 0.0
+        else:
+            self.raw, derivative = self.pi.flow(u_dc, vdc_ref, ff)
+        return self.raw, derivative
+
+    def continuous_state_bindings(self):
+        return {"integral_pu": (self.pi, "integral")}
+
+    def observe_constraint(self, t, intended, output, *, count):
+        """Record the controller-owned ``id_ref`` constraint without owning its policy."""
+        self.clamped = output != intended
+        if count and self.clamped:
+            self.n_clamped += 1
+            if self.first_clamp_t is None:
+                self.first_clamp_t = t
 
     def reset_integrator(self):
-        self.integral = 0.0
+        self.pi.reset()
         self.clamped = False
 
 
@@ -701,14 +709,20 @@ class PSC(SyncLaw):
     def __init__(self, cfg, unit, startup):
         super().__init__(cfg, unit, startup)
         self.k_p, self.k_v, self.k_vi = cfg.k_p_pu, cfg.k_v, cfg.k_vi
-        self.v_int = 0.0
+        self.voltage_pi = PI(self.k_v, self.k_vi, cfg.period)
+
+    @property
+    def v_int(self):
+        return self.voltage_pi.integral
+
+    @v_int.setter
+    def v_int(self, value):
+        self.voltage_pi.integral = float(value)
 
     def step(self, T, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
         self.omega = self.w0 + self.k_p * (p_ref_pu - p_pu)
         self.theta += T * self.omega
-        e_v = v_ref_pu - v_mag_pu
-        self.v_int += T * e_v
-        self.v_mag = v_ref_pu + self.k_v * e_v + self.k_vi * self.v_int
+        self.v_mag = self.voltage_pi.sample(v_ref_pu, v_mag_pu, v_ref_pu)
 
     def flow(self, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
         theta, v_int = self.flow_values(
@@ -719,9 +733,11 @@ class PSC(SyncLaw):
     def flow_values(self, p_pu, q_pu, v_mag_pu, v_dc_pu, p_ref_pu,
                     q_ref_pu, v_ref_pu, i_dq):
         self.omega = self.w0 + self.k_p * (p_ref_pu - p_pu)
-        e_v = v_ref_pu - v_mag_pu
-        self.v_mag = v_ref_pu + self.k_v * e_v + self.k_vi * self.v_int
-        return self.omega, e_v
+        self.v_mag, derivative = self.voltage_pi.flow(v_ref_pu, v_mag_pu, v_ref_pu)
+        return self.omega, derivative
+
+    def continuous_state_bindings(self):
+        return {"theta": (self, "theta"), "v_int_pu": (self.voltage_pi, "integral")}
 
     def continuous_path(self, p, q, voltage, current, u_dc, p_ref, q_ref, v_ref):
         return self._continuous_path(
@@ -736,7 +752,7 @@ class PSC(SyncLaw):
                       if self.k_vi > 0.0 else 0.0)
 
     def reset_integrator(self):
-        self.v_int = 0.0
+        self.voltage_pi.reset()
 
 
 @register_loop_type

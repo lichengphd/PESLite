@@ -10,7 +10,7 @@ import pytest
 import peslite
 from conftest import EXAMPLES
 from peslite.control import (ANGLE, CONTROL_INTERFACE, FREQUENCY, I, I_AB, I_DQ, LOOP_TYPES,
-                             POWER, PQ, V, V_AB, V_DQ, Loop, Measurement, SignalType, SyncLaw,
+                             POWER, PQ, V, V_AB, V_DQ, Loop, Measurement, PI, SignalType, SyncLaw,
                              register_loop_type)
 from peslite.solver.model import ConfigError
 
@@ -177,6 +177,33 @@ def test_control_ports_have_the_canonical_signal_types():
     assert not any(hasattr(peslite.control, old) for old in (
         "CURRENT", "VOLTAGE", "DC_VOLTAGE", "POWER_PU", "SignalPort",
     ))
+
+
+def test_pi_owns_tracking_antiwindup_but_not_the_output_limit():
+    pi = PI(2.0, 4.0, 0.1)
+    intended = pi.sample(2.0, 0.0)
+    integrated = pi.integral
+
+    assert intended == pytest.approx(4.8)
+    assert integrated == pytest.approx(0.2)
+    pi.antiwindup(intended, 1.0)
+    assert pi.integral == pytest.approx(integrated + 0.1 * (1.0 - intended) / 2.0)
+
+    disabled = PI(2.0, 4.0, 0.1, antiwindup=False)
+    intended = disabled.sample(2.0, 0.0)
+    integrated = disabled.integral
+    disabled.antiwindup(intended, 1.0)
+    assert disabled.integral == integrated
+
+
+def test_controller_adds_constraints_only_where_the_model_has_one(gfl):
+    sampled = peslite.Simulation(gfl()).unit().ctrl
+    continuous = peslite.Simulation(gfl(**{"units.vsc.bridge.model": "averaging"})).unit().ctrl
+
+    assert set(sampled.graph._constraints) == {"cc", "dvc"}
+    assert set(continuous.graph._constraints) == {"dvc"}
+    assert sampled.graph._constraints["cc"][2].pi is sampled.graph.nodes["cc"].pi
+    assert sampled.graph._constraints["dvc"][2].pi is sampled.graph.nodes["dvc"].pi
 
 
 def test_unknown_controller_output_boundary_port_is_rejected(gfl):

@@ -9,6 +9,7 @@ solver's kernel: the hardware adapts to its interface (:class:`Measurement`, :cl
 """
 
 from ..solver import ConfigError
+from .blocks import PI
 from .loops import (ANGLE, FREQUENCY, I, I_AB, I_DQ, LOOP_TYPES, POWER, PQ, V, V_AB, V_DQ,
                     Loop, SignalType, SyncLaw, register_loop_type)
 from .modulation import ModulationLimiter, OutputStage
@@ -16,7 +17,7 @@ from .controller import (CONTROL_INTERFACE, ControlGraph, ControlInterface, Cont
                          ControlOutput, Controller, Measurement, Startup, UniteType,
                          default_wiring, make_controller)
 
-__all__ = ["Loop", "SyncLaw", "SignalType", "ConfigError",
+__all__ = ["Loop", "SyncLaw", "PI", "SignalType", "ConfigError",
            "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
            "ANGLE", "FREQUENCY", "POWER", "PQ",
            "LOOP_TYPES", "register_loop_type", "ControlInterface", "CONTROL_INTERFACE",

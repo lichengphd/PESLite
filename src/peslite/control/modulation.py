@@ -1,8 +1,8 @@
 """The output stage of the controller: from the dq voltage command to the duty ratios of the three phases.
 
 The command is rotated into alpha-beta, turned into modulating signals by the PWM method (``spwm``,
-``svpwm`` or a custom one), limited, and fed back to the current loop when the limit is reached
-(anti-windup).
+``svpwm`` or a custom one), and limited. Controller-level command constraints and PI anti-windup
+are handled before this final output stage.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from typing import Any, Optional, Protocol
 import numpy as np
 from numpy.typing import NDArray
 
-from .blocks import abc2complex, complex2abc, peak_abs, phases
+from .blocks import complex2abc, peak_abs, phases
 
 __all__ = ["PWMMethod", "SignalLimiter", "PWM_METHODS", "spwm", "svpwm", "ModulationLimiter", "OutputStage"]
 
@@ -113,11 +113,19 @@ class OutputStage:
         self.m_abc = np.zeros(3)
         self._memo = None  # cached evaluation for the current control instant
         self._prepared = None
+        self._command_saturated = False
 
     def new_instant(self) -> None:
         """Start a new control instant (clear the cached evaluation)."""
         self._memo = None
         self._prepared = None
+
+    def command_limit(self, u_dc_pu: float) -> float | None:
+        """Circular dq-command limit for the configured standard PWM, otherwise ``None``."""
+        if not self._trusted_pwm or not self._standard_limiter:
+            return None
+        factor = 1.0 / math.sqrt(3.0) if self.pwm_method is svpwm else 0.5
+        return self.limiter.limit * max(0.0, u_dc_pu) * self.v_dc_base / self.v_base * factor
 
     def _evaluate(self, command: complex, rot: complex, u_dc: float) -> tuple[np.ndarray, bool]:
         """Modulating signals and saturation for a dq command (pu), cached for this control instant."""
@@ -147,25 +155,19 @@ class OutputStage:
         self._memo = (command, (rot, u_dc), m, saturated)
         return m, saturated
 
-    def modulate(self, t: float, u_cmd_dq: complex, theta: float, u_dc: float, cc: Any = None,
-                 extra_dq: Optional[complex] = None, *, count: bool = True) -> np.ndarray:
-        """Convert a dq voltage command to duty ratios, with the current loop's anti-windup.
+    def modulate(self, t: float, u_cmd_dq: complex, theta: float, u_dc: float, *,
+                 count: bool = True) -> np.ndarray:
+        """Convert a dq voltage command to duty ratios.
 
-        u_cmd_dq, extra_dq: voltage command (pu, AC base); theta: frame angle (rad); u_dc: dc voltage (pu, DC base).
-        cc: current loop for anti-windup (``"conditional"``: roll back its integration, or ``"backcalc"``).
-        count: ``False`` leaves the controller-update and saturation counters unchanged.
+        ``u_cmd_dq`` is in pu on the AC base; ``theta`` is in rad and ``u_dc`` is in pu on the
+        DC base. ``count=False`` leaves the controller-update and saturation counters unchanged.
         """
         rot = complex(math.cos(theta), math.sin(theta))
         u_dc_pu = u_dc
         u_dc = u_dc * self.v_dc_base  # PWM receives DC volts; loop feedback stays pu
-        u_dq = u_cmd_dq if extra_dq is None else u_cmd_dq + extra_dq
+        u_dq = u_cmd_dq
         m_abc, saturated = self._evaluate(u_dq, rot, u_dc)
-        if cc is not None and cc.antiwindup == "conditional" and saturated:
-            u_dq = cc.rollback() if extra_dq is None else cc.rollback() + extra_dq
-            m_abc, saturated = self._evaluate(u_dq, rot, u_dc)
-        if cc is not None and cc.antiwindup == "backcalc" and saturated:
-            u_lim_dq = abc2complex(m_abc) * u_dc / (2.0 * self.v_base) * complex(math.cos(theta), -math.sin(theta))
-            cc.backcalculate(u_dq, u_lim_dq)
+        saturated = saturated or self._command_saturated
         self.m_abc, self.saturated = m_abc, saturated
         duty = 0.5 * (1.0 + self.m_abc)
         self._prepared = ((u_dq, theta, u_dc_pu), duty)

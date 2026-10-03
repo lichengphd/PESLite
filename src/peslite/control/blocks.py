@@ -15,7 +15,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 __all__ = ["A120", "abc2complex", "complex2abc", "phases", "clamp", "smoothstep", "peak_abs",
-           "LowPass1", "HighPass1", "HoldTimer", "MovingWindow"]
+           "PI", "LowPass1", "HighPass1", "HoldTimer", "MovingWindow"]
 
 
 # ------------------------------------------------------------------ space vectors
@@ -66,6 +66,41 @@ def peak_abs(values) -> float:
         if a > peak or a != a:
             peak = a
     return float(peak)
+
+
+# ------------------------------------------------------------------ control law
+
+class PI:
+    """PI law. Output constraints are owned by the controller; tracking stays here."""
+
+    def __init__(self, kp: float, ki: float, period: float | None, *,
+                 antiwindup: bool = True, initial=0.0) -> None:
+        self.kp, self.ki, self.T = float(kp), float(ki), period
+        self.antiwindup_enabled = bool(antiwindup)
+        self.integral = initial
+
+    def sample(self, r, fb, ff=0.0):
+        """Advance one sampled step and return the unconstrained intended output."""
+        error = r - fb
+        self.integral += self.T * error
+        return ff + self.kp * error + self.ki * self.integral
+
+    def flow(self, r, fb, ff=0.0):
+        """Return the unconstrained output and integral derivative."""
+        error = r - fb
+        return ff + self.kp * error + self.ki * self.integral, error
+
+    def antiwindup(self, intended, output) -> None:
+        """Apply sampled tracking anti-windup after a controller constraint acts."""
+        if self.antiwindup_enabled:
+            self.integral += self.T * (output - intended) / self.kp
+
+    def antiwindup_flow(self, intended, output):
+        """Return the continuous-time tracking term for the integral derivative."""
+        return ((output - intended) / self.kp) if self.antiwindup_enabled else 0.0
+
+    def reset(self) -> None:
+        self.integral = self.integral * 0
 
 
 # ------------------------------------------------------------------ filters and timers

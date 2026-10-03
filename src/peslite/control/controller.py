@@ -21,8 +21,8 @@ from numpy.typing import NDArray
 
 from ..solver.model import Bag, ConfigError, gather, scatter
 from .blocks import abc2complex, peak_abs, phases, smoothstep
-from .loops import (ANGLE, FREQUENCY, I, I_AB, LOOP_TYPES, POWER, V, V_AB, V_DQ, Loop,
-                    SignalType, SyncLaw)
+from .loops import (ANGLE, FREQUENCY, I, I_AB, LOOP_TYPES, POWER, V, V_AB, V_DQ,
+                    CurrentLoop, DCVoltageLoop, Loop, SignalType, SyncLaw)
 from .modulation import CONFIGURED, OutputStage
 
 __all__ = ["Measurement", "ControlMeasurement", "ControlOutput", "Controller", "Startup",
@@ -107,6 +107,48 @@ class ControlInterface:
 
     inputs: Mapping[str, SignalType]
     outputs: Mapping[str, SignalType]
+
+
+class _PIOutputConstraint:
+    """Controller-owned scalar/magnitude constraint with PI-owned tracking correction."""
+
+    def __init__(self, pi, limit: float, *, lower=None, active=None, observer=None):
+        self.pi = pi
+        self.limit = float(limit)
+        self.lower = lower
+        self.active = active
+        self.observer = observer
+        self.saturated = False
+        if not math.isfinite(self.limit) or self.limit <= 0.0:
+            raise ConfigError("a controller output limit must be finite and positive")
+        if lower is not None and (not math.isfinite(lower) or lower >= self.limit):
+            raise ConfigError("a controller output lower limit must be finite and below its upper limit")
+        if pi.antiwindup_enabled and pi.kp == 0.0:
+            raise ConfigError("tracking anti-windup requires a nonzero proportional gain")
+
+    def _apply(self, intended):
+        if self.lower is not None:
+            return min(self.limit, max(self.lower, intended))
+        magnitude = abs(intended)
+        return intended * (self.limit / magnitude) if magnitude > self.limit else intended
+
+    def sample(self, t, intended):
+        output = self._apply(intended)
+        self.saturated = output != intended
+        if self.saturated and (self.active is None or self.active()):
+            self.pi.antiwindup(intended, output)
+        if self.observer is not None:
+            self.observer(t, intended, output, count=True)
+        return output
+
+    def flow(self, t, intended, derivative):
+        output = self._apply(intended)
+        self.saturated = output != intended
+        if self.saturated and (self.active is None or self.active()):
+            derivative += self.pi.antiwindup_flow(intended, output)
+        if self.observer is not None:
+            self.observer(t, intended, output, count=False)
+        return output, derivative
 
 
 # ------------------------------------------------------------------ the start-up sequence
@@ -276,6 +318,7 @@ class ControlGraph:
         self._t0 = cfg.pwm.grid_offset
         self.values: dict[str, Any] = {}
         self._out_specs: dict[str, tuple] = {}
+        self._constraints: dict[str, tuple[str, str, _PIOutputConstraint]] = {}
         self.updated = set()
         refs = cfg.ctrl.references
         self.references = {f.name: getattr(refs, f.name) for f in fields(refs)}
@@ -296,6 +339,7 @@ class ControlGraph:
             self.periods[name] = loop.period
             self._store(name, node.initial_outputs())
             types.update({f"{name}.{port}": spec for port, spec in node.outputs.items()})
+        self._updates = {name: node.update for name, node in self.nodes.items()}
         dependencies = {name: set() for name in self.nodes}
         targets = set()
         for name, node in self.nodes.items():
@@ -372,6 +416,31 @@ class ControlGraph:
         self._every_interrupt = (None if self.continuous else
                                  frozenset(name for name, every in self._every)
                                  if all(every == 1 for _name, every in self._every) else None)
+
+    def constrain(self, name, port, state, constraint):
+        """Attach a controller-owned output constraint to a loop and its PI state derivative."""
+        node = self.nodes.get(name)
+        if node is None or port not in node.outputs:
+            raise ConfigError(f"controller constraint: unknown output {name}.{port}")
+        if state not in node.continuous_state():
+            raise ConfigError(f"controller constraint: {name} has no PI state {state!r}")
+        self._constraints[name] = (port, state, constraint)
+        update = node.update
+
+        def constrained_update(t, inputs):
+            outputs = update(t, inputs)
+            outputs[port] = constraint.sample(t, outputs[port])
+            return outputs
+
+        self._updates[name] = constrained_update
+        if self.continuous:
+            self._prepare_continuous_buffers()
+
+    def clear_constraint(self, name):
+        if self._constraints.pop(name, None) is not None:
+            self._updates[name] = self.nodes[name].update
+            if self.continuous:
+                self._prepare_continuous_buffers()
 
     @staticmethod
     def _continuous_components(dependencies):
@@ -530,6 +599,10 @@ class ControlGraph:
             environment[f"_inputs{suffix}"] = inputs
             environment[f"_outputs{suffix}"] = outputs
             environment[f"_flow{suffix}"] = flow
+            constrained = self._constraints.get(name)
+            if constrained is not None:
+                constrained_port, constrained_state, constraint = constrained
+                environment[f"_constraint{suffix}"] = constraint.flow
             sources = {}
             for port, kind, key in wiring:
                 if kind == _HELD:
@@ -548,6 +621,13 @@ class ControlGraph:
                 body.append(
                     f"_evaluate{suffix}(t, _inputs{suffix}, _outputs{suffix}, _flow{suffix})"
                 )
+                if constrained is not None:
+                    body.append(
+                        f"_outputs{suffix}[{constrained_port!r}], "
+                        f"_flow{suffix}[{constrained_state!r}] = _constraint{suffix}("
+                        f"t, _outputs{suffix}[{constrained_port!r}], "
+                        f"_flow{suffix}[{constrained_state!r}])"
+                    )
                 body.extend(
                     f"_values[{key!r}] = _outputs{suffix}[{port!r}]"
                     for port, key, _complex_value in out_specs
@@ -563,13 +643,25 @@ class ControlGraph:
                     f"{result} = _evaluate{suffix}("
                     + ", ".join(sources[port] for port in path_ports) + ")"
                 )
-                for position, (_port, key, _complex_value) in enumerate(out_specs):
-                    body.append(f"_values[{key!r}] = {result}[{position}]")
+                output_values = {port: f"{result}[{position}]"
+                                 for position, (port, _key, _complex_value) in enumerate(out_specs)}
                 offset = len(out_specs)
-                for position, (_local, key) in enumerate(flow_specs, start=offset):
+                flow_values = {local: f"{result}[{position}]"
+                               for position, (local, _key) in enumerate(flow_specs, start=offset)}
+                if constrained is not None:
+                    limited = f"_limited{suffix}"
+                    body.append(
+                        f"{limited} = _constraint{suffix}(t, "
+                        f"{output_values[constrained_port]}, {flow_values[constrained_state]})"
+                    )
+                    output_values[constrained_port] = f"{limited}[0]"
+                    flow_values[constrained_state] = f"{limited}[1]"
+                for port, key, _complex_value in out_specs:
+                    body.append(f"_values[{key!r}] = {output_values[port]}")
+                for local, key in flow_specs:
                     body.append(
                         f"derivatives[{self._continuous_derivative_index[key]}] = "
-                        f"{result}[{position}]"
+                        f"{flow_values[local]}"
                     )
         source = "def run(t, meas, derivatives):\n" + "\n".join(
             "    " + line for line in (body or ["pass"])
@@ -619,6 +711,7 @@ class ControlGraph:
                 f"states than before ({exc}), so it cannot continue from them") from None
         fresh.retuned(old)
         self.nodes[name] = fresh
+        self._updates[name] = fresh.update
         if self.continuous:
             self._prepare_continuous_buffers()
         if self.on_retune is not None:
@@ -705,17 +798,17 @@ class ControlGraph:
         due = self.due(t)
         if not due:
             return updated
-        nodes, gather_, immediate = self.nodes, self._gather, self._immediate
+        updates, gather_, immediate = self._updates, self._gather, self._immediate
         for name in self.order:
             if name not in due:
                 continue
-            self._store(name, nodes[name].update(t, gather_(immediate[name], meas)))
+            self._store(name, updates[name](t, gather_(immediate[name], meas)))
             updated.add(name)
         if finalize is not None:
             finalize(t, meas, updated)
         for name in due:
             if name in self._latching:
-                nodes[name].latch(gather_(self._wiring[name], meas))
+                self.nodes[name].latch(gather_(self._wiring[name], meas))
         return updated
 
     def continuous_outputs(self, t, meas, only=None, derivatives=None):
@@ -755,6 +848,10 @@ class ControlGraph:
                     else:
                         inputs[port] = key
                 evaluate(t, inputs, outputs, flow)
+                constrained = self._constraints.get(_name)
+                if constrained is not None:
+                    port, state, constraint = constrained
+                    outputs[port], flow[state] = constraint.flow(t, outputs[port], flow[state])
                 for port, key, _complex_value in out_specs:
                     values[key] = outputs[port]
                 for local, key in flow_specs:
@@ -772,6 +869,10 @@ class ControlGraph:
                         else:
                             inputs[port] = key
                     evaluate(t, inputs, outputs, flow)
+                    constrained = self._constraints.get(_name)
+                    if constrained is not None:
+                        port, state, constraint = constrained
+                        outputs[port], flow[state] = constraint.flow(t, outputs[port], flow[state])
                     for port, key, _complex_value in out_specs:
                         values[key] = outputs[port]
                     for local, key in flow_specs:
@@ -929,10 +1030,7 @@ class UniteType:
                          if value == r and (port is None or port in graph.nodes[name].inputs)), None)
 
         self._terminal = graph.outputs["u_dq"].partition(".")[0]
-        self._terminal_key = f"{self._terminal}.u_dq"
         self._terminal_in_graph = self._terminal in graph.nodes
-        self._terminal_is_cc = self._terminal_in_graph and role[self._terminal] == "current"
-        self._find_terminal()
         graph.on_retune = self._loop_retuned
         self._frame_key = f"{graph.outputs['theta'].partition('.')[0]}.frame"
         self._dc, self._sync = first("dc_voltage"), first("sync")
@@ -944,8 +1042,44 @@ class UniteType:
                               if self._frame_cc is not None else None)
         self._is_gfl = cfg.ctrl.type == "gfl"
         self._p_key, self._q_key, self._v_ref_key = f"{first('power')}.p", f"{first('power')}.q", f"{self._sync}.v_ref"
+        self._terminal_constraint = None
+        self._terminal_limit_scale = None
+        self._configure_constraint(self._dc)
+        self._configure_constraint(self._terminal)
         if self.continuous:
             self._build_continuous_state()
+
+    def _configure_constraint(self, name):
+        """Build one controller-owned output constraint after graph construction or retuning."""
+        if name is None:
+            return
+        graph = self.graph
+        graph.clear_constraint(name)
+        node = graph.nodes.get(name)
+        if name == self._terminal:
+            self._terminal_constraint = None
+            self._terminal_limit_scale = None
+            if self.stage is not None:
+                self.stage._command_saturated = False
+        if isinstance(node, DCVoltageLoop):
+            graph.constrain(
+                name, "id_ref", "integral_pu",
+                _PIOutputConstraint(
+                    node.pi, node.limit, lower=node.floor,
+                    observer=node.observe_constraint,
+                ),
+            )
+        if (not self.continuous and name == self._terminal
+                and isinstance(node, CurrentLoop) and self.stage is not None):
+            limit = self.stage.command_limit(1.0)
+            if limit is not None:
+                constraint = _PIOutputConstraint(
+                    node.pi, limit,
+                    active=lambda: self.startup.active,
+                )
+                graph.constrain(name, "u_dq", "integral_pu", constraint)
+                self._terminal_constraint = constraint
+                self._terminal_limit_scale = limit
 
     def _build_continuous_state(self):
         """Create the fixed ODE state layout from each loop's continuous state declaration."""
@@ -1023,13 +1157,9 @@ class UniteType:
                 if key in self.state_names:
                     setattr(self.state, key, value)
 
-    def _find_terminal(self, name=None):
-        """Refresh the terminal loop reference after a loop is rebuilt."""
-        self._terminal_node = self.graph.nodes.get(self._terminal)
-
     def _loop_retuned(self, name=None):
-        """Refresh cached loop references and continuous state bindings after a set event."""
-        self._find_terminal(name)
+        """Rebuild the loop's constraint and continuous state bindings after a set event."""
+        self._configure_constraint(name)
         if self.continuous:
             if self.graph.continuous_state_names != self.state_names:
                 raise ConfigError("a set event cannot reorder continuous controller states")
@@ -1122,20 +1252,16 @@ class UniteType:
         """Enable per-interrupt log dictionaries when a run records or watches them."""
         self.logging = bool(enabled)
     def _accept_command(self, t, meas, updated):
-        """Update the held angle, frequency and voltage command, applying anti-windup feedback."""
+        """Update the held angle, frequency and constrained voltage command."""
         graph = self.graph
         self.theta = float(graph.output("theta", meas))
         self.omega = float(graph.output("omega", meas))
         if self._terminal in updated or (updated and not self._terminal_in_graph):
             self.u_cmd = complex(graph.output("u_dq", meas))
             self.command_theta = self.theta
-            cc = self._terminal_node if self._terminal_is_cc else None
-            extra = cc.extra if cc is not None else 0j
-            self.stage.modulate(t, self.u_cmd - extra, self.command_theta, meas.u_dc,
-                                cc=cc, extra_dq=extra, count=False)
-            if cc is not None and cc.antiwindup == "conditional":
-                self.u_cmd = cc.command(*cc._last) + cc.extra
-                graph.values[self._terminal_key] = self.u_cmd
+            if self._terminal_constraint is not None:
+                self.stage._command_saturated = self._terminal_constraint.saturated
+            self.stage.modulate(t, self.u_cmd, self.command_theta, meas.u_dc, count=False)
 
     def __call__(self, t, meas):
         if self.continuous:
@@ -1145,6 +1271,10 @@ class UniteType:
         if startup.in_progress:
             startup.advance()
         self.stage.new_instant()
+        if self._terminal_constraint is not None:
+            self._terminal_constraint.limit = (
+                self._terminal_limit_scale * max(0.0, control_meas.u_dc)
+            )
         self.graph.update(t, control_meas, finalize=self._accept_command)
         frame = self.graph.values.get(self._frame_key, self.theta)
         if self._frame_cc is not None:

@@ -922,13 +922,13 @@ class _ContinuousUnitGenerator(_ProtectionGenerator):
             uff = self._rotate(inp(name, "v"), frame)
             body = [f"const Complex i = {i};", f"const Complex u_ff = {uff};",
                     f"const Complex error = {self.m('startup_run')} ? Complex{{{inp(name, 'id_ref')}, {inp(name, 'iq_ref')}}} - i : Complex{{0.0, 0.0}};",
-                    f"Complex command = {_number(node.kp)} * error + {_number(node.ki)} * {integral};"]
+                    f"Complex feedforward = {inp(name, 'extra')};"]
             if node.feedforward:
-                body.append("command += u_ff;")
+                body.append("feedforward += u_ff;")
             if node.decoupling:
-                body.append(f"command += Complex{{{_number(node.r_pu)}, {omega} / {_number(node.w0)} * {_number(node.x_pu)}}} * i;")
+                body.append(f"feedforward += Complex{{{_number(node.r_pu)}, {omega} / {_number(node.w0)} * {_number(node.x_pu)}}} * i;")
             body += [f"{g(name + '.extra')} = {inp(name, 'extra')};",
-                     f"{g(name + '.u_dq')} = command + {g(name + '.extra')};",
+                     f"{g(name + '.u_dq')} = feedforward + {_number(node.kp)} * error + {_number(node.ki)} * {integral};",
                      f"{deriv(name, 'integral_pu')} = error;"]
         elif isinstance(node, DCVoltageLoop):
             integral = state(name, "integral_pu")
@@ -938,8 +938,8 @@ class _ContinuousUnitGenerator(_ProtectionGenerator):
             body = [f"const double error = {error};", f"const double raw = {raw};",
                     f"const double value = std::clamp(raw, {_number(node.floor)}, {_number(node.limit)});",
                     "double flow = " + self.m("startup_run") + " ? error : 0.0;",
-                    *([f"if ((value >= {_number(node.limit)} && flow > 0.0) || (value <= {_number(node.floor)} && flow < 0.0)) flow = 0.0;"]
-                      if node.antiwindup == "conditional" else []),
+                    *([f"if (value != raw) flow += (value - raw) / {_number(node.kp)};"]
+                      if node.antiwindup else []),
                     f"{g(name + '.id_ref')} = value;", f"{deriv(name, 'integral_pu')} = flow;"]
         elif isinstance(node, PowerLoop):
             power = f"({inp(name, 'v')} * std::conj({inp(name, 'i')}))"
@@ -1249,6 +1249,7 @@ class _UnitGenerator(_ProtectionGenerator):
             f"bool {self.m('pending_valid')} = false;",
             f"double {self.m('last_ctrl_t')} = -std::numeric_limits<double>::infinity();",
             f"double {self.m('last_m_max')} = 0.0;",
+            f"bool {self.m('command_saturated')} = false;",
             f"std::size_t {self.m('mod_updates')} = {int(getattr(ctrl.stage, 'n_updates', 0))};",
             f"std::size_t {self.m('mod_saturated')} = {int(getattr(ctrl.stage, 'n_saturated', 0))};",
             f"double {self.m('mod_first_t')} = {_number(getattr(ctrl.stage, 'first_saturation_t', math.nan) or math.nan)};",
@@ -1266,12 +1267,7 @@ class _UnitGenerator(_ProtectionGenerator):
                 if node.u_g is not None:
                     lines.append(f"double {self.node(loop_name, 'u_g')} = {_number(node.u_g)};")
             elif isinstance(node, CurrentLoop):
-                lines += [f"Complex {self.node(loop_name, 'integral')} = {_complex(node.integral)};",
-                          f"Complex {self.node(loop_name, 'previous_integral')} = {_complex(node._prev_integral)};",
-                          f"Complex {self.node(loop_name, 'last_error')}{{}};",
-                          f"Complex {self.node(loop_name, 'last_i')}{{}};",
-                          f"Complex {self.node(loop_name, 'last_u_ff')}{{}};",
-                          f"double {self.node(loop_name, 'last_omega')} = {_number(node.w0)};"]
+                lines.append(f"Complex {self.node(loop_name, 'integral')} = {_complex(node.integral)};")
             elif isinstance(node, DCVoltageLoop):
                 lines += [f"double {self.node(loop_name, 'integral')} = {_number(node.integral)};",
                           f"bool {self.node(loop_name, 'clamped')} = {'true' if node.clamped else 'false'};",
@@ -1442,11 +1438,13 @@ class _UnitGenerator(_ProtectionGenerator):
             ff = f"{self.m('startup_value')} * {_number(node.cfg.id0_export_pu)}"
             body += [f"const double error = {inp(loop_name, 'u_dc')} - {inp(loop_name, 'vdc_ref')};",
                      f"if ({self.m('startup_run')}) {{",
-                     f"    if (!({'true' if node.antiwindup == 'conditional' else 'false'} && {clamped})) {integral} += {_number(node.T)} * error;",
+                     f"    {integral} += {_number(node.T)} * error;",
                      f"}}",
                      f"const double raw = {self.m('startup_run')} ? ({ff} + {_number(node.kp)} * error + {_number(node.ki)} * {integral}) : 0.0;",
                      f"const double value = std::clamp(raw, {_number(node.floor)}, {_number(node.limit)});",
                      f"{clamped} = value != raw;",
+                     *([f"if ({clamped}) {integral} += {_number(node.T / node.kp)} * (value - raw);"]
+                       if node.antiwindup else []),
                      f"++{m(loop_name, 'n_updates')};",
                      f"if ({clamped}) {{ ++{m(loop_name, 'n_clamped')}; if (!std::isfinite({m(loop_name, 'first_clamp_t')})) {m(loop_name, 'first_clamp_t')} = t; }}",
                      f"{g(loop_name + '.id_ref')} = value;"]
@@ -1535,24 +1533,35 @@ class _UnitGenerator(_ProtectionGenerator):
     def _current_loop(self, loop_name: str, node: CurrentLoop) -> list[str]:
         m, g, inp = self.node, self.g, self.input
         integral = m(loop_name, "integral")
-        previous = m(loop_name, "previous_integral")
-        error, current, uff, omega = (m(loop_name, key) for key in
-                                      ("last_error", "last_i", "last_u_ff", "last_omega"))
         rotate = self._complex_rotate
-        return [
+        lines = [
             f"const Complex rotation{{std::cos({inp(loop_name, 'frame')}), -std::sin({inp(loop_name, 'frame')})}};",
             f"const Complex i = {inp(loop_name, 'i')} * rotation;",
             f"const Complex u_ff = {inp(loop_name, 'v')} * rotation;",
-            f"{previous} = {integral};",
             f"const Complex e = {self.m('startup_run')} ? Complex{{{inp(loop_name, 'id_ref')}, {inp(loop_name, 'iq_ref')}}} - i : Complex{{0.0, 0.0}};",
             f"if ({self.m('startup_run')}) {integral} += {_number(node.T)} * e;",
-            f"{error} = e; {current} = i; {uff} = u_ff; {omega} = {inp(loop_name, 'omega')};",
-            f"Complex command = {_number(node.kp)} * e + {_number(node.ki)} * {integral};",
-            *( ["command += u_ff;"] if node.feedforward else [] ),
-            *( [f"command += Complex{{{_number(node.r_pu)}, {omega} / {_number(node.w0)} * {_number(node.x_pu)}}} * i;"] if node.decoupling else [] ),
             f"{g(loop_name + '.extra')} = {inp(loop_name, 'extra')};",
-            f"{g(loop_name + '.u_dq')} = command + {g(loop_name + '.extra')};",
+            f"Complex feedforward = {g(loop_name + '.extra')};",
+            *( ["feedforward += u_ff;"] if node.feedforward else [] ),
+            *( [f"feedforward += Complex{{{_number(node.r_pu)}, {inp(loop_name, 'omega')} / {_number(node.w0)} * {_number(node.x_pu)}}} * i;"] if node.decoupling else [] ),
+            f"Complex intended = feedforward + {_number(node.kp)} * e + {_number(node.ki)} * {integral};",
         ]
+        constrained = self.graph._constraints.get(loop_name)
+        if constrained is not None and constrained[0] == "u_dq":
+            limit = self.ctrl.stage.command_limit(1.0)
+            lines += [
+                f"const double command_limit = {_number(limit)} * std::max(0.0, meas_u_dc);",
+                "const double command_magnitude = std::abs(intended);",
+                "const bool command_saturated = command_magnitude > command_limit;",
+                "Complex output = command_saturated ? intended * (command_limit / command_magnitude) : intended;",
+                *([f"if ({self.m('startup_run')} && command_saturated) {integral} += {_number(node.T / node.kp)} * (output - intended);"]
+                  if node.antiwindup else []),
+                f"{self.m('command_saturated')} = command_saturated;",
+                f"{g(loop_name + '.u_dq')} = output;",
+            ]
+        else:
+            lines.append(f"{g(loop_name + '.u_dq')} = intended;")
+        return lines
 
     def controller_method(self) -> str:
         lines = [f"void controller_{self.tag}(double t) {{",
@@ -1641,8 +1650,9 @@ class _UnitGenerator(_ProtectionGenerator):
                   f"{indent}    if (peak > 0.0) for (int k = 0; k < 3; ++k) modulation[k] = phase[k] / peak;",
                   f"{indent}}}",
                   f"{indent}const double peak_m = std::max({{std::abs(modulation[0]), std::abs(modulation[1]), std::abs(modulation[2])}});",
-                  f"{indent}const bool saturated = peak_m > {_number(self.cfg.pwm.modulation_limit)};",
-                  f"{indent}if (saturated) for (double& value : modulation) value *= {_number(self.cfg.pwm.modulation_limit)} / peak_m;",
+                  f"{indent}const bool output_saturated = peak_m > {_number(self.cfg.pwm.modulation_limit)};",
+                  f"{indent}if (output_saturated) for (double& value : modulation) value *= {_number(self.cfg.pwm.modulation_limit)} / peak_m;",
+                  f"{indent}const bool saturated = {self.m('command_saturated')} || output_saturated;",
                   f"{indent}{self.m('last_m_max')} = std::min(peak_m, {_number(self.cfg.pwm.modulation_limit)});",
                   f"{indent}++{self.m('mod_updates')};",
                   f"{indent}if (saturated) {{ ++{self.m('mod_saturated')}; if (!std::isfinite({self.m('mod_first_t')})) {self.m('mod_first_t')} = t; }}",
@@ -1834,8 +1844,7 @@ class _UnitGenerator(_ProtectionGenerator):
             if isinstance(node, SRFPLL):
                 lines.append(f"{self.node(name, 'integral')} = 0.0;")
             elif isinstance(node, CurrentLoop):
-                lines += [f"{self.node(name, 'integral')} = Complex{{0.0, 0.0}};",
-                          f"{self.node(name, 'previous_integral')} = Complex{{0.0, 0.0}};"]
+                lines.append(f"{self.node(name, 'integral')} = Complex{{0.0, 0.0}};")
             elif isinstance(node, DCVoltageLoop):
                 lines += [f"{self.node(name, 'integral')} = 0.0;",
                           f"{self.node(name, 'clamped')} = false;"]

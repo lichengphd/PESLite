@@ -188,6 +188,7 @@ def test_system_switches_units_sources_and_loads():
 def test_system_applies_retunes_and_control_loops_keep_their_state():
     tree = _line(_load(_tree()))
     tree["units"]["vsc"]["bridge"] = {"model": "pwm_averaging"}
+    tree["units"]["vsc"]["ctrl"]["loops"]["dvc"]["antiwindup"] = 0
     tree["events"]["connect_vsc"].update(t=0.0, ramp=0.0)
     tree["events"]["retune"] = {"type": "set", "t": 0.001, "set": {
         "buses.pcc.c_pu": 0.03,
