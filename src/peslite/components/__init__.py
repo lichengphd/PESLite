@@ -6,7 +6,7 @@ models use the ADC (:mod:`.adc`) and own their PWM timing/register implementatio
 :mod:`.pwm`; the ideal averaging bridge connects directly to continuous controller equations.
 """
 
-from ..solver import ConfigError
+from ..solver import Bag, ConfigError, PowerPort, StoragePort
 from .network import (ELEMENT_TYPES, Element, Load, RCNode, RLBranch, Terminal, ThreePhaseSource,
                       register_element_type)
 from .converter import (AveragingBridge, Bridge, PWMBridge, DCCapacitor, DCCurrentSource, DCLink,
@@ -14,7 +14,8 @@ from .converter import (AveragingBridge, Bridge, PWMBridge, DCCapacitor, DCCurre
 from .adc import ADC, MeasurementPorts
 from .pwm import ZOH, CarrierComparison, PWM, SwitchingSequence, SynchronousCarrier, make_modulator
 
-__all__ = ["Terminal", "ThreePhaseSource", "RLBranch", "RCNode", "Element", "ELEMENT_TYPES", "ConfigError",
+__all__ = ["Terminal", "ThreePhaseSource", "RLBranch", "RCNode", "Element", "ELEMENT_TYPES",
+           "Bag", "ConfigError", "PowerPort", "StoragePort",
            "register_element_type", "Load", "Bridge", "PWMBridge", "make_bridge", "DCLink",
            "DCCapacitor", "DCCurrentSource", "DCVoltageSource", "make_dclink", "ADC",
            "MeasurementPorts", "AveragingBridge", "PWM", "SwitchingSequence",

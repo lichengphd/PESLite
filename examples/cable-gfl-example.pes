@@ -1,0 +1,44 @@
+# A grid-following converter connected to a stiff grid through the custom distributed cable model.
+base: {s_base: 10.0e6, v_ll_rms: 10.0e3, f0: 50.0}
+buses:
+  grid_bus: {c_pu: 0.02, r_d_pu: 0.5}
+  pcc: {c_pu: 0.02, r_d_pu: 0.5}
+sources:
+  grid: {bus: grid_bus, x_pu: 0.1, r_pu: 0.01}
+elements:
+  cable1:
+    type: cable
+    bus1: grid_bus
+    bus2: pcc
+    length_km: 5.0
+    r_per_km: 0.05       # ohm/km
+    l_per_km: 0.4e-3     # H/km
+    c_per_km: 0.2e-6     # F/km
+    g_per_km: 1.0e-8     # S/km
+    sections: 2
+units:
+  vsc:
+    bus: pcc
+    ac_filter: {l_f_pu: 0.2, r_f_pu: 0.01}
+    dclink:
+      vdc_ref: 20000.0
+      capacitor: {c_pu: 35.0, r_esr_pu: 0.001}
+      source: {type: current, i_pu: 0.9}
+    pwm: {f_sw: 20000.0, modulation_limit: 0.95}
+    ctrl:
+      type: gfl
+      loops:
+        pll: {type: srf_pll, kp_pu: 20.0, ki_pu: 1200.0}
+        cc: {type: dq_current_pi, bandwidth: 200.0}
+        dvc: {type: dc_voltage_pi, kp_pu: 0.8, ki_pu: 90.0, limit_pu: 1.15,
+              id0_export_pu: 0.9}
+    protection: {overcurrent: {enable: 1, limit_pu: 1.5}}
+events:
+  connect_vsc: {type: connect, target: vsc, t: 0.0, ramp: 0.01}
+simulation:
+  t_end: 0.1
+  solver: {dt: 25e-6}
+  output: {record_every: 10}
+meta:
+  title: Cable-connected grid-following converter
+  description: A GFL converter connected through a two-terminal distributed R-L/G-C cable add-on.

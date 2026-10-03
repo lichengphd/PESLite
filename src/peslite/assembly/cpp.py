@@ -7,10 +7,13 @@ standard library and never calls Python.
 
 from __future__ import annotations
 
+import copy
 import json
 import math
+import numbers
 import re
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, fields
 from pathlib import Path
 from types import SimpleNamespace
@@ -67,6 +70,170 @@ def _fields(record: Any) -> tuple[str, ...]:
 def _complex(value: complex) -> str:
     value = complex(value)
     return f"Complex{{{_number(value.real)}, {_number(value.imag)}}}"
+
+
+class _Expression:
+    """One scalar expression traced from an ordinary custom subsystem equation.
+
+    This exists only while generating C++; generated simulators contain the resulting static
+    expression and no tracing or dispatch machinery.
+    """
+
+    __slots__ = ("code", "kind")
+    __array_priority__ = 1000
+
+    def __init__(self, code: str, kind: str) -> None:
+        self.code, self.kind = code, kind
+
+    @staticmethod
+    def of(value: Any) -> "_Expression":
+        if isinstance(value, _Expression):
+            return value
+        if isinstance(value, bool):
+            return _Expression("true" if value else "false", "bool")
+        if isinstance(value, numbers.Real):
+            return _Expression(_number(float(value)), "real")
+        if isinstance(value, numbers.Complex):
+            return _Expression(_complex(complex(value)), "complex")
+        raise TypeError(f"unsupported equation value {value!r} ({type(value).__name__})")
+
+    @staticmethod
+    def _result(left: "_Expression", right: "_Expression") -> str:
+        return "complex" if "complex" in (left.kind, right.kind) else "real"
+
+    def _binary(self, other: Any, op: str) -> "_Expression":
+        right = self.of(other)
+        if op in ("+", "-") and right.code == "0.0":
+            return self
+        if op == "+" and self.code == "0.0":
+            return right
+        if op == "*" and right.code == "1.0":
+            return self
+        if op == "*" and self.code == "1.0":
+            return right
+        if op == "*" and (self.code == "0.0" or right.code == "0.0"):
+            return _Expression("0.0", self._result(self, right))
+        return _Expression(f"(({self.code}) {op} ({right.code}))", self._result(self, right))
+
+    def _rbinary(self, other: Any, op: str) -> "_Expression":
+        left = self.of(other)
+        if op == "+" and left.code == "0.0":
+            return self
+        if op == "*" and left.code == "1.0":
+            return self
+        if op == "*" and (left.code == "0.0" or self.code == "0.0"):
+            return _Expression("0.0", self._result(left, self))
+        return _Expression(f"(({left.code}) {op} ({self.code}))", self._result(left, self))
+
+    def __add__(self, other: Any): return self._binary(other, "+")
+    def __radd__(self, other: Any): return self._rbinary(other, "+")
+    def __sub__(self, other: Any): return self._binary(other, "-")
+    def __rsub__(self, other: Any): return self._rbinary(other, "-")
+    def __mul__(self, other: Any): return self._binary(other, "*")
+    def __rmul__(self, other: Any): return self._rbinary(other, "*")
+    def __truediv__(self, other: Any): return self._binary(other, "/")
+    def __rtruediv__(self, other: Any): return self._rbinary(other, "/")
+
+    def __pow__(self, exponent: Any):
+        power = self.of(exponent)
+        if power.kind == "real" and power.code == "2.0":
+            if self.code.startswith("std::abs(") and self.code.endswith(")"):
+                return _Expression(f"std::norm({self.code[9:-1]})", "real")
+            return _Expression(f"(({self.code}) * ({self.code}))", self.kind)
+        return _Expression(f"std::pow(({self.code}), ({power.code}))", self.kind)
+
+    def __rpow__(self, base: Any):
+        left = self.of(base)
+        return _Expression(f"std::pow(({left.code}), ({self.code}))", self._result(left, self))
+
+    def __neg__(self): return _Expression(f"-({self.code})", self.kind)
+    def __pos__(self): return self
+    def __abs__(self): return _Expression(f"std::abs({self.code})", "real")
+
+    @property
+    def real(self): return _Expression(f"std::real({self.code})", "real")
+
+    @property
+    def imag(self): return _Expression(f"std::imag({self.code})", "real")
+
+    def conjugate(self): return _Expression(f"std::conj({self.code})", self.kind)
+
+    def _compare(self, other: Any, op: str) -> "_Expression":
+        right = self.of(other)
+        if op not in ("==", "!=") and "complex" in (self.kind, right.kind):
+            raise TypeError("complex equation values cannot be ordered")
+        return _Expression(f"(({self.code}) {op} ({right.code}))", "bool")
+
+    def __lt__(self, other: Any): return self._compare(other, "<")
+    def __le__(self, other: Any): return self._compare(other, "<=")
+    def __gt__(self, other: Any): return self._compare(other, ">")
+    def __ge__(self, other: Any): return self._compare(other, ">=")
+    def __eq__(self, other: Any): return self._compare(other, "==")
+    def __ne__(self, other: Any): return self._compare(other, "!=")
+
+    def __bool__(self) -> bool:
+        control = _TRACE_CONTROL.get()
+        if control is None:
+            raise TypeError("a run-time equation value cannot control a Python branch")
+        condition = self if self.kind == "bool" else _Expression(
+            f"(std::abs({self.code}) != 0.0)", "bool"
+        )
+        index = control.index
+        control.index += 1
+        if index >= len(control.decisions):
+            raise _TraceBranch(condition)
+        return control.decisions[index]
+
+    def __float__(self) -> float:
+        raise TypeError("a run-time equation value cannot be converted to a Python float")
+
+    def __array_ufunc__(self, ufunc: Any, method: str, *inputs: Any, **kwargs: Any):
+        if method != "__call__" or kwargs:
+            return NotImplemented
+        name = getattr(ufunc, "__name__", "")
+        if name in {"add", "subtract", "multiply", "divide", "true_divide", "power"}:
+            left, right = inputs
+            operations = {"add": "+", "subtract": "-", "multiply": "*",
+                          "divide": "/", "true_divide": "/"}
+            if name == "power":
+                return self.of(left).__pow__(right)
+            return self.of(left)._binary(right, operations[name])
+        value = self.of(inputs[0])
+        if name in {"absolute", "fabs"}:
+            return abs(value)
+        if name in {"conjugate", "conj"}:
+            return value.conjugate()
+        if name == "real":
+            return value.real
+        if name == "imag":
+            return value.imag
+        if name == "square":
+            return value ** 2
+        functions = {
+            "sin": "std::sin", "cos": "std::cos", "tan": "std::tan",
+            "exp": "std::exp", "log": "std::log", "sqrt": "std::sqrt",
+            "sinh": "std::sinh", "cosh": "std::cosh", "tanh": "std::tanh",
+        }
+        if name in functions:
+            kind = "complex" if value.kind == "complex" else "real"
+            return _Expression(f"{functions[name]}({value.code})", kind)
+        return NotImplemented
+
+
+@dataclass
+class _TraceControl:
+    decisions: tuple[bool, ...]
+    index: int = 0
+
+
+class _TraceBranch(Exception):
+    def __init__(self, condition: _Expression) -> None:
+        self.condition = condition
+
+
+_TRACE_CONTROL: ContextVar[_TraceControl | None] = ContextVar(
+    "peslite_cpp_trace_control", default=None
+)
 
 
 @dataclass(frozen=True)
@@ -239,6 +406,144 @@ class _ModelGenerator:
             return "true" if value else "false"
         return _number(value)
 
+    @staticmethod
+    def _normalise_trace(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {str(key): _ModelGenerator._normalise_trace(item)
+                    for key, item in value.items()}
+        if isinstance(value, (tuple, list)):
+            return tuple(_ModelGenerator._normalise_trace(item) for item in value)
+        if hasattr(value, "shape") and hasattr(value, "flat"):
+            return tuple(_ModelGenerator._normalise_trace(item) for item in value.flat)
+        return _Expression.of(value)
+
+    @staticmethod
+    def _merge_trace(condition: _Expression, when_false: Any, when_true: Any) -> Any:
+        if isinstance(when_false, dict) and isinstance(when_true, dict):
+            if when_false.keys() != when_true.keys():
+                raise TypeError("a symbolic branch changes the equation output names")
+            return {key: _ModelGenerator._merge_trace(condition, when_false[key], when_true[key])
+                    for key in when_false}
+        if isinstance(when_false, tuple) and isinstance(when_true, tuple):
+            if len(when_false) != len(when_true):
+                raise TypeError("a symbolic branch changes the number of state derivatives")
+            return tuple(_ModelGenerator._merge_trace(condition, left, right)
+                         for left, right in zip(when_false, when_true))
+        left, right = _Expression.of(when_false), _Expression.of(when_true)
+        if (left.code, left.kind) == (right.code, right.kind):
+            return left
+        kind = "complex" if "complex" in (left.kind, right.kind) else (
+            "bool" if left.kind == right.kind == "bool" else "real"
+        )
+        if kind == "complex":
+            if left.kind != "complex":
+                left = _Expression(f"Complex{{{left.code}, 0.0}}", "complex")
+            if right.kind != "complex":
+                right = _Expression(f"Complex{{{right.code}, 0.0}}", "complex")
+        return _Expression(
+            f"(({condition.code}) ? ({right.code}) : ({left.code}))", kind
+        )
+
+    def _trace(self, run: Any, decisions: tuple[bool, ...] = ()) -> Any:
+        """Trace pure scalar arithmetic, exploring state-dependent Python branches."""
+        if len(decisions) > 12:
+            raise TypeError("more than 12 state-dependent branch decisions in one equation")
+        token = _TRACE_CONTROL.set(_TraceControl(decisions))
+        branch: _TraceBranch | None = None
+        try:
+            return self._normalise_trace(run())
+        except _TraceBranch as exc:
+            branch = exc
+        finally:
+            _TRACE_CONTROL.reset(token)
+        assert branch is not None
+        when_false = self._trace(run, (*decisions, False))
+        when_true = self._trace(run, (*decisions, True))
+        return self._merge_trace(branch.condition, when_false, when_true)
+
+    def _equation_clone(self, owner: Any) -> Any:
+        clone = copy.copy(owner)
+        for role in ("state", "inp", "out"):
+            original = getattr(owner, role)
+            record = copy.copy(original)
+            for field in _fields(original):
+                kind = self.record_types[id(original), field]
+                setattr(record, field, _Expression(
+                    self.value(original, field),
+                    "complex" if kind == "Complex" else "bool" if kind == "bool" else "real",
+                ))
+            setattr(clone, role, record)
+        return clone
+
+    @staticmethod
+    def _rebind(method: Any, owner: Any) -> Any:
+        function = getattr(method, "__func__", None)
+        if function is None:
+            raise TypeError("equation callable is not a bound Python method")
+        return function.__get__(owner, type(owner))
+
+    def trace_outputs(self, method: Any) -> list[str]:
+        owner = method.__self__
+        fields = _fields(owner.out)
+
+        def run():
+            clone = self._equation_clone(owner)
+            self._rebind(method, clone)(_Expression("t", "real"))
+            return tuple(getattr(clone.out, field) for field in fields)
+
+        values = self._trace(run)
+        lines: list[str] = []
+        for field, value in zip(fields, values):
+            original = self.value(owner.out, field)
+            if value.code != original:
+                lines.append(f"{original} = {value.code};")
+        if not lines and fields:
+            raise TypeError("output equation did not assign an output field")
+        return lines
+
+    def trace_rhs(self, sub: Any) -> list[str]:
+        method = sub.rhs
+
+        def run():
+            clone = self._equation_clone(sub)
+            return tuple(self._rebind(method, clone)(_Expression("t", "real")))
+
+        return [value.code for value in self._trace(run)]
+
+    def trace_scalar_method(self, sub: Any, name: str) -> str:
+        method = getattr(sub, name)
+
+        def run():
+            clone = self._equation_clone(sub)
+            return self._rebind(method, clone)()
+
+        return self._trace(run).code
+
+    def trace_element_signals(self, element: Any) -> dict[str, _Expression]:
+        subsystems = tuple(element.subsystems().values())
+
+        def run():
+            saved: list[tuple[Any, str, Any]] = []
+            try:
+                for sub in subsystems:
+                    for role in ("state", "inp", "out"):
+                        record = getattr(sub, role)
+                        for field in _fields(record):
+                            value = getattr(record, field)
+                            saved.append((record, field, value))
+                            kind = self.record_types[id(record), field]
+                            setattr(record, field, _Expression(
+                                self.value(record, field),
+                                "complex" if kind == "Complex" else
+                                "bool" if kind == "bool" else "real",
+                            ))
+                return element.signals()
+            finally:
+                for record, field, value in reversed(saved):
+                    setattr(record, field, value)
+
+        return self._trace(run)
+
     def declarations(self) -> list[str]:
         lines: list[str] = []
         declared: set[str] = set()
@@ -343,7 +648,13 @@ class _ModelGenerator:
         if hook is not None:
             return list(hook(self))
         label = self.subsystem_name.get(id(owner), type(owner).__name__)
-        raise TypeError(f"C++ export: subsystem {label!r} ({type(owner).__name__}) has no C++ output implementation")
+        try:
+            return self.trace_outputs(method)
+        except Exception as exc:
+            raise TypeError(
+                f"C++ export: cannot lower the output equation of subsystem {label!r} "
+                f"({type(owner).__name__}): {exc}"
+            ) from exc
 
     def _dclink_output(self, link: DCLink, name: str) -> list[str]:
         inp, out, state = link.inp, link.out, link.state
@@ -438,7 +749,13 @@ class _ModelGenerator:
         if hook is not None:
             return list(hook(self))
         label = self.subsystem_name.get(id(sub), type(sub).__name__)
-        raise TypeError(f"C++ export: subsystem {label!r} ({type(sub).__name__}) has no C++ RHS implementation")
+        try:
+            return self.trace_rhs(sub)
+        except Exception as exc:
+            raise TypeError(
+                f"C++ export: cannot lower the state equation of subsystem {label!r} "
+                f"({type(sub).__name__}): {exc}"
+            ) from exc
 
     def body(self, derivatives: bool = True) -> list[str]:
         lines = self.declarations()
@@ -524,11 +841,24 @@ class _ModelGenerator:
         for name, element in self.system.named_elements.items():
             signals = getattr(element, "signals", None)
             if signals is not None:
-                for signal, value in signals().items():
-                    # Built-in load is one branch. Custom elements can expose an explicit C++
-                    # observation hook alongside their equation hook.
-                    if hasattr(element, "branch") and signal == f"{name}.i":
-                        add(signal, self.value(element.branch.out, "i"), "Complex")
+                values = signals()
+                if hasattr(element, "branch") and set(values) == {f"{name}.i"}:
+                    add(f"{name}.i", self.value(element.branch.out, "i"), "Complex")
+                    continue
+                try:
+                    traced = self.trace_element_signals(element)
+                except Exception as exc:
+                    if self.p.simulation.output.signals:
+                        raise TypeError(
+                            f"C++ export: cannot lower signals of element {name!r} "
+                            f"({type(element).__name__}): {exc}"
+                        ) from exc
+                    continue
+                for signal, value in traced.items():
+                    kind = "Complex" if value.kind == "complex" else (
+                        "bool" if value.kind == "bool" else "double"
+                    )
+                    add(signal, value.code, kind)
         return members, assigns
 
 
@@ -2012,8 +2342,9 @@ class _CppGenerator:
         self.model.sync(self.p.simulation.initial.t, self.model.get_initial_values())
         for key, value in self.system.signals(self.p.simulation.initial.t).items():
             head, _, what = key.rpartition(".")
-            if what in ("u_g", "i_c", "i", "u") and isinstance(value, complex):
-                stem = {"u_g": "v", "i_c": "i_conv", "i": "i", "u": "v"}[what]
+            if what in ("u_g", "i_c", "i", "i1", "i2", "u") and isinstance(value, complex):
+                stem = {"u_g": "v", "i_c": "i_conv", "i": "i",
+                        "i1": "i1", "i2": "i2", "u": "v"}[what]
                 columns.extend(f"{head}.{stem}_{phase}" for phase in "abc")
                 expressions.extend(self._phase_expressions(f"obs_{_identifier(key)}"))
         for name in self.p.units:
@@ -2100,10 +2431,14 @@ class _CppGenerator:
             if hook is not None:
                 supplied, dissipated = hook(model)
                 return str(supplied), str(dissipated)
-            raise TypeError(
-                f"C++ export: energy audit for {check.name!r} ({type(sub).__name__}) needs "
-                "a cpp_energy(generator) hook"
-            )
+            try:
+                return (model.trace_scalar_method(sub, "supplied_power"),
+                        model.trace_scalar_method(sub, "dissipated_power"))
+            except Exception as exc:
+                raise TypeError(
+                    f"C++ export: cannot lower the energy equation of {check.name!r} "
+                    f"({type(sub).__name__}): {exc}"
+                ) from exc
 
         declared_index = 0
         for check in plan.subsystems:

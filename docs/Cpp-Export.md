@@ -135,12 +135,30 @@ These choices are fixed when `peslite.cpp` is generated:
 Specialization lets the compiler inline the configured RHS and remove generic dispatch. To change a
 fixed choice, update the source `.pes` file and run `peslite-convert` again.
 
+Built-in plant and converter modules have dedicated lowering for their complete switching,
+protection and scheduling semantics. A custom continuous subsystem also has a fallback: PESLite
+traces its fixed `state`, `inp`, `out`, `set_outputs()` and `rhs()` scalar equations while exporting,
+specialises configuration-dependent branches and loops, and emits ordinary static C++. Common
+arithmetic, complex operations, state-dependent branches and NumPy scalar ufuncs are lowered. The
+generated binary does not contain an expression interpreter or Python runtime, so using the
+fallback does not add a generic dispatch layer to each solver stage.
+
+The dedicated modules remain preferable when they fit: their event and timing semantics are fully
+covered, their generated expressions are deliberately tuned, and unsupported behavior is found
+before a long build. The fallback is intended for pure numerical component equations with a fixed
+state and port layout.
+
 ## Current limitations
 
 - Supported solvers are fixed `euler`, `heun` and `rk4`, plus adaptive `DP45`.
 - Multirate subsystem schedules are not currently lowered to C++.
-- A custom component, loop, event or modulator must have C++ lowering support; unsupported types are
+- Arbitrary Python behavior is not embedded in the standalone executable. File or network I/O,
+  reflection, run-time type/layout changes and unsupported library calls in a custom equation are
   rejected during export rather than silently approximated.
+- Symbolic branch exploration is bounded; deeply state-dependent iterative control flow needs
+  dedicated backend support instead of an exponentially large generated expression.
+- Custom controller loops, events and modulators still need backend support because they alter the
+  discrete schedule rather than only contributing continuous scalar equations.
 - Only parameters reported by `--list-params` can change in the compiled simulator.
 
 The exporter supports the built-in switching, PWM-period-averaged and ideal averaged bridge models.

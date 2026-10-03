@@ -7,6 +7,7 @@ import peslite
 import pytest
 from peslite.addons import components as addon_components
 from peslite.addons import controllers as addon_controllers
+from peslite.addons.components.cable import CableModel
 from peslite.addons.controllers.voltage_adaptive_pll import VoltageAdaptivePLL
 from peslite.components import ELEMENT_TYPES
 from peslite.control import LOOP_TYPES, Loop
@@ -80,6 +81,43 @@ def test_addon_entry_points_match_builtin_public_apis():
     assert set(peslite.components.__all__) < set(addon_components.__all__)
     assert addon_controllers.LOOP_TYPES is LOOP_TYPES
     assert addon_components.ELEMENT_TYPES is ELEMENT_TYPES
+
+
+def test_cable_model_has_two_inward_ports_and_closes_its_power_balance():
+    cable = CableModel(
+        length_km=2.0,
+        r_per_km=0.08,
+        l_per_km=0.6e-3,
+        g_per_km=2.0e-7,
+        c_per_km=0.3e-6,
+        sections=2,
+        voltage0=0j,
+    )
+    cable.inp.u1 = 8000.0 + 200.0j
+    cable.inp.u2 = 7600.0 - 100.0j
+    cable.state.iL1 = 20.0 + 3.0j
+    cable.state.iL2 = 18.0 + 2.0j
+    cable.state.iL3 = 16.0 + 1.0j
+    cable.state.uC1 = 7900.0 + 100.0j
+    cable.state.uC2 = 7750.0
+    cable.set_outputs(0.0)
+    derivatives = cable.rhs(0.0)
+
+    stored_rate = 0.0
+    for storage, derivative in zip(cable.storage, derivatives):
+        value = getattr(cable.state, storage.state)
+        stored_rate += storage.scale * storage.value * (value * derivative.conjugate()).real
+    power_in = 1.5 * (
+        (cable.inp.u1 * cable.out.i1.conjugate()).real
+        + (cable.inp.u2 * cable.out.i2.conjugate()).real
+    )
+
+    assert cable.terminal1.direction == cable.terminal2.direction == 1
+    assert cable.out.i1 == cable.state.iL1
+    assert cable.out.i2 == -cable.state.iL3
+    assert sum(cable.series_r) == pytest.approx(0.16)
+    assert sum(cable.series_l) == pytest.approx(1.2e-3)
+    assert power_in == pytest.approx(stored_rate + cable.dissipated_power())
 
 
 def test_pesaddons_beside_simulation_file_merges_project_paths(examples, tmp_path):
@@ -195,3 +233,26 @@ def test_custom_pll_assembles_with_builtin_loops_and_runs(examples, tmp_path, mo
     assert np.isfinite(theta).all()
     assert theta[-1] > 1.0
     assert not result.tripped
+
+
+@pytest.mark.parametrize("model", ["switching", "pwm_averaging", "averaging"])
+def test_custom_cable_gfl_case_runs_in_every_bridge_mode(examples, tmp_path, model):
+    solver = ("adaptive", "DP45") if model == "averaging" else ("fixed", "rk4")
+    params = peslite.load(
+        examples / "cable-gfl-example.pes",
+        **{
+            "simulation.t_end": 0.004,
+            "simulation.solver.type": solver[0],
+            "simulation.solver.method": solver[1],
+            "simulation.solver.linearisations": 0,
+            "simulation.energy_check": "strict",
+            "units.vsc.bridge.model": model,
+        },
+    )
+    simulation = peslite.Simulation(params)
+    result = simulation.run(out_dir=tmp_path / model)
+
+    assert simulation.ph_report.verdict == "port-hamiltonian"
+    assert not result.tripped
+    assert np.isfinite(result.states["cable1.iL1.re"]).all()
+    assert np.isfinite(result.states["cable1.uC2.im"]).all()

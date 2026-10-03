@@ -21,7 +21,7 @@ from .assembly.params import _register_load_preparer
 
 _register_load_preparer(addons._discover_for)
 
-__version__ = "0.2.3"
+__version__ = "0.3.0"
 
 __all__ = [
     "solver", "control", "components", "assembly", "addons",

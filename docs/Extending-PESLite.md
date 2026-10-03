@@ -18,6 +18,12 @@ while `peslite.addons.controllers.voltage_adaptive_pll` contains the executable 
 uses a filtered measured-voltage magnitude and grid-frequency state, then joins the same GFL graph
 as the built-in current and DC-voltage loops.
 
+The bundled `cable-gfl-example` similarly keeps its case in `examples/`, while
+`peslite.addons.components.cable` implements its own distributed R-L/G-C state equations. It is a
+two-terminal custom element rather than a renamed built-in branch: both terminal currents are
+positive into the cable, and its internal inductor currents and capacitor voltages are ordinary
+restartable PESLite states.
+
 ## Custom control loops
 
 Register a loop class with `register_loop_type`:
@@ -134,6 +140,25 @@ uses `bus` and returns one binding; a multi-terminal element uses `bus1`, `bus2`
 returns one binding per terminal. System assembly converts these declarations to direct model
 connections, so terminal metadata adds no work to the integration loop.
 
+The cable add-on is a complete multi-terminal reference implementation:
+
+```yaml
+elements:
+  cable1:
+    type: cable
+    bus1: grid_bus
+    bus2: pcc
+    length_km: 5.0
+    r_per_km: 0.05
+    l_per_km: 0.4e-3
+    c_per_km: 0.2e-6
+    g_per_km: 1.0e-8
+    sections: 2
+```
+
+Its per-kilometre parameters are SI values. `sections` changes the spatial discretisation and
+therefore the state layout, so it is fixed when the simulation is assembled.
+
 ## Custom events
 
 Register an `Event` subclass with `register_event_type`. Its `Params` dataclass contains at least
@@ -190,6 +215,14 @@ startup status; it should not directly open breakers or mutate the system.
 
 ## C++ export
 
-Python registration alone does not automatically generate C++. A custom subsystem, loop, event or
-modulator needs corresponding C++ lowering support. The exporter rejects unsupported custom types
-instead of silently changing their behavior.
+Pure numerical custom subsystems with a fixed `state`/`inp`/`out` layout have an automatic C++
+fallback. During export, PESLite symbolically traces their scalar `set_outputs()` and `rhs()`
+equations, specialises configuration branches and fixed loops, and emits static C++. The cable
+add-on is exported through this fallback; it does not carry a second handwritten C++ equation.
+Built-in modules still use dedicated lowering, which covers their complete event and timing
+semantics and gives the generator more opportunities for deliberate optimisation.
+
+The fallback does not embed Python in the binary. Dynamic Python behavior outside a pure numerical
+equation—such as I/O, reflection, changing the state layout or an unsupported library call—is
+rejected. Custom loops, events and modulators that alter discrete scheduling still need explicit
+backend support rather than being approximated.

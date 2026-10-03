@@ -61,8 +61,9 @@ def _plant_output_row(params: Params, t: float, plant: Mapping[str, Any],
     row: dict[str, float] = {"t": t}
     for key, value in plant.items():
         head, _, what = key.rpartition(".")
-        if what in ("u_g", "i_c", "i", "u") and np.iscomplexobj(value):
-            stem = {"u_g": "v", "i_c": "i_conv", "i": "i", "u": "v"}[what]
+        if what in ("u_g", "i_c", "i", "i1", "i2", "u") and np.iscomplexobj(value):
+            stem = {"u_g": "v", "i_c": "i_conv", "i": "i",
+                    "i1": "i1", "i2": "i2", "u": "v"}[what]
             for phase, phase_value in zip("abc", complex2abc(complex(value))):
                 row[f"{head}.{stem}_{phase}"] = float(phase_value)
     for name in params.units:
