@@ -1,0 +1,52 @@
+name: CLA
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, closed]
+  issue_comment:
+    types: [created]
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: write
+  statuses: write
+
+jobs:
+  cla:
+    if: |
+      github.event_name == 'pull_request_target' ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        (
+          github.event.comment.body == 'recheck' ||
+          github.event.comment.body == 'I have read the PESLite CLA and I agree to it.'
+        )
+      )
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check Contributor License Agreement
+        uses: contributor-license/cla-action@2e483ec09841118c52af4716e8875eb9832d1dd2 # v1.0.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PERSONAL_ACCESS_TOKEN: ${{ secrets.CLA_PERSONAL_ACCESS_TOKEN }}
+        with:
+          path-to-signatures: signatures/version1/cla.json
+          path-to-document: https://github.com/lonaparte/PESLite/blob/main/CLA-v1.0.md
+          branch: main
+          remote-organization-name: lonaparte
+          remote-repository-name: PESLite-cla-signatures
+          allowlist: lonaparte,dependabot[bot],github-actions[bot]
+          custom-pr-sign-comment: I have read the PESLite CLA and I agree to it.
+          custom-notsigned-prcomment: |
+            Thanks for contributing to PESLite!
+
+            Before this pull request can be merged, please review the
+            [PESLite Contributor License Agreement](https://github.com/lonaparte/PESLite/blob/main/CLA-v1.0.md).
+
+            You keep ownership of your contribution, and the public PESLite project remains
+            `AGPL-3.0-only`.
+
+            If you agree, reply with:
