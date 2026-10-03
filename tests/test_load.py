@@ -14,7 +14,7 @@ def _two_buses(case, events):
     tree = case()
     tree["buses"]["b2"] = {"c_pu": 0.02, "r_d_pu": 0.5}
     tree["branches"] = {
-        "line": {"from_bus": "pcc", "to_bus": "b2", "x_pu": 0.05}
+        "line": {"bus1": "pcc", "bus2": "b2", "x_pu": 0.05}
     }
     tree["elements"] = {
         "load": {"type": "load", "bus": "b2", "r_pu": 1.0, "x_pu": 0.5}
@@ -42,6 +42,24 @@ def test_branch_source_and_load_switch_during_a_run(case, tmp_path):
     assert np.max(load[t > 0.0022]) > 0.0
     assert np.all(grid[t > 0.003 + 1e-9] == 0.0)
     assert np.max(grid[t < 0.003]) > 0.0
+
+
+def test_every_network_component_uses_the_same_terminal_assembly(case):
+    params = _two_buses(case, {})
+    system = peslite.System(params)
+    line = system.branches["line"]
+
+    assert system.model.connections[(line, "u1")] == (system.buses["pcc"], "u")
+    assert system.model.connections[(line, "u2")] == (system.buses["b2"], "u")
+    assert system.sources["grid"].terminals() == (
+        ("pcc", system.sources["grid"].branch.terminal2),
+    )
+    assert system.units["vsc"].terminals() == (
+        ("pcc", system.units["vsc"].branch_f.terminal2),
+    )
+    assert system.named_elements["load"].terminals() == (
+        ("b2", system.named_elements["load"].branch.terminal1),
+    )
 
 
 def test_small_load_can_model_a_switched_fault(case, tmp_path):

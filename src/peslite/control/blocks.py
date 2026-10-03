@@ -1,4 +1,4 @@
-"""Building blocks of the controller: space-vector transforms, discrete-time filters and timers, helpers.
+"""Building blocks of the controller: transforms, dynamic blocks, timers and helpers.
 
 Space vectors are peak-value, ``u = (2/3)(u_a + a u_b + a^2 u_c)`` with ``a = exp(j 2 pi/3)``, the
 zero sequence dropped; ``u_dq = u_ab * exp(-j theta)``. Filters accept real or complex signals;
@@ -15,7 +15,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 __all__ = ["A120", "abc2complex", "complex2abc", "phases", "clamp", "smoothstep", "peak_abs",
-           "LowPass1", "HighPass1", "HoldTimer", "MovingWindow"]
+           "Integrator", "PI", "Filter", "HoldTimer", "MovingWindow"]
 
 
 # ------------------------------------------------------------------ space vectors
@@ -68,55 +68,341 @@ def peak_abs(values) -> float:
     return float(peak)
 
 
-# ------------------------------------------------------------------ filters and timers
+# ------------------------------------------------------------------ dynamic control blocks
 
-class LowPass1:
-    """First-order low-pass filter: ``y += (1 - exp(-2*pi*bw_hz*T))*(x - y)``.
+class Integrator:
+    """Integrator with one user-facing call and construction-time execution binding.
 
-    ``bw_hz`` in Hz (``<= 0`` passes the input through), ``T`` in s. ``init_on_first``
-    copies the first sample to the output; ``y0`` is the initial output.
-    Named state: ``y``, NaN while not yet seeded.
+    ``period=None`` selects the continuous implementation: calling the block returns its present
+    state and records the supplied derivative for the ODE solver.  A positive ``period`` selects
+    the sampled implementation, discretised by the trapezoidal rule.  Mode selection therefore
+    adds no branch to the block's hot path.
     """
 
-    def __init__(self, bw_hz: float, T: float | None, y0=0.0, init_on_first: bool = True) -> None:
-        self.alpha = (0.0 if T is None else
-                      1.0 - math.exp(-2.0 * math.pi * bw_hz * T) if bw_hz > 0.0 else 1.0)
-        self.y = y0
-        self._y0 = y0
-        self._init_on_first = init_on_first
-        self._first = init_on_first
+    def __new__(cls, period: float | None, initial=0.0):
+        if cls is Integrator:
+            impl = _ContinuousIntegrator if period is None else _SampledIntegrator
+            return object.__new__(impl)
+        return object.__new__(cls)
 
-    def update(self, x):
-        if self._first:
-            self.y = x
-            self._first = False
-        else:
-            self.y = self.y + self.alpha * (x - self.y)
-        return self.y
+    def __init__(self, period: float | None, initial=0.0) -> None:
+        if period is not None and (not math.isfinite(period) or period <= 0.0):
+            raise ValueError(f"integrator period must be finite and positive, got {period}")
+        self.T = None if period is None else float(period)
+        self.initial = initial
+        self.value = initial
+        self.derivative = initial * 0
+
+    def __call__(self, derivative):
+        raise NotImplementedError
+
+    def reset(self) -> None:
+        self.value = self.initial
+        self.derivative = self.initial * 0
 
     def get_state(self) -> dict[str, Any]:
-        if self._first:
-            return {"": complex(math.nan, math.nan) if isinstance(self._y0, complex) else math.nan}
-        return {"": self.y}
+        return {"": self.value}
 
     def set_state(self, values: Mapping[str, Any]) -> None:
-        if "" not in values:
-            return
-        y = values[""]
-        if (y.real != y.real) or (isinstance(y, complex) and y.imag != y.imag):  # nan: not seeded
-            self.y, self._first = self._y0, self._init_on_first
-        else:
-            self.y, self._first = y, False
+        if "" in values:
+            self.value = values[""]
+
+    def state_derivatives(self) -> dict[str, Any]:
+        return {"": self.derivative}
+
+    def state_bindings(self):
+        return {"": (self, "value")}
 
 
-class HighPass1(LowPass1):
-    """First-order high-pass filter ``x - LowPass1(x)`` with corner ``bw_hz`` (Hz).
+class _SampledIntegrator(Integrator):
+    """Tustin realisation of ``1/s`` with one stored state."""
 
-    Named state: the low-passed signal.
+    def __call__(self, derivative):
+        half_step = 0.5 * self.T * derivative
+        output = self.value + half_step
+        self.value = output + half_step
+        return output
+
+
+class _ContinuousIntegrator(Integrator):
+    def __call__(self, derivative):
+        self.derivative = derivative
+        return self.value
+
+class PI:
+    """PI law with sampled and continuous implementations behind one call.
+
+    The sampled integral branch is the Tustin realisation of ``1/s``.  The continuous branch
+    records ``r - fb`` as its state derivative.  Output constraints are owned by the controller;
+    sampled tracking anti-windup remains local to the PI state.
     """
 
-    def update(self, x):
-        return x - super().update(x)
+    def __new__(cls, kp: float, ki: float, period: float | None, *,
+                antiwindup: bool = True, initial=0.0):
+        if cls is PI:
+            impl = _ContinuousPI if period is None else _SampledPI
+            return object.__new__(impl)
+        return object.__new__(cls)
+
+    def __init__(self, kp: float, ki: float, period: float | None, *,
+                 antiwindup: bool = True, initial=0.0) -> None:
+        if period is not None and (not math.isfinite(period) or period <= 0.0):
+            raise ValueError(f"PI period must be finite and positive, got {period}")
+        self.kp, self.ki = float(kp), float(ki)
+        self.T = None if period is None else float(period)
+        self.antiwindup_enabled = bool(antiwindup)
+        self.initial = initial
+        self.integral = initial
+        self.derivative = initial * 0
+
+    def __call__(self, r, fb, ff=0.0):
+        raise NotImplementedError
+
+    def antiwindup(self, intended, output) -> None:
+        """Apply sampled tracking anti-windup after a controller constraint acts."""
+        if self.T is not None and self.antiwindup_enabled:
+            self.integral += self.T * (output - intended) / self.kp
+
+    def reset(self) -> None:
+        self.integral = self.initial
+        self.derivative = self.initial * 0
+
+    def get_state(self) -> dict[str, Any]:
+        return {"": self.integral}
+
+    def set_state(self, values: Mapping[str, Any]) -> None:
+        if "" in values:
+            self.integral = values[""]
+
+    def state_derivatives(self) -> dict[str, Any]:
+        return {"": self.derivative}
+
+    def state_bindings(self):
+        return {"": (self, "integral")}
+
+
+class _SampledPI(PI):
+    def __call__(self, r, fb, ff=0.0):
+        error = r - fb
+        half_step = 0.5 * self.T * error
+        integrated = self.integral + half_step
+        self.integral = integrated + half_step
+        return ff + self.kp * error + self.ki * integrated
+
+
+class _ContinuousPI(PI):
+    def __call__(self, r, fb, ff=0.0):
+        error = r - fb
+        self.derivative = error
+        return ff + self.kp * error + self.ki * self.integral
+
+
+def _coefficients(values, name: str) -> tuple[float, ...]:
+    try:
+        result = tuple(float(value) for value in values)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"filter {name} must be a finite coefficient sequence") from exc
+    if not result or not all(math.isfinite(value) for value in result):
+        raise ValueError(f"filter {name} must be a non-empty finite coefficient sequence")
+    return result
+
+
+def _filter_order(den) -> int:
+    coefficients = _coefficients(den, "denominator")
+    if coefficients[0] == 0.0:
+        raise ValueError("filter denominator leading coefficient must be nonzero")
+    return len(coefficients) - 1
+
+
+class Filter:
+    r"""Continuous transfer function with a mode-specific runtime implementation.
+
+    ``num`` and ``den`` contain coefficients in descending powers of :math:`s`, matching the
+    Simulink Transfer Fcn convention.  The transfer function must be proper.  ``period=None``
+    exposes its observable-canonical continuous state and derivatives; a positive ``period`` constructs a
+    discrete Tustin (bilinear/trapezoidal) realisation once and runs only that recurrence.
+
+    Initial values are the states of the observable canonical realisation.  As with a transfer
+    function block, the default is zero state.  A scalar initial value is accepted for first-order
+    filters; higher-order filters require one value per denominator order.
+    """
+
+    def __new__(cls, num, den, period: float | None, *, initial=0.0):
+        if cls is Filter:
+            order = _filter_order(den)
+            if period is None:
+                impl = (_ContinuousGain if order == 0 else
+                        _ContinuousFilter1 if order == 1 else _ContinuousFilterN)
+            else:
+                impl = (_SampledGain if order == 0 else
+                        _SampledFilter1 if order == 1 else _SampledFilterN)
+            return object.__new__(impl)
+        return object.__new__(cls)
+
+    def __init__(self, num, den, period: float | None, *, initial=0.0) -> None:
+        numerator = _coefficients(num, "numerator")
+        denominator = _coefficients(den, "denominator")
+        if denominator[0] == 0.0:
+            raise ValueError("filter denominator leading coefficient must be nonzero")
+        while len(numerator) > 1 and numerator[0] == 0.0:
+            numerator = numerator[1:]
+        order = len(denominator) - 1
+        if len(numerator) - 1 > order:
+            raise ValueError(
+                "filter must be proper: denominator order must be at least numerator order"
+            )
+        if period is not None and (not math.isfinite(period) or period <= 0.0):
+            raise ValueError(f"filter period must be finite and positive, got {period}")
+
+        scale = denominator[0]
+        den_n = tuple(value / scale for value in denominator)
+        num_n = (0.0,) * (order + 1 - len(numerator)) + tuple(
+            value / scale for value in numerator
+        )
+        self.num, self.den = numerator, denominator
+        self.order = order
+        self.T = None if period is None else float(period)
+        self.derivative = ()
+
+        if order == 0:
+            self.gain = num_n[0]
+            return
+
+        # Observable canonical form.  It makes the state of a first-order low-pass filter equal
+        # to its output, while remaining a general proper transfer-function realisation.
+        a = np.asarray(den_n[1:], dtype=float)
+        b0 = num_n[0]
+        dynamic_num = np.asarray(num_n[1:], dtype=float) - a * b0
+        A = np.zeros((order, order), dtype=float)
+        A[:, 0] = -a
+        if order > 1:
+            A[:-1, 1:] += np.eye(order - 1)
+        B = dynamic_num
+        C = np.zeros(order, dtype=float)
+        C[0] = 1.0
+        D = b0
+
+        if order == 1:
+            values = (initial,) if not isinstance(initial, (tuple, list, np.ndarray)) else tuple(initial)
+            if len(values) != 1:
+                raise ValueError("first-order filter initial state must contain one value")
+            self.x0 = values[0]
+            self._initial = values
+            if self.T is None:
+                self._a, self._b, self._c, self._d = A[0, 0], B[0], C[0], D
+            else:
+                h = 0.5 * self.T
+                inv = 1.0 / (1.0 - h * A[0, 0])
+                self._ad = inv * (1.0 + h * A[0, 0])
+                self._bd = inv * self.T * B[0]
+                self._cd = C[0] * inv
+                self._dd = D + h * C[0] * inv * B[0]
+            return
+
+        if isinstance(initial, (tuple, list, np.ndarray)):
+            values = tuple(initial)
+        elif initial == 0 or initial == 0.0 or initial == 0j:
+            values = (initial,) * order
+        else:
+            raise ValueError(f"order-{order} filter initial state needs {order} values")
+        if len(values) != order:
+            raise ValueError(f"order-{order} filter initial state needs {order} values")
+        self._initial = values
+        self._x = np.asarray(values)
+        self._A, self._B, self._C, self._D = A, B, C, D
+        if self.T is not None:
+            identity = np.eye(order)
+            inverse = np.linalg.solve(identity - 0.5 * self.T * A, identity)
+            self._Ad = inverse @ (identity + 0.5 * self.T * A)
+            self._Bd = inverse @ (self.T * B)
+            self._Cd = C @ inverse
+            self._Dd = D + 0.5 * self.T * (C @ inverse @ B)
+
+    def __call__(self, value):
+        raise NotImplementedError
+
+    def get_state(self) -> dict[str, Any]:
+        if self.order == 0:
+            return {}
+        if self.order == 1:
+            return {"": self.x0}
+        return {str(index): value.item() if hasattr(value, "item") else value
+                for index, value in enumerate(self._x)}
+
+    def set_state(self, values: Mapping[str, Any]) -> None:
+        if self.order == 1:
+            if "" in values:
+                self.x0 = values[""]
+            return
+        if any(isinstance(values.get(str(index)), complex) for index in range(self.order)):
+            self._x = self._x.astype(complex)
+        for index in range(self.order):
+            key = str(index)
+            if key in values:
+                self._x[index] = values[key]
+
+    def state_derivatives(self) -> dict[str, Any]:
+        if self.order == 0:
+            return {}
+        if self.order == 1:
+            return {"": self.derivative[0]}
+        return {str(index): value for index, value in enumerate(self.derivative)}
+
+    def state_bindings(self):
+        if self.order == 0:
+            return {}
+        if self.order == 1:
+            return {"": (self, "x0")}
+        # Higher-order filters keep a compact ndarray. The graph falls back to set_state() when
+        # binding individual array entries into the packed ODE state.
+        return None
+
+    def reset(self) -> None:
+        if self.order == 1:
+            self.x0 = self._initial[0]
+        elif self.order > 1:
+            self._x = np.asarray(self._initial)
+        self.derivative = ()
+
+
+class _SampledGain(Filter):
+    def __call__(self, value):
+        return self.gain * value
+
+
+class _ContinuousGain(_SampledGain):
+    pass
+
+
+class _SampledFilter1(Filter):
+    def __call__(self, value):
+        output = self._cd * self.x0 + self._dd * value
+        self.x0 = self._ad * self.x0 + self._bd * value
+        return output
+
+
+class _ContinuousFilter1(Filter):
+    def __call__(self, value):
+        output = self._c * self.x0 + self._d * value
+        self.derivative = (self._a * self.x0 + self._b * value,)
+        return output
+
+
+class _SampledFilterN(Filter):
+    def __call__(self, value):
+        output = self._Cd @ self._x + self._Dd * value
+        self._x = self._Ad @ self._x + self._Bd * value
+        return output.item() if hasattr(output, "item") else output
+
+
+class _ContinuousFilterN(Filter):
+    def __call__(self, value):
+        output = self._C @ self._x + self._D * value
+        self.derivative = tuple(self._A @ self._x + self._B * value)
+        return output.item() if hasattr(output, "item") else output
+
+
+# ------------------------------------------------------------------ timers
 
 
 class HoldTimer:

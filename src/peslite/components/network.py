@@ -14,34 +14,71 @@ from ..solver.energy import PowerPort, StoragePort
 from ..solver.model import Bag, ConfigError, Empty
 
 __all__ = [
-    "ThreePhaseSource", "RLBranch", "RCNode", "Element", "ELEMENT_TYPES",
+    "Terminal", "ThreePhaseSource", "RLBranch", "RCNode", "Element", "ELEMENT_TYPES",
     "register_element_type", "element_buses", "Load",
 ]
+
+
+@dataclass(frozen=True, eq=False)
+class Terminal:
+    """One electrical terminal of a subsystem.
+
+    ``voltage`` is an ``inp`` field and ``current`` an ``out`` field of ``subsystem``.
+    ``direction`` is +1 when positive current enters the subsystem and -1 when it leaves.  These
+    are construction-time references; System lowers them to ordinary Model connections.
+    """
+
+    subsystem: Any
+    voltage: str
+    current: str
+    direction: int
+
+    def __post_init__(self) -> None:
+        if self.direction not in (-1, 1) or isinstance(self.direction, bool):
+            raise ValueError(f"terminal direction must be +1 or -1, got {self.direction!r}")
+        if not hasattr(self.subsystem.inp, self.voltage):
+            raise ValueError(
+                f"{type(self.subsystem).__name__}.inp has no terminal voltage {self.voltage!r}"
+            )
+        if not hasattr(self.subsystem.out, self.current):
+            raise ValueError(
+                f"{type(self.subsystem).__name__}.out has no terminal current {self.current!r}"
+            )
+        for port in getattr(self.subsystem, "ports", ()):
+            if (port.effort, port.flow) == (f"inp.{self.voltage}", f"out.{self.current}"):
+                if port.sign != self.direction:
+                    raise ValueError(
+                        f"terminal direction {self.direction:+d} does not match the energy-port "
+                        f"direction {port.sign:+g}"
+                    )
+                break
 
 
 class _BranchState(Bag):
     __slots__ = ("i",)
 
 class _BranchInp(Bag):
-    __slots__ = ("u_from", "u_to")
+    __slots__ = ("u1", "u2")
 
 class _BranchOut(Bag):
     __slots__ = ("i",)
 
 class RLBranch:
-    """Series R-L branch; an open breaker zeroes and holds its current."""
+    """Series R-L branch with positive current from terminal 1 to terminal 2."""
 
     state_names: ClassVar[tuple[str, ...]] = ("i",)
     outputs_need_inputs: ClassVar[bool] = False
-    ports: ClassVar[tuple[PowerPort, ...]] = (PowerPort("inp.u_from", "out.i", 1.5, 1.0),
-                                              PowerPort("inp.u_to", "out.i", 1.5, -1.0))
+    ports: ClassVar[tuple[PowerPort, ...]] = (PowerPort("inp.u1", "out.i", 1.5, 1.0),
+                                              PowerPort("inp.u2", "out.i", 1.5, -1.0))
 
     def __init__(self, L: float, R: float, i0: complex = 0j) -> None:
         self.L, self.R = L, R
-        self.storage = (StoragePort("i", L, 1.5, (("inp.u_from", 1.0), ("inp.u_to", -1.0)), "inductor"),)
+        self.storage = (StoragePort("i", L, 1.5, (("inp.u1", 1.0), ("inp.u2", -1.0)), "inductor"),)
         self.state = _BranchState(i=complex(i0))
-        self.inp = _BranchInp(u_from=0j, u_to=0j)
+        self.inp = _BranchInp(u1=0j, u2=0j)
         self.out = _BranchOut(i=complex(i0))
+        self.terminal1 = Terminal(self, "u1", "i", 1)
+        self.terminal2 = Terminal(self, "u2", "i", -1)
         self.breaker_open = False
         if type(self) is RLBranch:
             self.rhs = self._rhs_closed
@@ -69,13 +106,13 @@ class RLBranch:
     def rhs(self, t: float):
         if self.breaker_open:
             return (0j,)
-        return ((self.inp.u_from - self.inp.u_to - self.R * self.state.i) / self.L,)
+        return ((self.inp.u1 - self.inp.u2 - self.R * self.state.i) / self.L,)
 
     def _rhs_open(self, t: float):
         return (0j,)
 
     def _rhs_closed(self, t: float):
-        return ((self.inp.u_from - self.inp.u_to - self.R * self.state.i) / self.L,)
+        return ((self.inp.u1 - self.inp.u2 - self.R * self.state.i) / self.L,)
 
     def dissipated_power(self) -> float:
         return 1.5 * self.R * abs(self.state.i) ** 2
@@ -87,7 +124,7 @@ class _NodeState(Bag):
     __slots__ = ("u_C",)
 
 class _NodeInp(Bag):
-    __slots__ = ("i_in",)
+    __slots__ = ("i",)
 
 class _NodeOut(Bag):
     __slots__ = ("u",)
@@ -95,25 +132,25 @@ class _NodeOut(Bag):
 class RCNode:
     """Node with a shunt capacitor ``C`` (F) in series with ``R_d`` (ohm) to ground.
 
-    Input ``i_in``: sum of currents into the node (fan-in connection). Output ``u = u_C + R_d i_in``.
+    Input ``i`` is the net current into the node. Output ``u = u_C + R_d i``.
     """
 
     state_names: ClassVar[tuple[str, ...]] = ("u_C",)
     outputs_need_inputs: ClassVar[bool] = True
-    ports: ClassVar[tuple[PowerPort, ...]] = (PowerPort("out.u", "inp.i_in", 1.5),)
+    ports: ClassVar[tuple[PowerPort, ...]] = (PowerPort("out.u", "inp.i", 1.5),)
 
     def __init__(self, C: float, R_d: float, u0: complex = 0j) -> None:
         self.C, self.R_d = C, R_d
-        self.storage = (StoragePort("u_C", C, 1.5, (("inp.i_in", 1.0),)),)
+        self.storage = (StoragePort("u_C", C, 1.5, (("inp.i", 1.0),)),)
         self.state = _NodeState(u_C=complex(u0))
-        self.inp = _NodeInp(i_in=0j)
+        self.inp = _NodeInp(i=0j)
         self.out = _NodeOut(u=complex(u0))
 
     def set_outputs(self, t: float) -> None:
-        self.out.u = self.state.u_C + self.R_d * self.inp.i_in
+        self.out.u = self.state.u_C + self.R_d * self.inp.i
 
     def rhs(self, t: float):
-        return (self.inp.i_in / self.C,)
+        return (self.inp.i / self.C,)
 
     def retune(self, C: float, R_d: float) -> None:
         """Change capacitance and damping resistance without changing voltage."""
@@ -121,7 +158,7 @@ class RCNode:
         self.storage = (replace(self.storage[0], value=C),)
 
     def dissipated_power(self) -> float:
-        return 1.5 * self.R_d * abs(self.inp.i_in) ** 2
+        return 1.5 * self.R_d * abs(self.inp.i) ** 2
 
     def supplied_power(self) -> float:
         return 0.0
@@ -180,9 +217,10 @@ class Element:
     """Base of a registered ``elements`` entry, built as ``cls(name, cfg, buses, p)``.
 
     A type defines ``type`` and a frozen ``Params`` dataclass with a matching ``type`` field.
-    An instance supplies ``subsystems()``, ``connections()``, ``bus_name`` and ``injection``.
-    Optional ``breakers`` or ``connect()`` enable switching; optional ``retune()`` enables
-    runtime parameter changes.
+    An instance supplies ``subsystems()``, ``connections()`` and ``terminals()``.  Each terminal
+    binds a configured bus name to a :class:`Terminal`; one- and multi-terminal elements use the
+    same interface. Optional ``breakers`` or ``connect()`` enable switching; optional ``retune()``
+    enables runtime parameter changes.
     """
 
     type: ClassVar[str]
@@ -209,9 +247,11 @@ def register_element_type(cls: type) -> type:
 
 
 def element_buses(cfg: Any) -> dict[str, str]:
-    """Return fields named ``bus`` or ending in ``_bus`` from an element's parameters."""
+    """Return fields named ``bus`` or ``busN`` from an element's parameters."""
     return {f.name: getattr(cfg, f.name) for f in fields(cfg)
-            if f.init and (f.name == "bus" or f.name.endswith("_bus"))}
+            if f.init and (f.name == "bus"
+                           or (f.name.startswith("bus") and f.name[3:].isdigit()
+                               and int(f.name[3:]) > 0))}
 
 
 @register_element_type
@@ -237,7 +277,7 @@ class Load(Element):
     type = "load"
 
     def __init__(self, name: str, cfg: Any, buses: dict, p: Any) -> None:
-        self.name, self.cfg, self.bus = name, cfg, buses[cfg.bus]
+        self.name, self.cfg = name, cfg
         self.branch = RLBranch(cfg.l, cfg.r)
         self.breakers = [self.branch]
 
@@ -245,15 +285,10 @@ class Load(Element):
         return {f"{self.name}.branch": self.branch}
 
     def connections(self) -> dict:
-        return {(self.branch, "u_from"): (self.bus, "u")}
+        return {}
 
-    @property
-    def bus_name(self) -> str:
-        return self.cfg.bus
-
-    @property
-    def injection(self) -> tuple:
-        return (self.branch, "i", -1.0)
+    def terminals(self) -> tuple[tuple[str, Terminal], ...]:
+        return ((self.cfg.bus, self.branch.terminal1),)
 
     def signals(self) -> dict[str, complex]:
         return {f"{self.name}.i": self.branch.out.i}

@@ -61,10 +61,14 @@ def _plant_output_row(params: Params, t: float, plant: Mapping[str, Any],
     row: dict[str, float] = {"t": t}
     for key, value in plant.items():
         head, _, what = key.rpartition(".")
-        if what in ("u_g", "i_c", "i", "u") and np.iscomplexobj(value):
-            stem = {"u_g": "v", "i_c": "i_conv", "i": "i", "u": "v"}[what]
+        if np.iscomplexobj(value):
+            stem = {"u_g": "v", "i_c": "i_conv", "u": "v"}.get(what, what)
+            prefix = f"{head}." if head else ""
             for phase, phase_value in zip("abc", complex2abc(complex(value))):
-                row[f"{head}.{stem}_{phase}"] = float(phase_value)
+                row[f"{prefix}{stem}_{phase}"] = float(phase_value)
+        elif not ((head in params.units and what in ("u_dc", "i_dc"))
+                  or (head in params.sources and what == "angle")):
+            row[key] = float(value)
     for name in params.units:
         for what in ("u_dc", "i_dc"):
             key = f"{name}.{what}"
@@ -697,8 +701,13 @@ class Simulation:
                 with np.errstate(over="raise"):
                     sync_if_needed(t_now)
                     for unit in units:
-                        log = (unit.ctrl.continuous_log(t_now)
-                               if getattr(unit, "continuous", False) else None)
+                        if getattr(unit, "continuous", False):
+                            observe_limits = getattr(unit.ctrl, "observe_limits", None)
+                            if observe_limits is not None:
+                                observe_limits(t_now)
+                            log = unit.ctrl.continuous_log(t_now)
+                        else:
+                            log = None
                         if log is not None:
                             rec.last_ctrl_log[unit.name] = log
                             if continuous_record_index % record_every == 0:
@@ -1108,6 +1117,9 @@ _CONFIG_SUFFIXES = (".pes", ".yaml", ".yml", ".json")
 
 def _config_path(value: str | None) -> Path:
     if value is None:
+        default = _EXAMPLE_CONFIGS / "gfl-example.pes"
+        if default.is_file():
+            return default.resolve()
         configs = sorted(
             p for p in _EXAMPLE_CONFIGS.iterdir()
             if p.is_file() and p.suffix.lower() in _CONFIG_SUFFIXES

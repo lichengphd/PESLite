@@ -8,11 +8,19 @@ Signals are pu; time s, angles rad, frequencies rad/s. The controller depends on
 solver's kernel: the hardware adapts to its interface (:class:`Measurement`, :class:`ControlOutput`).
 """
 
-from .loops import LOOP_TYPES, Loop, SignalType, SyncLaw, register_loop_type
+from ..solver import ConfigError
+from .blocks import Filter, Integrator, PI
+from .loops import (ANGLE, FREQUENCY, I, I_AB, I_DQ, LOOP_TYPES, POWER, PQ, V, V_AB, V_DQ,
+                    Loop, SignalType, SyncLaw, register_loop_type)
 from .modulation import ModulationLimiter, OutputStage
-from .controller import (ControlGraph, ControlMeasurement, ControlOutput, Controller, Measurement,
-                         Startup, UniteType, default_wiring, make_controller)
+from .controller import (CONTROL_INTERFACE, ControlGraph, ControlInterface, ControlMeasurement,
+                         ControlOutput, Controller, Measurement, Startup, UniteType,
+                         default_wiring, make_controller)
 
-__all__ = ["Loop", "SyncLaw", "SignalType", "LOOP_TYPES", "register_loop_type", "ControlGraph", "default_wiring",
+__all__ = ["Loop", "SyncLaw", "Integrator", "PI", "Filter", "SignalType", "ConfigError",
+           "I_AB", "V_AB", "I_DQ", "V_DQ", "I", "V",
+           "ANGLE", "FREQUENCY", "POWER", "PQ",
+           "LOOP_TYPES", "register_loop_type", "ControlInterface", "CONTROL_INTERFACE",
+           "ControlGraph", "default_wiring",
            "ModulationLimiter", "OutputStage", "Measurement", "ControlMeasurement", "ControlOutput",
            "Controller", "Startup", "UniteType", "make_controller"]

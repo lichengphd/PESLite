@@ -29,7 +29,7 @@ class ExportResult:
     files: tuple[Path, ...]
 
 
-Exporter = Callable[["Simulation", Path, str, tuple[str, ...]], ExportResult]
+Exporter = Callable[["Simulation", Path, str, tuple[str, ...], bool], ExportResult]
 EXPORTERS: dict[str, Exporter] = {}
 
 
@@ -59,9 +59,12 @@ def export(what: Params | "Simulation", format: str, out_dir: str | Path | None 
     if key not in EXPORTERS:
         known = ", ".join(sorted(EXPORTERS)) or "none"
         raise ValueError(f"unknown export format {format!r}; known: {known}")
-    simulation = what if isinstance(what, Simulation) else Simulation(what)
+    caller_owned = isinstance(what, Simulation)
+    simulation = what if caller_owned else Simulation(what)
     if simulation.result is not None:
         raise RuntimeError("an already-run Simulation cannot be exported; build one from its Params")
     destination = Path(out_dir) if out_dir is not None else Path("export") / name
     selected = tuple(str(path) for path in variables)
-    return EXPORTERS[key](simulation, destination, name, selected)
+    # Backends may prepare an internally constructed Simulation in place.  A Simulation supplied
+    # by the caller remains private to the caller and therefore must still be copied by a backend.
+    return EXPORTERS[key](simulation, destination, name, selected, not caller_owned)

@@ -16,6 +16,7 @@ theme:
 nav:
   - Home: index.md
   - Getting Started: Getting-Started.md
+  - Project Workspace: Project-Workspace.md
   - Simulation Files: Simulation-Files.md
   - Simulation:
       - Converter and Bridge Models: Converter-and-Bridge-Models.md

@@ -118,8 +118,8 @@ def test_bus_without_own_source_keeps_default_and_explicit_values_win(case, tmp_
         b3={"c_pu": 0.02, "r_d_pu": 0.5},
     )
     tree["branches"] = {
-        "l2": {"from_bus": "pcc", "to_bus": "b2", "x_pu": 0.1},
-        "l3": {"from_bus": "b2", "to_bus": "b3", "x_pu": 0.1},
+        "l2": {"bus1": "pcc", "bus2": "b2", "x_pu": 0.1},
+        "l3": {"bus1": "b2", "bus2": "b3", "x_pu": 0.1},
     }
     tree["sources"]["grid"]["v_pu"] = 1.05
     tree["sources"]["g2"] = {"bus": "b2", "x_pu": 0.4, "v_pu": 0.95}

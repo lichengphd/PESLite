@@ -178,7 +178,7 @@ def test_shortened_multirate_window_uses_its_length_and_keeps_the_grid(method):
     def build():
         flow, capacitor = _ConstantFlow(2.0), RCNode(1.0, 0.0)
         model = Model({"flow": flow, "capacitor": capacitor},
-                      {(capacitor, "i_in"): (flow, "flow")})
+                      {(capacitor, "i"): (flow, "flow")})
         solver = MultirateSolver(
             model, {"capacitor": {"step": 4, "method": method}}, dt=0.001
         )

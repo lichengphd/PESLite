@@ -65,7 +65,7 @@ class Bridge:
     def connections(self, dc_link, ac_branch) -> dict:
         """Return the connections of the bridge to ``dc_link`` and ``ac_branch``."""
         return {
-            (ac_branch, "u_from"): (self, "u_c"),
+            (ac_branch, "u1"): (self, "u_c"),
             (self, "i_c"): (ac_branch, "i"),
             (dc_link, "i_dc"): (self, "i_dc"),
             (self, "u_dc"): (dc_link, "u_dc"),

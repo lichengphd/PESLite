@@ -12,15 +12,27 @@ src/peslite/
 ├── control/      control loops, graphs, startup and modulation
 ├── assembly/     parameters, events, protection, units, systems and exporters
 ├── solver/       connected model kernel, energy model, integrators and simulation run
-└── addons/       optional post-processing features, loaded only when requested
+└── addons/       custom extension entry points and optional functions
+    ├── controllers/  automatically discovered custom control-loop modules
+    ├── components/   automatically discovered custom circuit-element modules
+    └── functions/    optional user-facing functions such as IEEE PDF plotting
 ```
 
 Dependencies point inward through small interfaces: components use the model kernel, controller
 logic uses typed signals, assembly wires both into a system, and `solver.simulation` schedules the
 assembled system.
 
-Optional dependencies stay behind the `addons` boundary. For example, IEEE-style plotting reads
-closed result CSV files after a run and is absent from the solver path and generated C++ source.
+Controller and component modules in their respective add-on packages are imported once at package
+initialisation. Their decorators populate the same registries used by built-in types, so there is
+no add-on lookup or dispatch in the simulation hot path. Optional dependencies stay behind the
+`addons/functions` boundary. IEEE-style plotting reads closed result CSV files after a run and is
+absent from the solver path and generated C++ source.
+
+Loading a simulation file also merges a sibling `PESaddons/` tree into these three package paths.
+Its controller and component modules register before parameter-schema resolution; its function
+modules remain lazy. The merge is a construction-time project extension and adds no work to the
+simulation loop. `PESaddons` is anchored to the simulation file, while the CLI's default `output/`
+directory is anchored to the current working directory.
 
 ## Components
 
@@ -32,12 +44,25 @@ converter peripherals.
 Physical component state and parameters are SI quantities. Components declare ports, state,
 derivatives and energy/storage relationships without knowing the global system order.
 
+Every physical network attachment uses the same construction-time `Terminal` contract. A terminal
+names its voltage and current once, with positive direction defined into the component; a one-port
+component binds `bus`, while a branch or other two-port component binds `bus1` and `bus2`. System
+assembly lowers this metadata to direct model connections before integration begins.
+
 ## Control
 
 Each loop owns its parameter schema, typed ports, state and sampled/continuous update. `ControlGraph`
 checks wiring and creates an execution plan. Sampled graphs require an explicit delay to break a
 cycle; continuous graphs identify strongly connected loop groups and solve only those cyclic
 groups iteratively.
+
+The graph has one typed, directed boundary. Its input ports are the measured feedback signals
+(`meas.*`) and controller references (`references.*`); its output ports are `u_dq`, `theta` and
+`omega`. A connection always binds a loop input to a boundary or loop output. Default GFL/GFM
+wiring and explicit custom wiring are both lowered to this same graph before the run.
+
+Control ports use one canonical set of signal representations: complex vectors `I_AB`, `V_AB`,
+`I_DQ`, `V_DQ` and `PQ`; scalar `I`, `V` and `POWER`; and scalar `ANGLE` and `FREQUENCY`.
 
 `Startup` owns run/stop and reference-ramp progress. The modulation output stage converts controller
 voltage commands into duty ratios. Protection does not belong to the controller.

@@ -26,7 +26,7 @@ def _load(tree, name="load", **values):
 def _line(tree):
     tree["buses"]["remote"] = {"c_pu": 0.02, "r_d_pu": 0.5}
     tree.setdefault("branches", {})["line"] = {
-        "from_bus": "pcc", "to_bus": "remote", "x_pu": 0.1, "r_pu": 0.01,
+        "bus1": "pcc", "bus2": "remote", "x_pu": 0.1, "r_pu": 0.01,
     }
     return tree
 
@@ -52,22 +52,17 @@ class _PassiveShunt(Element):
     type = "test_passive_shunt"
 
     def __init__(self, name, cfg, buses, p):
-        self.name, self.cfg, self.bus = name, cfg, buses[cfg.bus]
+        self.name, self.cfg = name, cfg
         self.branch = RLBranch(cfg.l, cfg.r)
 
     def subsystems(self):
         return {f"{self.name}.branch": self.branch}
 
     def connections(self):
-        return {(self.branch, "u_from"): (self.bus, "u")}
+        return {}
 
-    @property
-    def bus_name(self):
-        return self.cfg.bus
-
-    @property
-    def injection(self):
-        return self.branch, "i", -1.0
+    def terminals(self):
+        return ((self.cfg.bus, self.branch.terminal1),)
 
 
 def test_builtin_load_is_typed_scaled_built_and_written(tmp_path):
@@ -193,6 +188,7 @@ def test_system_switches_units_sources_and_loads():
 def test_system_applies_retunes_and_control_loops_keep_their_state():
     tree = _line(_load(_tree()))
     tree["units"]["vsc"]["bridge"] = {"model": "pwm_averaging"}
+    tree["units"]["vsc"]["ctrl"]["loops"]["dvc"]["antiwindup"] = 0
     tree["events"]["connect_vsc"].update(t=0.0, ramp=0.0)
     tree["events"]["retune"] = {"type": "set", "t": 0.001, "set": {
         "buses.pcc.c_pu": 0.03,
@@ -229,8 +225,8 @@ def test_system_applies_retunes_and_control_loops_keep_their_state():
     old_pll = unit.ctrl.graph.nodes["pll"]
     old_pll.theta, old_pll.integral = 1.2, 0.3
     old_dvc = unit.ctrl.graph.nodes["dvc"]
-    old_dvc.integral, old_dvc.n_updates, old_dvc.n_clamped = 0.2, 5, 2
-    old_dvc.n_reverse, old_dvc.first_clamp_t = 1, 4e-4
+    old_dvc.integral, old_dvc.n_updates, old_dvc.n_limit_exceeded = 0.2, 5, 2
+    old_dvc.n_reverse, old_dvc.first_limit_t = 1, 4e-4
     system.apply(change)
     current = change.params
     assert bus.state.u_C == 3 + 4j
@@ -258,7 +254,7 @@ def test_system_applies_retunes_and_control_loops_keep_their_state():
     assert pll.theta == pytest.approx(1.2 + pll.T * (pll.w0 + pll.ki * 0.3))
     dvc = unit.ctrl.graph.nodes["dvc"]
     assert dvc is not old_dvc and dvc.kp == 0.4 and dvc.integral == 0.2
-    assert (dvc.n_updates, dvc.n_clamped, dvc.n_reverse, dvc.first_clamp_t) == (6, 3, 1, 4e-4)
+    assert (dvc.n_updates, dvc.n_limit_exceeded, dvc.n_reverse, dvc.first_limit_t) == (6, 3, 1, 4e-4)
     assert unit.ctrl.graph.references["p_ref_pu"] == 0.4
 
     specs = system.model.energy_specs

@@ -35,8 +35,8 @@ class _LaggedPSC(SyncLaw):
         super().__init__(cfg, unit, scenario)
         self.p_f = 0.0
 
-    def step(self, period, p_pu, q_pu, v_mag_pu, v_dc_pu,
-             p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
+    def _sample(self, period, p_pu, q_pu, v_mag_pu, v_dc_pu,
+                p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
         self.p_f += period / self.cfg.tau * (p_pu - self.p_f)
         self.omega = self.w0 + self.cfg.k_p_pu * (p_ref_pu - self.p_f)
         self.theta += period * self.omega
@@ -62,22 +62,17 @@ class _ShuntRL(Element):
     type = "test_shunt_rl"
 
     def __init__(self, name, cfg, buses, _params):
-        self.name, self.cfg, self.bus = name, cfg, buses[cfg.bus]
+        self.name, self.cfg = name, cfg
         self.branch = RLBranch(cfg.l, cfg.r)
 
     def subsystems(self):
         return {f"{self.name}.branch": self.branch}
 
     def connections(self):
-        return {(self.branch, "u_from"): (self.bus, "u")}
+        return {}
 
-    @property
-    def bus_name(self):
-        return self.cfg.bus
-
-    @property
-    def injection(self):
-        return self.branch, "i", -1.0
+    def terminals(self):
+        return ((self.cfg.bus, self.branch.terminal1),)
 
     def retune(self, cfg):
         self.cfg = cfg

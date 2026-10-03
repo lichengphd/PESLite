@@ -101,6 +101,10 @@ top-level sections:
 | `simulation` | End time, solver, initial values, output and progress. |
 | `meta` | Optional title and description; does not affect the run. |
 
+A `.pes` file may optionally use a sibling `PESaddons/` directory for project-local extensions.
+The simulation file, extension paths and local output layout are described together in
+[Project Workspace](Project-Workspace.md).
+
 A compact complete case looks like this:
 
 ```yaml

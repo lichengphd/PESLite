@@ -22,7 +22,7 @@ from collections.abc import Mapping as _Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from pathlib import Path
-from typing import Any, Optional, Union, get_args, get_origin, get_type_hints
+from typing import Any, Callable, Optional, Union, get_args, get_origin, get_type_hints
 
 from ..components.network import ELEMENT_TYPES, element_buses
 from ..control.loops import LOOP_TYPES
@@ -190,13 +190,13 @@ class BusParams:
 
 @dataclass(frozen=True)
 class BranchParams:
-    """Series R-L branch between two buses; current positive from ``from_bus`` to ``to_bus``.
+    """Series R-L branch between two buses; current positive from ``bus1`` to ``bus2``.
 
     ``l`` in H, ``r`` in ohm; pu inputs use the system base. Connect/disconnect events switch it.
     """
 
-    from_bus: str
-    to_bus: str
+    bus1: str
+    bus2: str
     l: float
     r: float = 0.0
     _quantities = {"l": "inductance", "r": "resistance"}
@@ -1007,6 +1007,14 @@ def set_changes(p: Params) -> tuple[Change, ...]:
 
 # ------------------------------------------------------------------ files
 
+_LOAD_PREPARERS: list[Callable[[str | Path], Any]] = []
+
+
+def _register_load_preparer(function: Callable[[str | Path], Any]) -> None:
+    """Register construction-time preparation performed before a file is parsed."""
+    if function not in _LOAD_PREPARERS:
+        _LOAD_PREPARERS.append(function)
+
 def load(path: str | Path, initial: str | Path | None = None,
          initial_time: Optional[float] = None, **overrides: Any) -> Params:
     """Load a YAML/JSON configuration, optionally replace its initial state, and apply overrides.
@@ -1014,6 +1022,8 @@ def load(path: str | Path, initial: str | Path | None = None,
     ``initial``: states CSV (last row, or the row at ``initial_time`` in s) or YAML/JSON.
     ``overrides``: dotted paths, e.g. ``load("case.pes", **{"simulation.t_end": 5.0})``.
     """
+    for prepare in _LOAD_PREPARERS:
+        prepare(path)
     p = from_dict(read_tree(path))
     if initial is not None:
         init = read_initial(initial, initial_time)

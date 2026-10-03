@@ -31,7 +31,7 @@ Do not provide both forms of the same parameter.
 base: {s_base: 2.0e6, v_ll_rms: 690.0, f0: 50.0}
 
 branches:
-  line: {from_bus: grid_bus, to_bus: pcc, l_pu: 0.2, r_pu: 0.02}
+  line: {bus1: grid_bus, bus2: pcc, l_pu: 0.2, r_pu: 0.02}
 ```
 
 Each converter may define its own `s_base`; otherwise it uses the system base. Controller

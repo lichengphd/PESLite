@@ -2,8 +2,9 @@
 
 The package has five parts: :mod:`.components` (power circuit and converter hardware),
 :mod:`.control` (the converter's controller), :mod:`.assembly` (a system built from a simulation
-file), :mod:`.solver` (the model kernel, integrators and run), and :mod:`.addons` (optional
-post-processing). Plant quantities are in SI; controllers work in each unit's pu bases.
+file), :mod:`.solver` (the model kernel, integrators and run), and :mod:`.addons` (custom extension
+entry points and optional functions). Plant quantities are in SI; controllers work in each unit's
+pu bases.
 """
 
 from . import solver, control, components, assembly
@@ -15,11 +16,15 @@ from .assembly import (Params, Protection, SourceScenario, System, Unit, dump, d
                        register_event_type)
 from .solver.simulation import Simulation, SimulationResult, main
 from .assembly.exporter import ExportResult, export
+from . import addons
+from .assembly.params import _register_load_preparer
 
-__version__ = "0.2.3"
+_register_load_preparer(addons._discover_for)
+
+__version__ = "0.3.0"
 
 __all__ = [
-    "solver", "control", "components", "assembly",
+    "solver", "control", "components", "assembly", "addons",
     "Params", "load", "dump", "dumps", "System", "Unit", "Protection", "MeasurementPorts", "Model", "SourceScenario",
     "Simulation", "SimulationResult", "ExportResult", "export", "UniteType", "main", "make_controller", "make_modulator", "make_solver",
     "register_loop_type", "register_element_type", "register_event_type",

@@ -13,12 +13,38 @@ from peslite.components import (
     AveragingBridge,
     MeasurementPorts,
     PWM,
+    RCNode,
+    RLBranch,
+    Terminal,
     ZOH,
 )
 from peslite.control.blocks import abc2complex
 
 COMPONENTS = Path(peslite.components.__file__).parent
 PACKAGE = COMPONENTS.parent
+
+
+def test_electrical_terminals_use_the_energy_direction_and_numbered_voltage_ports():
+    branch = RLBranch(0.1, 0.01)
+
+    assert (branch.terminal1.subsystem, branch.terminal1.voltage,
+            branch.terminal1.current, branch.terminal1.direction) == (
+                branch, "u1", "i", 1,
+            )
+    assert (branch.terminal2.subsystem, branch.terminal2.voltage,
+            branch.terminal2.current, branch.terminal2.direction) == (
+                branch, "u2", "i", -1,
+            )
+    assert [port.sign for port in branch.ports] == [
+        branch.terminal1.direction, branch.terminal2.direction,
+    ]
+
+    node = RCNode(0.1, 0.01)
+    assert node.inp.__slots__ == ("i",)
+    with pytest.raises(ValueError, match="direction must be"):
+        Terminal(branch, "u1", "i", 0)
+    with pytest.raises(ValueError, match="does not match the energy-port direction"):
+        Terminal(branch, "u1", "i", -1)
 
 
 def test_unit_delegates_sampling_to_adc_and_actuation_to_bridge():

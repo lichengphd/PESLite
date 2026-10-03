@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.0
+
+- Unified one- and multi-terminal electrical elements behind the `Terminal` contract, with
+  numbered `busN`, voltage and current ports and construction-time current-direction handling.
+- Added shared sampled/continuous `Integrator`, `PI` and transfer-function `Filter` blocks, typed
+  controller connections and controller-owned output limits with sampled tracking anti-windup.
+- Organised add-ons into automatically discovered `controllers` and `components` extension
+  packages plus an optional `functions` package; a `PESaddons` directory beside a simulation file
+  contributes the same project-local extension paths.
+- Added voltage-adaptive PLL and distributed R-L/G-C cable add-ons, together with simulation-file
+  examples that run under switching, PWM-period-averaged and ideal averaged bridge models.
+- Added a general C++ fallback for pure numerical custom component outputs, state equations,
+  energy equations and public signals while retaining specialised lowering for built-in parts.
+- Documented the project workspace, custom component/controller construction and current C++
+  export boundary.
+
 ## 0.2.3
 
 - Added an optional `peslite.addons` plotting function and `--plot` post-processing interface for

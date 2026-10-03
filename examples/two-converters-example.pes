@@ -6,8 +6,8 @@ buses:
   bus1: {c_pu: 0.02, r_d_pu: 0.5}
   bus2: {c_pu: 0.02, r_d_pu: 0.5}
 branches:
-  line1: {from_bus: bus1, to_bus: pcc, x_pu: 0.05, r_pu: 0.005}
-  line2: {from_bus: bus2, to_bus: pcc, x_pu: 0.08, r_pu: 0.008}
+  line1: {bus1: bus1, bus2: pcc, x_pu: 0.05, r_pu: 0.005}
+  line2: {bus1: bus2, bus2: pcc, x_pu: 0.08, r_pu: 0.008}
 sources:
   grid:
     bus: pcc

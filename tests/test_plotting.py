@@ -7,8 +7,8 @@ import numpy as np
 import pytest
 
 from peslite.addons import plot_csv, plot_result
-from peslite.addons import plotting
-from peslite.addons.plotting import _time_scale
+from peslite.addons.functions import plotting
+from peslite.addons.functions.plotting import _time_scale
 from peslite.solver.simulation import main
 
 
