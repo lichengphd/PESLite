@@ -17,6 +17,9 @@ from .assembly import (Params, Protection, SourceScenario, System, Unit, dump, d
 from .solver.simulation import Simulation, SimulationResult, main
 from .assembly.exporter import ExportResult, export
 from . import addons
+from .assembly.params import _register_load_preparer
+
+_register_load_preparer(addons._discover_for)
 
 __version__ = "0.2.3"
 

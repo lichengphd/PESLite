@@ -23,7 +23,8 @@ and a Python API.
 - Streamed CSV output, energy accounting, port-Hamiltonian structure reporting and a lazy Python
   result API.
 - Optional IEEE/LaTeX-style vector PDF plots from completed CSV results.
-- Registration APIs for custom control loops, circuit elements, events and solvers.
+- Optional project-local extensibility through a `PESaddons/` directory beside a simulation file, plus
+  registration APIs for custom control loops, circuit elements, events and solvers.
 - Export as a parameter-specialized, standalone C++17 simulator with no third-party C++ runtime
   dependencies.
 

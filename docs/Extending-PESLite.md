@@ -1,13 +1,17 @@
 # Extending PESLite
 
 PESLite uses registries and small typed protocols for custom control loops, circuit elements and
-events. Modules placed in `peslite/addons/controllers/` or `peslite/addons/components/` are imported
-automatically when PESLite starts and register into the same type tables as built-in modules.
-Types kept elsewhere can still be imported and registered explicitly before loading a simulation
-file that names them.
+events. Installed modules under `peslite/addons/` and project-local modules under a `PESaddons/`
+directory beside a simulation file share the same package search paths and registries. Types kept
+elsewhere can still be imported and registered explicitly before loading a simulation file that
+names them.
 
 Executable examples live in `tests/test_custom_parts.py`; Python implementation files are not
 placed in the root `examples/` directory.
+
+Project-local controllers, components and functions can live beside a simulation rather than in
+the installed package. Their exact search rules and their relationship to the output directory are
+defined once in [Project Workspace](Project-Workspace.md).
 
 The bundled `custom-pll-example` demonstrates this layout: its `.pes` file remains in `examples/`,
 while `peslite.addons.controllers.voltage_adaptive_pll` contains the executable custom loop. It

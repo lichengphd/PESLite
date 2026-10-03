@@ -82,6 +82,93 @@ def test_addon_entry_points_match_builtin_public_apis():
     assert addon_components.ELEMENT_TYPES is ELEMENT_TYPES
 
 
+def test_pesaddons_beside_simulation_file_merges_project_paths(examples, tmp_path):
+    root = tmp_path / "project"
+    controllers = root / "PESaddons/controllers"
+    components = root / "PESaddons/components"
+    functions = root / "PESaddons/functions"
+    controllers.mkdir(parents=True)
+    components.mkdir()
+    functions.mkdir()
+    (controllers / "project_local_pll.py").write_text(
+        """import cmath
+from dataclasses import dataclass
+from peslite.addons.controllers import (ANGLE, FREQUENCY, V_AB, Integrator, Loop,
+                                         register_loop_type)
+
+@register_loop_type
+class ProjectLocalPLL(Loop):
+    @dataclass(frozen=True, kw_only=True)
+    class Params:
+        kp_pu: float
+        ki_pu: float
+        period: float | None = None
+        type: str = "project_local_pll"
+
+    type = "project_local_pll"
+    role = "pll"
+    inputs = {"v": V_AB}
+    outputs = {"theta": ANGLE, "frame": ANGLE, "omega": FREQUENCY}
+    flow_inputs = ("v",)
+
+    def __init__(self, cfg, unit, startup):
+        super().__init__(cfg, unit, startup)
+        self.w0 = unit.base.w0
+        self.angle = self.state_block("theta", Integrator(self.block_period))
+        self.integral = self.state_block("integral_pu", Integrator(self.block_period))
+        self.omega = self.w0
+
+    def initial_outputs(self):
+        return {"theta": self.angle.value, "frame": self.angle.value, "omega": self.omega}
+
+    def equation(self, voltage):
+        frame = self.angle.value
+        error = (voltage * cmath.exp(-1j * frame)).imag
+        self.omega = self.w0 + self.cfg.kp_pu * error + self.cfg.ki_pu * self.integral(error)
+        theta = self.angle(self.omega)
+        return theta, frame, self.omega
+""",
+        encoding="utf-8",
+    )
+    (components / "project_local_element.py").write_text(
+        """from dataclasses import dataclass
+from peslite.addons.components import Load, register_element_type
+
+@register_element_type
+class ProjectLocalElement(Load):
+    @dataclass(frozen=True, kw_only=True)
+    class Params(Load.Params):
+        type: str = "project_local_element"
+
+    type = "project_local_element"
+""",
+        encoding="utf-8",
+    )
+    (functions / "project_local_function.py").write_text("VALUE = 42\n", encoding="utf-8")
+
+    case = root / "local-case.pes"
+    case.write_text(
+        (examples / "gfl-example.pes").read_text(encoding="utf-8").replace(
+            "type: srf_pll", "type: project_local_pll", 1
+        ) + "\nelements:\n  project_load: {type: project_local_element, bus: pcc, l: 0.001, r: 1.0}\n",
+        encoding="utf-8",
+    )
+
+    params = peslite.load(case)
+    simulation = peslite.Simulation(params)
+    local_function = importlib.import_module(
+        "peslite.addons.functions.project_local_function"
+    )
+
+    assert type(simulation.unit().ctrl.graph.nodes["pll"]).__name__ == "ProjectLocalPLL"
+    assert params.elements["project_load"].type == "project_local_element"
+    assert local_function.VALUE == 42
+    assert str((root / "PESaddons").resolve()) in peslite.addons.__path__
+    assert str(controllers.resolve()) in addon_controllers.__path__
+    assert str(components.resolve()) in addon_components.__path__
+    assert str(functions.resolve()) in peslite.addons.functions.__path__
+
+
 @pytest.mark.parametrize("model", ["switching", "pwm_averaging", "averaging"])
 def test_custom_pll_assembles_with_builtin_loops_and_runs(examples, tmp_path, model):
     params = peslite.load(

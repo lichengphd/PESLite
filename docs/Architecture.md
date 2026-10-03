@@ -28,6 +28,12 @@ no add-on lookup or dispatch in the simulation hot path. Optional dependencies s
 `addons/functions` boundary. IEEE-style plotting reads closed result CSV files after a run and is
 absent from the solver path and generated C++ source.
 
+Loading a simulation file also merges a sibling `PESaddons/` tree into these three package paths.
+Its controller and component modules register before parameter-schema resolution; its function
+modules remain lazy. The merge is a construction-time project extension and adds no work to the
+simulation loop. `PESaddons` is anchored to the simulation file, while the CLI's default `output/`
+directory is anchored to the current working directory.
+
 ## Components
 
 `components/network.py` contains grid sources, R-L branches, bus R-C nodes and registered element

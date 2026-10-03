@@ -49,6 +49,7 @@ See [Getting Started](Getting-Started.md) to create a case and inspect its resul
 ## Documentation
 
 - [Getting Started](Getting-Started.md)
+- [Project Workspace](Project-Workspace.md)
 - [Simulation Files](Simulation-Files.md)
 - [Converter and Bridge Models](Converter-and-Bridge-Models.md)
 - [Control and PWM Timing](Control-and-PWM-Timing.md)
