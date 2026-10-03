@@ -225,8 +225,8 @@ def test_system_applies_retunes_and_control_loops_keep_their_state():
     old_pll = unit.ctrl.graph.nodes["pll"]
     old_pll.theta, old_pll.integral = 1.2, 0.3
     old_dvc = unit.ctrl.graph.nodes["dvc"]
-    old_dvc.integral, old_dvc.n_updates, old_dvc.n_clamped = 0.2, 5, 2
-    old_dvc.n_reverse, old_dvc.first_clamp_t = 1, 4e-4
+    old_dvc.integral, old_dvc.n_updates, old_dvc.n_limit_exceeded = 0.2, 5, 2
+    old_dvc.n_reverse, old_dvc.first_limit_t = 1, 4e-4
     system.apply(change)
     current = change.params
     assert bus.state.u_C == 3 + 4j
@@ -254,7 +254,7 @@ def test_system_applies_retunes_and_control_loops_keep_their_state():
     assert pll.theta == pytest.approx(1.2 + pll.T * (pll.w0 + pll.ki * 0.3))
     dvc = unit.ctrl.graph.nodes["dvc"]
     assert dvc is not old_dvc and dvc.kp == 0.4 and dvc.integral == 0.2
-    assert (dvc.n_updates, dvc.n_clamped, dvc.n_reverse, dvc.first_clamp_t) == (6, 3, 1, 4e-4)
+    assert (dvc.n_updates, dvc.n_limit_exceeded, dvc.n_reverse, dvc.first_limit_t) == (6, 3, 1, 4e-4)
     assert unit.ctrl.graph.references["p_ref_pu"] == 0.4
 
     specs = system.model.energy_specs

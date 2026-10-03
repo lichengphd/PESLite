@@ -49,8 +49,9 @@ def test_cli_export_preserves_mode_name_and_emits_one_file(tmp_path, monkeypatch
     source = project / "peslite.cpp"
     assert tuple(project.iterdir()) == (source,)
     text = source.read_text()
-    assert "if constexpr (false) integrate_fixed" in text
-    assert "else integrate_adaptive" in text
+    assert "void integrate(double& t, double target)" in text
+    assert "integrate_fixed" not in text
+    assert "integrate_adaptive" not in text
 
 
 def test_convert_alias_and_all_variables(tmp_path, monkeypatch):

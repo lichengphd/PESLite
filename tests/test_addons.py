@@ -9,7 +9,7 @@ from peslite.addons import components as addon_components
 from peslite.addons import controllers as addon_controllers
 from peslite.addons.controllers.voltage_adaptive_pll import VoltageAdaptivePLL
 from peslite.components import ELEMENT_TYPES
-from peslite.control import LOOP_TYPES
+from peslite.control import LOOP_TYPES, Loop
 
 
 def test_controller_addon_path_registers_loops(tmp_path, monkeypatch):
@@ -97,6 +97,9 @@ def test_custom_pll_assembles_with_builtin_loops_and_runs(examples, tmp_path, mo
 
     assert set(nodes) == {"pll", "cc", "dvc"}
     assert isinstance(nodes["pll"], VoltageAdaptivePLL)
+    assert type(nodes["pll"]).sample is Loop.sample
+    assert type(nodes["pll"]).flow_path is Loop.flow_path
+    assert set(nodes["pll"]._state_blocks) == {"theta", "omega_g", "u_g_pu"}
     assert nodes["cc"].type == "dq_current_pi"
     assert nodes["dvc"].type == "dc_voltage_pi"
 

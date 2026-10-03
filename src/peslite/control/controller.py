@@ -109,10 +109,10 @@ class ControlInterface:
     outputs: Mapping[str, SignalType]
 
 
-class _PIOutputConstraint:
-    """Controller-owned scalar/magnitude constraint with PI-owned tracking correction."""
+class _OutputLimit:
+    """Controller-owned scalar/magnitude limit; sampled use may track a PI."""
 
-    def __init__(self, pi, limit: float, *, lower=None, active=None, observer=None):
+    def __init__(self, limit: float, *, lower=None, pi=None, active=None, observer=None):
         self.pi = pi
         self.limit = float(limit)
         self.lower = lower
@@ -123,7 +123,7 @@ class _PIOutputConstraint:
             raise ConfigError("a controller output limit must be finite and positive")
         if lower is not None and (not math.isfinite(lower) or lower >= self.limit):
             raise ConfigError("a controller output lower limit must be finite and below its upper limit")
-        if pi.antiwindup_enabled and pi.kp == 0.0:
+        if pi is not None and pi.antiwindup_enabled and pi.kp == 0.0:
             raise ConfigError("tracking anti-windup requires a nonzero proportional gain")
 
     def _apply(self, intended):
@@ -132,24 +132,20 @@ class _PIOutputConstraint:
         magnitude = abs(intended)
         return intended * (self.limit / magnitude) if magnitude > self.limit else intended
 
+    def exceeded(self, intended) -> bool:
+        if self.lower is not None:
+            return intended < self.lower or intended > self.limit
+        return abs(intended) > self.limit
+
     def sample(self, t, intended):
         output = self._apply(intended)
         self.saturated = output != intended
-        if self.saturated and (self.active is None or self.active()):
+        if (self.saturated and self.pi is not None
+                and (self.active is None or self.active())):
             self.pi.antiwindup(intended, output)
         if self.observer is not None:
             self.observer(t, intended, output, count=True)
         return output
-
-    def flow(self, t, intended, derivative):
-        output = self._apply(intended)
-        self.saturated = output != intended
-        if self.saturated and (self.active is None or self.active()):
-            derivative += self.pi.antiwindup_flow(intended, output)
-        if self.observer is not None:
-            self.observer(t, intended, output, count=False)
-        return output, derivative
-
 
 # ------------------------------------------------------------------ the start-up sequence
 
@@ -318,7 +314,7 @@ class ControlGraph:
         self._t0 = cfg.pwm.grid_offset
         self.values: dict[str, Any] = {}
         self._out_specs: dict[str, tuple] = {}
-        self._constraints: dict[str, tuple[str, str, _PIOutputConstraint]] = {}
+        self._limits: dict[str, tuple[str, _OutputLimit]] = {}
         self.updated = set()
         refs = cfg.ctrl.references
         self.references = {f.name: getattr(refs, f.name) for f in fields(refs)}
@@ -339,7 +335,7 @@ class ControlGraph:
             self.periods[name] = loop.period
             self._store(name, node.initial_outputs())
             types.update({f"{name}.{port}": spec for port, spec in node.outputs.items()})
-        self._updates = {name: node.update for name, node in self.nodes.items()}
+        self._samples = {name: node.sample for name, node in self.nodes.items()}
         dependencies = {name: set() for name in self.nodes}
         targets = set()
         for name, node in self.nodes.items():
@@ -409,7 +405,7 @@ class ControlGraph:
         self.dc_affected = frozenset(affected)
         self._rewire()
         if self.continuous:
-            self._prepare_continuous_buffers()
+            self._prepare_flow()
         self._every = (() if self.continuous else
                        tuple((name, max(1, int(round(T / self._T))))
                              for name, T in self.periods.items()))
@@ -417,30 +413,26 @@ class ControlGraph:
                                  frozenset(name for name, every in self._every)
                                  if all(every == 1 for _name, every in self._every) else None)
 
-    def constrain(self, name, port, state, constraint):
-        """Attach a controller-owned output constraint to a loop and its PI state derivative."""
+    def limit_output(self, name, port, limit):
+        """Attach a controller-owned limit to one sampled loop output."""
+        if self.continuous:
+            raise RuntimeError("continuous control limits are observed, not applied")
         node = self.nodes.get(name)
         if node is None or port not in node.outputs:
-            raise ConfigError(f"controller constraint: unknown output {name}.{port}")
-        if state not in node.continuous_state():
-            raise ConfigError(f"controller constraint: {name} has no PI state {state!r}")
-        self._constraints[name] = (port, state, constraint)
-        update = node.update
+            raise ConfigError(f"controller limit: unknown output {name}.{port}")
+        self._limits[name] = (port, limit)
+        sample = node.sample
 
-        def constrained_update(t, inputs):
-            outputs = update(t, inputs)
-            outputs[port] = constraint.sample(t, outputs[port])
+        def limited_sample(t, inputs):
+            outputs = sample(t, inputs)
+            outputs[port] = limit.sample(t, outputs[port])
             return outputs
 
-        self._updates[name] = constrained_update
-        if self.continuous:
-            self._prepare_continuous_buffers()
+        self._samples[name] = limited_sample
 
-    def clear_constraint(self, name):
-        if self._constraints.pop(name, None) is not None:
-            self._updates[name] = self.nodes[name].update
-            if self.continuous:
-                self._prepare_continuous_buffers()
+    def clear_limit(self, name):
+        if self._limits.pop(name, None) is not None:
+            self._samples[name] = self.nodes[name].sample
 
     @staticmethod
     def _continuous_components(dependencies):
@@ -530,79 +522,75 @@ class ControlGraph:
         self._latching = frozenset(n for n, node in self.nodes.items() if node.delayed)
         self._output_source = {port: self._resolve(source) for port, source in self.outputs.items()}
 
-    def _prepare_continuous_buffers(self):
-        """Allocate the fixed loop input/output/flow mappings once for continuous RHS calls."""
-        self._continuous_inputs = {
+    def _prepare_flow(self):
+        """Build the fixed buffers and runner for continuous loop-flow evaluations."""
+        self._flow_inputs = {
             name: {port: 0.0 for port in node.inputs}
             for name, node in self.nodes.items()
         }
-        self._continuous_outputs = {
+        self._flow_outputs = {
             name: {port: self.values[key] for port, key, _complex in self._out_specs[name]}
             for name in self.nodes
         }
-        self._continuous_flows = {
-            name: dict(node.continuous_state())
+        self._flow_derivatives = {
+            name: dict(node.flow_state())
             for name, node in self.nodes.items()
         }
-        self._continuous_flow_specs = {
+        self._flow_derivative_specs = {
             name: tuple((local, f"{name}.{local}") for local in flow)
-            for name, flow in self._continuous_flows.items()
+            for name, flow in self._flow_derivatives.items()
         }
-        self.continuous_state_names = tuple(
-            key for name in self.order for _local, key in self._continuous_flow_specs[name]
+        self.flow_state_names = tuple(
+            key for name in self.order for _local, key in self._flow_derivative_specs[name]
         )
-        self._continuous_derivative_index = {
-            key: index for index, key in enumerate(self.continuous_state_names)
+        self._flow_derivative_index = {
+            key: index for index, key in enumerate(self.flow_state_names)
         }
-        self._continuous_cycle_keys = {
+        self._flow_cycle_keys = {
             group: tuple(key for name in group for _port, key, _complex in self._out_specs[name])
             for group in self._continuous_cycles
         }
         steps = {
             name: (
-                name, node.continuous_into, self._wiring[name], self._continuous_inputs[name],
-                self._continuous_outputs[name], self._continuous_flows[name],
-                self._out_specs[name], self._continuous_flow_specs[name],
+                name, node.flow_into, self._wiring[name], self._flow_inputs[name],
+                self._flow_outputs[name], self._flow_derivatives[name],
+                self._out_specs[name], self._flow_derivative_specs[name],
             )
             for name, node in self.nodes.items()
         }
-        self._continuous_step_plan = tuple(
+        self._flow_plan = tuple(
             (group, group in self._continuous_cycles,
-             self._continuous_cycle_keys.get(group, ()), tuple(steps[name] for name in group))
+             self._flow_cycle_keys.get(group, ()), tuple(steps[name] for name in group))
             for group in self._continuous_plan
         )
         if self._continuous_cycles:
-            self._continuous_runner = self._continuous_dc_runner = None
+            self._flow_runner = self._dc_flow_runner = None
         else:
-            self._continuous_runner = self._compile_continuous_runner(None)
-            self._continuous_dc_runner = (
-                self._compile_continuous_runner(self.dc_affected)
+            self._flow_runner = self._compile_flow_runner(None)
+            self._dc_flow_runner = (
+                self._compile_flow_runner(self.dc_affected)
                 if self.dc_affected else None
             )
 
-    def _compile_continuous_runner(self, selected):
+    def _compile_flow_runner(self, selected):
         """Compile an acyclic fixed-wiring graph into one allocation-free Python call."""
         environment = {"_values": self.values}
         body = []
         index = 0
-        for group, _cyclic, _keys, steps in self._continuous_step_plan:
+        for group, _cyclic, _keys, steps in self._flow_plan:
             name, evaluate, wiring, inputs, outputs, flow, out_specs, flow_specs = steps[0]
             if selected is not None and name not in selected:
                 continue
             suffix = str(index)
             index += 1
             node = self.nodes[name]
-            path_ports = getattr(node, "continuous_path_inputs", None)
+            path_ports = node.flow_inputs
             environment[f"_evaluate{suffix}"] = (
-                node.continuous_path if path_ports is not None else evaluate
+                node.flow_path if path_ports is not None else evaluate
             )
             environment[f"_inputs{suffix}"] = inputs
             environment[f"_outputs{suffix}"] = outputs
             environment[f"_flow{suffix}"] = flow
-            constrained = self._constraints.get(name)
-            if constrained is not None:
-                constrained_port, constrained_state, constraint = constrained
-                environment[f"_constraint{suffix}"] = constraint.flow
             sources = {}
             for port, kind, key in wiring:
                 if kind == _HELD:
@@ -621,19 +609,12 @@ class ControlGraph:
                 body.append(
                     f"_evaluate{suffix}(t, _inputs{suffix}, _outputs{suffix}, _flow{suffix})"
                 )
-                if constrained is not None:
-                    body.append(
-                        f"_outputs{suffix}[{constrained_port!r}], "
-                        f"_flow{suffix}[{constrained_state!r}] = _constraint{suffix}("
-                        f"t, _outputs{suffix}[{constrained_port!r}], "
-                        f"_flow{suffix}[{constrained_state!r}])"
-                    )
                 body.extend(
                     f"_values[{key!r}] = _outputs{suffix}[{port!r}]"
                     for port, key, _complex_value in out_specs
                 )
                 body.extend(
-                    f"derivatives[{self._continuous_derivative_index[key]}] = "
+                    f"derivatives[{self._flow_derivative_index[key]}] = "
                     f"_flow{suffix}[{local!r}]"
                     for local, key in flow_specs
                 )
@@ -648,19 +629,11 @@ class ControlGraph:
                 offset = len(out_specs)
                 flow_values = {local: f"{result}[{position}]"
                                for position, (local, _key) in enumerate(flow_specs, start=offset)}
-                if constrained is not None:
-                    limited = f"_limited{suffix}"
-                    body.append(
-                        f"{limited} = _constraint{suffix}(t, "
-                        f"{output_values[constrained_port]}, {flow_values[constrained_state]})"
-                    )
-                    output_values[constrained_port] = f"{limited}[0]"
-                    flow_values[constrained_state] = f"{limited}[1]"
                 for port, key, _complex_value in out_specs:
                     body.append(f"_values[{key!r}] = {output_values[port]}")
                 for local, key in flow_specs:
                     body.append(
-                        f"derivatives[{self._continuous_derivative_index[key]}] = "
+                        f"derivatives[{self._flow_derivative_index[key]}] = "
                         f"{flow_values[local]}"
                     )
         source = "def run(t, meas, derivatives):\n" + "\n".join(
@@ -683,7 +656,7 @@ class ControlGraph:
                                    for f in fields(ctrl.references)}
                 self._rewire()
                 if self.continuous:
-                    self._prepare_continuous_buffers()
+                    self._prepare_flow()
             changed = [name for name, params in ctrl.loops.items()
                        if params != self.cfg.ctrl.loops[name]]
             self.cfg = cfg
@@ -696,8 +669,8 @@ class ControlGraph:
         params = self.cfg.ctrl.loops[name]
         fresh = LOOP_TYPES[params.type](params, self.cfg, self.startup)
         if self.continuous:
-            old_schema = set(old.continuous_state())
-            new_schema = set(fresh.continuous_state())
+            old_schema = set(old.flow_state())
+            new_schema = set(fresh.flow_state())
             if new_schema != old_schema:
                 raise ConfigError(
                     f"ctrl.loops.{name}: a set event cannot change continuous states "
@@ -711,9 +684,9 @@ class ControlGraph:
                 f"states than before ({exc}), so it cannot continue from them") from None
         fresh.retuned(old)
         self.nodes[name] = fresh
-        self._updates[name] = fresh.update
+        self._samples[name] = fresh.sample
         if self.continuous:
-            self._prepare_continuous_buffers()
+            self._prepare_flow()
         if self.on_retune is not None:
             self.on_retune(name)
 
@@ -787,7 +760,7 @@ class ControlGraph:
         """Return the input ``port`` of the loop ``name`` for the pu measurement ``meas``."""
         return self._read(*self._port_source[name][port], meas)
 
-    def update(self, t, meas, finalize=None):
+    def sample(self, t, meas, finalize=None):
         """Run the loops due at ``t`` on the pu measurement ``meas``; return their names.
 
         ``finalize(t, meas, updated)`` runs after them, before the delayed inputs are latched.
@@ -798,11 +771,11 @@ class ControlGraph:
         due = self.due(t)
         if not due:
             return updated
-        updates, gather_, immediate = self._updates, self._gather, self._immediate
+        samples, gather_, immediate = self._samples, self._gather, self._immediate
         for name in self.order:
             if name not in due:
                 continue
-            self._store(name, updates[name](t, gather_(immediate[name], meas)))
+            self._store(name, samples[name](t, gather_(immediate[name], meas)))
             updated.add(name)
         if finalize is not None:
             finalize(t, meas, updated)
@@ -811,7 +784,7 @@ class ControlGraph:
                 self.nodes[name].latch(gather_(self._wiring[name], meas))
         return updated
 
-    def continuous_outputs(self, t, meas, only=None, derivatives=None):
+    def flow(self, t, meas, only=None, derivatives=None):
         """Evaluate continuous loops and return their named state derivatives.
 
         Acyclic components run once.  A strongly connected component is solved by warm-started
@@ -823,19 +796,19 @@ class ControlGraph:
             self._apply_pending()
         named = derivatives is None
         if derivatives is None:
-            derivatives = [0.0] * len(self.continuous_state_names)
-        runner = self._continuous_runner
+            derivatives = [0.0] * len(self.flow_state_names)
+        runner = self._flow_runner
         if runner is not None:
             if only is None:
                 runner(t, meas, derivatives)
-                return (dict(zip(self.continuous_state_names, derivatives))
+                return (dict(zip(self.flow_state_names, derivatives))
                         if named else derivatives)
-            if only == self.dc_affected and self._continuous_dc_runner is not None:
-                self._continuous_dc_runner(t, meas, derivatives)
-                return (dict(zip(self.continuous_state_names, derivatives))
+            if only == self.dc_affected and self._dc_flow_runner is not None:
+                self._dc_flow_runner(t, meas, derivatives)
+                return (dict(zip(self.flow_state_names, derivatives))
                         if named else derivatives)
         values = self.values
-        for group, cyclic, keys, steps in self._continuous_step_plan:
+        for group, cyclic, keys, steps in self._flow_plan:
             if only is not None and not any(name in only for name in group):
                 continue
             if not cyclic:
@@ -848,14 +821,10 @@ class ControlGraph:
                     else:
                         inputs[port] = key
                 evaluate(t, inputs, outputs, flow)
-                constrained = self._constraints.get(_name)
-                if constrained is not None:
-                    port, state, constraint = constrained
-                    outputs[port], flow[state] = constraint.flow(t, outputs[port], flow[state])
                 for port, key, _complex_value in out_specs:
                     values[key] = outputs[port]
                 for local, key in flow_specs:
-                    derivatives[self._continuous_derivative_index[key]] = flow[local]
+                    derivatives[self._flow_derivative_index[key]] = flow[local]
                 continue
             previous = tuple(values[key] for key in keys)
             for _iteration in range(16):
@@ -869,14 +838,10 @@ class ControlGraph:
                         else:
                             inputs[port] = key
                     evaluate(t, inputs, outputs, flow)
-                    constrained = self._constraints.get(_name)
-                    if constrained is not None:
-                        port, state, constraint = constrained
-                        outputs[port], flow[state] = constraint.flow(t, outputs[port], flow[state])
                     for port, key, _complex_value in out_specs:
                         values[key] = outputs[port]
                     for local, key in flow_specs:
-                        derivatives[self._continuous_derivative_index[key]] = flow[local]
+                        derivatives[self._flow_derivative_index[key]] = flow[local]
                 current = tuple(values[key] for key in keys)
                 if all(abs(new - old) <= 1e-10 + 1e-8 * max(1.0, abs(new), abs(old))
                        for new, old in zip(current, previous)):
@@ -887,7 +852,7 @@ class ControlGraph:
                     "continuous control algebraic loop did not converge after 16 iterations: "
                     + ", ".join(group)
                 )
-        return dict(zip(self.continuous_state_names, derivatives)) if named else derivatives
+        return dict(zip(self.flow_state_names, derivatives)) if named else derivatives
 
     def output(self, port, meas):
         """Return the graph output ``port`` (``u_dq``, ``theta`` or ``omega``)."""
@@ -1042,61 +1007,83 @@ class UniteType:
                               if self._frame_cc is not None else None)
         self._is_gfl = cfg.ctrl.type == "gfl"
         self._p_key, self._q_key, self._v_ref_key = f"{first('power')}.p", f"{first('power')}.q", f"{self._sync}.v_ref"
-        self._terminal_constraint = None
+        self._terminal_limit = None
         self._terminal_limit_scale = None
-        self._configure_constraint(self._dc)
-        self._configure_constraint(self._terminal)
+        self._flow_limits = {}
+        self.alarms: list[str] = []
+        self._configure_limit(self._dc)
+        self._configure_limit(self._terminal)
         if self.continuous:
-            self._build_continuous_state()
+            self._build_flow_state()
 
-    def _configure_constraint(self, name):
-        """Build one controller-owned output constraint after graph construction or retuning."""
+    def _configure_limit(self, name):
+        """Build a sampled output limit or a continuous observation-only limit."""
         if name is None:
             return
         graph = self.graph
-        graph.clear_constraint(name)
+        graph.clear_limit(name)
+        self._flow_limits.pop(name, None)
         node = graph.nodes.get(name)
         if name == self._terminal:
-            self._terminal_constraint = None
+            self._terminal_limit = None
             self._terminal_limit_scale = None
             if self.stage is not None:
                 self.stage._command_saturated = False
         if isinstance(node, DCVoltageLoop):
-            graph.constrain(
-                name, "id_ref", "integral_pu",
-                _PIOutputConstraint(
-                    node.pi, node.limit, lower=node.floor,
-                    observer=node.observe_constraint,
-                ),
+            limit = _OutputLimit(
+                node.limit, lower=node.floor, pi=None if self.continuous else node.pi,
+                observer=node.observe_limit,
             )
+            if self.continuous:
+                self._flow_limits[name] = (f"{name}.id_ref", limit, "ID_REF_LIMIT", node)
+            else:
+                graph.limit_output(name, "id_ref", limit)
         if (not self.continuous and name == self._terminal
                 and isinstance(node, CurrentLoop) and self.stage is not None):
             limit = self.stage.command_limit(1.0)
             if limit is not None:
-                constraint = _PIOutputConstraint(
-                    node.pi, limit,
+                output_limit = _OutputLimit(
+                    limit, pi=node.pi,
                     active=lambda: self.startup.active,
                 )
-                graph.constrain(name, "u_dq", "integral_pu", constraint)
-                self._terminal_constraint = constraint
+                graph.limit_output(name, "u_dq", output_limit)
+                self._terminal_limit = output_limit
                 self._terminal_limit_scale = limit
 
-    def _build_continuous_state(self):
-        """Create the fixed ODE state layout from each loop's continuous state declaration."""
+    def observe_limits(self, t: float) -> None:
+        """Check ideal-model commands at a recorded snapshot without altering their values."""
+        for path, limit, alarm, node in self._flow_limits.values():
+            value = self.graph.values[path]
+            exceeded = limit.exceeded(value)
+            node.n_updates += 1
+            node.limit_exceeded = exceeded
+            if not exceeded:
+                continue
+            node.n_limit_exceeded += 1
+            if node.first_limit_t is None:
+                node.first_limit_t = t
+            if alarm not in self.alarms:
+                self.alarms.append(alarm)
+
+    def _build_flow_state(self):
+        """Create the fixed ODE state layout from each loop's flow-state declaration."""
         state = _ContinuousControlState()
         names = []
         for name in self.graph.order:
             node = self.graph.nodes[name]
             try:
-                if type(node).continuous is Loop.continuous:
+                if (type(node).flow is Loop.flow
+                        and (node.flow_inputs is None
+                             or (type(node).flow_path is Loop.flow_path
+                                 and type(node).equation is Loop.equation))):
                     raise NotImplementedError(
                         f"loop type {node.type!r} has no continuous-time implementation"
                     )
-                if isinstance(node, SyncLaw) and type(node).flow is SyncLaw.flow:
+                if isinstance(node, SyncLaw) and type(node)._flow is SyncLaw._flow:
                     raise NotImplementedError(
                         f"loop type {node.type!r} has no continuous-time flow implementation"
                     )
-                values = node.continuous_state()
+                values = node.flow_state()
             except NotImplementedError as exc:
                 raise ConfigError(f"ctrl.loops.{name}: {exc}") from None
             for local, value in values.items():
@@ -1108,28 +1095,28 @@ class UniteType:
                 names.append(key)
                 setattr(state, key, complex(value) if isinstance(value, complex) else float(value))
         self.state, self.state_names = state, tuple(names)
-        if self.state_names != self.graph.continuous_state_names:
+        if self.state_names != self.graph.flow_state_names:
             raise RuntimeError("continuous controller state and derivative layouts differ")
         self.inp = _ContinuousControlInp(u_g=0j, i_c=0j, u_dc=self.p.dclink.vdc_ref)
         self.out = _ContinuousControlOut(q=0j)
         self._derivatives = [0j if isinstance(getattr(state, name), complex) else 0.0
                              for name in self.state_names]
-        self._continuous_derivative_index = {
+        self._flow_derivative_index = {
             name: index for index, name in enumerate(self.state_names)
         }
         self._continuous_meas = ControlMeasurement(0.0, 0j, 0j, 1.0, np.zeros(3))
         self._last_control_meas = self._continuous_meas
-        self._bind_continuous_state()
+        self._bind_flow_state()
 
-    def _bind_continuous_state(self):
+    def _bind_flow_state(self):
         """Resolve direct loop-state assignments once, including after a loop is retuned."""
         direct = []
         indirect = []
         known = set(self.state_names)
         for name in self.graph.order:
             node = self.graph.nodes[name]
-            values = node.continuous_state()
-            bindings = node.continuous_state_bindings()
+            values = node.flow_state()
+            bindings = node.flow_state_bindings()
             if bindings is None or set(bindings) != set(values):
                 indirect.append((node, tuple((local, f"{name}.{local}") for local in values)))
                 continue
@@ -1152,18 +1139,18 @@ class UniteType:
     def _store_continuous_nodes(self):
         """Copy loop states changed by a host action (tracking/reset) into Model state."""
         for name in self.graph.order:
-            for local, value in self.graph.nodes[name].continuous_state().items():
+            for local, value in self.graph.nodes[name].flow_state().items():
                 key = f"{name}.{local}"
                 if key in self.state_names:
                     setattr(self.state, key, value)
 
     def _loop_retuned(self, name=None):
-        """Rebuild the loop's constraint and continuous state bindings after a set event."""
-        self._configure_constraint(name)
+        """Rebuild the loop's limit and continuous state bindings after a set event."""
+        self._configure_limit(name)
         if self.continuous:
-            if self.graph.continuous_state_names != self.state_names:
+            if self.graph.flow_state_names != self.state_names:
                 raise ConfigError("a set event cannot reorder continuous controller states")
-            self._bind_continuous_state()
+            self._bind_flow_state()
 
     def describe(self):
         return self.graph.describe()
@@ -1252,15 +1239,15 @@ class UniteType:
         """Enable per-interrupt log dictionaries when a run records or watches them."""
         self.logging = bool(enabled)
     def _accept_command(self, t, meas, updated):
-        """Update the held angle, frequency and constrained voltage command."""
+        """Update the held angle, frequency and sampled voltage command."""
         graph = self.graph
         self.theta = float(graph.output("theta", meas))
         self.omega = float(graph.output("omega", meas))
         if self._terminal in updated or (updated and not self._terminal_in_graph):
             self.u_cmd = complex(graph.output("u_dq", meas))
             self.command_theta = self.theta
-            if self._terminal_constraint is not None:
-                self.stage._command_saturated = self._terminal_constraint.saturated
+            if self._terminal_limit is not None:
+                self.stage._command_saturated = self._terminal_limit.saturated
             self.stage.modulate(t, self.u_cmd, self.command_theta, meas.u_dc, count=False)
 
     def __call__(self, t, meas):
@@ -1271,11 +1258,11 @@ class UniteType:
         if startup.in_progress:
             startup.advance()
         self.stage.new_instant()
-        if self._terminal_constraint is not None:
-            self._terminal_constraint.limit = (
+        if self._terminal_limit is not None:
+            self._terminal_limit.limit = (
                 self._terminal_limit_scale * max(0.0, control_meas.u_dc)
             )
-        self.graph.update(t, control_meas, finalize=self._accept_command)
+        self.graph.sample(t, control_meas, finalize=self._accept_command)
         frame = self.graph.values.get(self._frame_key, self.theta)
         if self._frame_cc is not None:
             frame = self.graph.input(self._frame_cc, "frame", control_meas)
@@ -1335,7 +1322,7 @@ class UniteType:
         if self._in_algebraic_solve and not self._algebraic_first:
             only = self.graph.dc_affected
         derivatives = self._derivatives
-        self.graph.continuous_outputs(t, meas, only=only, derivatives=derivatives)
+        self.graph.flow(t, meas, only=only, derivatives=derivatives)
         self._algebraic_first = False
         graph = self.graph
         self.theta = float(graph._read(*self._theta_source, meas))
@@ -1431,10 +1418,11 @@ class UniteType:
         })
         if self._dc is not None:
             dc = self.graph.nodes[self._dc]
-            summary["id_ref_limit_fraction"] = dc.n_clamped / max(1, dc.n_updates)
-            summary["id_ref_limit_first_t"] = dc.first_clamp_t
+            summary["id_ref_limit_fraction"] = dc.n_limit_exceeded / max(1, dc.n_updates)
+            summary["id_ref_limit_first_t"] = dc.first_limit_t
         if self._sync is not None:
             summary["law"] = self.p.ctrl.loops[self._sync].type
+        summary["alarms"] = list(self.alarms)
         return summary
 
 

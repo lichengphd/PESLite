@@ -38,21 +38,61 @@ class LaggedSync(SyncLaw):
         super().__init__(cfg, unit, scenario)
         self.p_f = 0.0
 
-    def step(self, period, p_pu, q_pu, v_mag_pu, v_dc_pu,
-             p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
+    def _sample(self, period, p_pu, q_pu, v_mag_pu, v_dc_pu,
+                p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
         self.p_f += period / self.cfg.tau * (p_pu - self.p_f)
         self.omega = self.w0 + self.cfg.k_p_pu * (p_ref_pu - self.p_f)
         self.theta += period * self.omega
         self.v_mag = v_ref_pu
+
+    def _flow(self, p_pu, q_pu, v_mag_pu, v_dc_pu,
+              p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
+        self.omega = self.w0 + self.cfg.k_p_pu * (p_ref_pu - self.p_f)
+        self.v_mag = v_ref_pu
+        return self.omega, (p_pu - self.p_f) / self.cfg.tau
 ```
 
 The nested frozen `Params` dataclass defines the file schema and defaults. A module stored under
 `peslite/addons/controllers/` is discovered automatically; the registered name is then available at
 `units.<u>.ctrl.loops.<loop>.type` exactly like a built-in loop.
 
-A loop used by sampled bridges implements `step()`. A loop used with ideal averaging also provides
-continuous outputs and state derivatives through its continuous interface, such as `flow()` for a
-`SyncLaw`. Typed input/output ports let the controller graph validate connections before running.
+A specialized loop may expose separate sampled and continuous-flow laws. When its dynamics can be
+built from the standard blocks, define one `equation()` instead: the graph supplies its inputs,
+collects the registered states and derivatives, and selects sampled or continuous block
+implementations during construction. Typed ports still validate all connections before running.
+
+The essential pattern is:
+
+```python
+from peslite.addons.controllers import Filter, Integrator, PI
+
+def __init__(self, cfg, unit, startup):
+    super().__init__(cfg, unit, startup)
+    self.angle = self.state_block(
+        "theta", Integrator(self.block_period, initial=0.0)
+    )
+    self.regulator = self.state_block(
+        "integral_pu", PI(kp, ki, self.block_period)
+    )
+    self.feedback = self.state_block(
+        "feedback_pu",
+        Filter(num=(1.0,), den=(tau, 1.0), period=self.block_period),
+    )
+
+def equation(self, signal, omega, reference, feedforward):
+    measured = self.feedback(signal)
+    command = self.regulator(reference, measured, feedforward)
+    theta = self.angle(omega)
+    return command, theta
+```
+
+`Loop.block_period` is the configured loop period for sampled bridge models and `None` for ideal
+averaging. Construction therefore selects a sampled or continuous implementation once; the call
+itself has no mode branch. `Filter` follows the Transfer Fcn coefficient convention: numerator and
+denominator coefficients are in descending powers of `s`, and the transfer function must be
+proper. Its sampled implementation, and the sampled integral branch of `Integrator` and `PI`, use
+the trapezoidal (Tustin) method. The complete bundled example is
+`peslite.addons.controllers.voltage_adaptive_pll`.
 
 ## Custom circuit elements
 

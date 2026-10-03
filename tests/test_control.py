@@ -10,8 +10,8 @@ import pytest
 import peslite
 from conftest import EXAMPLES
 from peslite.control import (ANGLE, CONTROL_INTERFACE, FREQUENCY, I, I_AB, I_DQ, LOOP_TYPES,
-                             POWER, PQ, V, V_AB, V_DQ, Loop, Measurement, PI, SignalType, SyncLaw,
-                             register_loop_type)
+                             POWER, PQ, V, V_AB, V_DQ, Filter, Integrator, Loop, Measurement, PI,
+                             SignalType, SyncLaw, register_loop_type)
 from peslite.solver.model import ConfigError
 
 CONTROL = Path(peslite.control.__file__).parent
@@ -30,8 +30,8 @@ class _FixedFrequency(SyncLaw):
 
     type = "test_fixed_frequency"
 
-    def step(self, T, p_pu, q_pu, v_mag_pu, v_dc_pu,
-             p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
+    def _sample(self, T, p_pu, q_pu, v_mag_pu, v_dc_pu,
+                p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
         self.omega = self.w0
         self.theta += T * self.omega
         self.v_mag = v_ref_pu
@@ -55,11 +55,11 @@ class _AffineFeedback(Loop):
     def initial_outputs(self):
         return {"y": 0j}
 
-    def update(self, t, inputs):
+    def sample(self, t, inputs):
         return {"y": self.cfg.bias + self.cfg.gain * inputs["x"]}
 
-    def continuous(self, t, inputs):
-        return self.update(t, inputs), {}
+    def flow(self, t, inputs):
+        return self.sample(t, inputs), {}
 
 
 def test_registered_loop_owns_its_schema_and_uses_default_role_wiring(tmp_path):
@@ -181,29 +181,74 @@ def test_control_ports_have_the_canonical_signal_types():
 
 def test_pi_owns_tracking_antiwindup_but_not_the_output_limit():
     pi = PI(2.0, 4.0, 0.1)
-    intended = pi.sample(2.0, 0.0)
+    intended = pi(2.0, 0.0)
     integrated = pi.integral
 
-    assert intended == pytest.approx(4.8)
+    assert intended == pytest.approx(4.4)
     assert integrated == pytest.approx(0.2)
     pi.antiwindup(intended, 1.0)
     assert pi.integral == pytest.approx(integrated + 0.1 * (1.0 - intended) / 2.0)
 
     disabled = PI(2.0, 4.0, 0.1, antiwindup=False)
-    intended = disabled.sample(2.0, 0.0)
+    intended = disabled(2.0, 0.0)
     integrated = disabled.integral
     disabled.antiwindup(intended, 1.0)
     assert disabled.integral == integrated
 
 
-def test_controller_adds_constraints_only_where_the_model_has_one(gfl):
+def test_integrator_binds_continuous_or_trapezoidal_sampled_semantics_at_construction():
+    sampled = Integrator(0.1, initial=1.0)
+    continuous = Integrator(None, initial=1.0)
+
+    assert sampled(2.0) == pytest.approx(1.1)
+    assert sampled(4.0) == pytest.approx(1.4)
+    assert sampled.value == pytest.approx(1.6)
+    assert continuous(2.0) == pytest.approx(1.0)
+    assert continuous.value == pytest.approx(1.0)
+    assert continuous.derivative == pytest.approx(2.0)
+
+
+def test_filter_uses_descending_s_coefficients_and_tustin_for_sampled_control():
+    # 10 / (s + 10): Tustin at T=0.1 gives y0=1/3 and y1=7/9 for a unit step.
+    sampled = Filter((10.0,), (1.0, 10.0), 0.1)
+    continuous = Filter((10.0,), (1.0, 10.0), None)
+
+    assert sampled(1.0) == pytest.approx(1.0 / 3.0)
+    assert sampled(1.0) == pytest.approx(7.0 / 9.0)
+    assert continuous(1.0) == pytest.approx(0.0)
+    assert continuous.derivative == pytest.approx((10.0,))
+
+    with pytest.raises(ValueError, match="must be proper"):
+        Filter((1.0, 0.0), (1.0,), 0.1)
+
+
+def test_controller_applies_limits_only_to_sampled_control(gfl):
     sampled = peslite.Simulation(gfl()).unit().ctrl
     continuous = peslite.Simulation(gfl(**{"units.vsc.bridge.model": "averaging"})).unit().ctrl
 
-    assert set(sampled.graph._constraints) == {"cc", "dvc"}
-    assert set(continuous.graph._constraints) == {"dvc"}
-    assert sampled.graph._constraints["cc"][2].pi is sampled.graph.nodes["cc"].pi
-    assert sampled.graph._constraints["dvc"][2].pi is sampled.graph.nodes["dvc"].pi
+    assert set(sampled.graph._limits) == {"cc", "dvc"}
+    assert continuous.graph._limits == {}
+    assert set(continuous._flow_limits) == {"dvc"}
+    assert sampled.graph._limits["cc"][1].pi is sampled.graph.nodes["cc"].pi
+    assert sampled.graph._limits["dvc"][1].pi is sampled.graph.nodes["dvc"].pi
+
+
+def test_averaging_observes_pi_limit_without_clipping_or_antiwindup(gfl):
+    ctrl = peslite.Simulation(gfl(**{"units.vsc.bridge.model": "averaging"})).unit().ctrl
+    dvc = ctrl.graph.nodes["dvc"]
+    ctrl.command_at(True, 0.0, 0.0)
+    intended = 2.0 * dvc.limit
+    setattr(ctrl.state, "dvc.integral_pu", intended / dvc.ki)
+    ctrl.inp.u_dc = ctrl.p.dclink.vdc_ref
+
+    ctrl.set_outputs(0.0)
+
+    expected = intended + dvc.cfg.id0_export_pu
+    assert ctrl.graph.values["dvc.id_ref"] == pytest.approx(expected)
+    assert ctrl.rhs(0.0)[ctrl.state_names.index("dvc.integral_pu")] == pytest.approx(0.0)
+    assert ctrl.alarms == []
+    ctrl.observe_limits(0.0)
+    assert ctrl.alarms == ["ID_REF_LIMIT"]
 
 
 def test_unknown_controller_output_boundary_port_is_rejected(gfl):

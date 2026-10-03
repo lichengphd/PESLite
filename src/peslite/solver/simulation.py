@@ -697,8 +697,13 @@ class Simulation:
                 with np.errstate(over="raise"):
                     sync_if_needed(t_now)
                     for unit in units:
-                        log = (unit.ctrl.continuous_log(t_now)
-                               if getattr(unit, "continuous", False) else None)
+                        if getattr(unit, "continuous", False):
+                            observe_limits = getattr(unit.ctrl, "observe_limits", None)
+                            if observe_limits is not None:
+                                observe_limits(t_now)
+                            log = unit.ctrl.continuous_log(t_now)
+                        else:
+                            log = None
                         if log is not None:
                             rec.last_ctrl_log[unit.name] = log
                             if continuous_record_index % record_every == 0:

@@ -436,7 +436,11 @@ class Unit:
     # ---------------------------------------------------------------- results
     def summary(self) -> dict[str, Any]:
         seen = dict(self.ctrl.summary()) if hasattr(self.ctrl, "summary") else {}
-        seen.update(self.protection.summary())
+        protection = self.protection.summary()
+        protection["alarms"] = list(dict.fromkeys(
+            [*seen.pop("alarms", []), *protection["alarms"]]
+        ))
+        seen.update(protection)
         return seen
 
     def signals(self) -> dict[str, float | complex]:

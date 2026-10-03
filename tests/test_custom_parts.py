@@ -35,8 +35,8 @@ class _LaggedPSC(SyncLaw):
         super().__init__(cfg, unit, scenario)
         self.p_f = 0.0
 
-    def step(self, period, p_pu, q_pu, v_mag_pu, v_dc_pu,
-             p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
+    def _sample(self, period, p_pu, q_pu, v_mag_pu, v_dc_pu,
+                p_ref_pu, q_ref_pu, v_ref_pu, i_dq):
         self.p_f += period / self.cfg.tau * (p_pu - self.p_f)
         self.omega = self.w0 + self.cfg.k_p_pu * (p_ref_pu - self.p_f)
         self.theta += period * self.omega
