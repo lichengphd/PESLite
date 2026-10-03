@@ -246,6 +246,7 @@ def test_custom_cable_gfl_case_runs_in_every_bridge_mode(examples, tmp_path, mod
             "simulation.solver.method": solver[1],
             "simulation.solver.linearisations": 0,
             "simulation.energy_check": "strict",
+            "simulation.output.signals": 1,
             "units.vsc.bridge.model": model,
         },
     )
@@ -256,3 +257,4 @@ def test_custom_cable_gfl_case_runs_in_every_bridge_mode(examples, tmp_path, mod
     assert not result.tripped
     assert np.isfinite(result.states["cable1.iL1.re"]).all()
     assert np.isfinite(result.states["cable1.uC2.im"]).all()
+    assert {"cable1.i1_a", "cable1.i2_a"} <= result.plant.keys()

@@ -50,7 +50,7 @@ PQ = SignalType("pu_power", "pq", True)
 
 # ------------------------------------------------------------------ the base class and the registry
 
-# the parts a loop can play in the default gfl/gfm wiring (see peslite.control.graph.default_wiring)
+# The parts a loop can play in the default GFL/GFM wiring assembled by ControllerGraph.
 ROLES = ("pll", "sync", "current", "dc_voltage", "power", "impedance", "admittance", "damping")
 
 

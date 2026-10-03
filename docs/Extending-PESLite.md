@@ -6,8 +6,9 @@ directory beside a simulation file share the same package search paths and regis
 elsewhere can still be imported and registered explicitly before loading a simulation file that
 names them.
 
-Executable examples live in `tests/test_custom_parts.py`; Python implementation files are not
-placed in the root `examples/` directory.
+The root `examples/` directory contains simulation files only. Bundled Python implementations live
+under `peslite.addons`, while additional test-only implementations exercise the same interfaces in
+the test suite.
 
 Project-local controllers, components and functions can live beside a simulation rather than in
 the installed package. Their exact search rules and their relationship to the output directory are
@@ -44,8 +45,8 @@ class LaggedSync(SyncLaw):
     type = "lagged_sync"
     state_names = {"theta": "theta", "p_f_pu": "p_f"}
 
-    def __init__(self, cfg, unit, scenario):
-        super().__init__(cfg, unit, scenario)
+    def __init__(self, cfg, unit, startup):
+        super().__init__(cfg, unit, startup)
         self.p_f = 0.0
 
     def _sample(self, period, p_pu, q_pu, v_mag_pu, v_dc_pu,
@@ -112,6 +113,7 @@ An element class registered by `register_element_type` owns:
 - `subsystems()` for its physical model objects;
 - `connections()` for its internal and auxiliary signal wiring;
 - `terminals()` binding each configured bus to an electrical `Terminal`;
+- optional `signals()` returning namespaced scalar or complex values for `plant.csv`;
 - optional `connect()`, `disconnect()` or `retune()` behavior.
 
 ```python
@@ -139,6 +141,10 @@ An electrical `Terminal` names a subsystem voltage input and current output once
 uses `bus` and returns one binding; a multi-terminal element uses `bus1`, `bus2`, and so on and
 returns one binding per terminal. System assembly converts these declarations to direct model
 connections, so terminal metadata adds no work to the integration loop.
+
+Every entry returned by `signals()` follows the same output path. Complex values become three
+phase columns with `_a`, `_b` and `_c` suffixes, while scalar values retain their declared name;
+custom signal names do not require recorder-specific code.
 
 The cable add-on is a complete multi-terminal reference implementation:
 

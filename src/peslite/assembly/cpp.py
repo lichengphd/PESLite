@@ -2342,11 +2342,15 @@ class _CppGenerator:
         self.model.sync(self.p.simulation.initial.t, self.model.get_initial_values())
         for key, value in self.system.signals(self.p.simulation.initial.t).items():
             head, _, what = key.rpartition(".")
-            if what in ("u_g", "i_c", "i", "i1", "i2", "u") and isinstance(value, complex):
-                stem = {"u_g": "v", "i_c": "i_conv", "i": "i",
-                        "i1": "i1", "i2": "i2", "u": "v"}[what]
-                columns.extend(f"{head}.{stem}_{phase}" for phase in "abc")
+            if isinstance(value, numbers.Complex) and not isinstance(value, numbers.Real):
+                stem = {"u_g": "v", "i_c": "i_conv", "u": "v"}.get(what, what)
+                prefix = f"{head}." if head else ""
+                columns.extend(f"{prefix}{stem}_{phase}" for phase in "abc")
                 expressions.extend(self._phase_expressions(f"obs_{_identifier(key)}"))
+            elif not ((head in self.p.units and what in ("u_dc", "i_dc"))
+                      or (head in self.p.sources and what == "angle")):
+                columns.append(key)
+                expressions.append(f"obs_{_identifier(key)}")
         for name in self.p.units:
             for what in ("u_dc", "i_dc"):
                 columns.append(f"{name}.{what}")

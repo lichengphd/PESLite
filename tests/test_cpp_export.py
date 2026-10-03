@@ -81,7 +81,8 @@ class _ConditionalElement(Element):
         return ((self.cfg.bus, self.model.terminal),)
 
     def signals(self):
-        return {f"{self.name}.i": self.model.out.i}
+        return {f"{self.name}.i": self.model.out.i,
+                f"{self.name}.i_mag": abs(self.model.out.i)}
 
 
 def _compiler() -> str | None:
@@ -194,7 +195,10 @@ def test_generated_cpp_runs_custom_cable_equations(tmp_path):
     assert max(abs(actual[key] - expected[key]) for key in expected) <= 2e-8 * max(
         1.0, max(abs(value) for value in expected.values())
     )
-    assert final(cpp_out / "plant.csv").keys() == final(python_out / "plant.csv").keys()
+    expected_plant = final(python_out / "plant.csv")
+    actual_plant = final(cpp_out / "plant.csv")
+    assert actual_plant.keys() == expected_plant.keys()
+    assert {"cable1.i1_a", "cable1.i2_a"} <= actual_plant.keys()
 
 
 def test_generic_cpp_fallback_lowers_custom_equations_and_state_branches(tmp_path):
@@ -213,6 +217,7 @@ def test_generic_cpp_fallback_lowers_custom_equations_and_state_branches(tmp_pat
     tree["simulation"]["t_end"] = 0.002
     tree["simulation"]["solver"]["linearisations"] = 0
     tree["simulation"]["energy_check"] = "off"
+    tree["simulation"].setdefault("output", {})["signals"] = 1
     case = tmp_path / "conditional.pes"
     case.write_text(yaml.safe_dump(tree, sort_keys=False), encoding="utf-8")
     params = peslite.load(case)
@@ -238,6 +243,10 @@ def test_generic_cpp_fallback_lowers_custom_equations_and_state_branches(tmp_pat
     assert max(abs(actual[key] - expected[key]) for key in expected) <= 2e-8 * max(
         1.0, max(abs(value) for value in expected.values())
     )
+    expected_plant = final(python_out / "plant.csv")
+    actual_plant = final(cpp_out / "plant.csv")
+    assert actual_plant.keys() == expected_plant.keys()
+    assert "conditional.i_mag" in actual_plant
 
 
 def test_cpp_export_rejects_an_already_run_simulation(tmp_path):

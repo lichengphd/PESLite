@@ -61,11 +61,14 @@ def _plant_output_row(params: Params, t: float, plant: Mapping[str, Any],
     row: dict[str, float] = {"t": t}
     for key, value in plant.items():
         head, _, what = key.rpartition(".")
-        if what in ("u_g", "i_c", "i", "i1", "i2", "u") and np.iscomplexobj(value):
-            stem = {"u_g": "v", "i_c": "i_conv", "i": "i",
-                    "i1": "i1", "i2": "i2", "u": "v"}[what]
+        if np.iscomplexobj(value):
+            stem = {"u_g": "v", "i_c": "i_conv", "u": "v"}.get(what, what)
+            prefix = f"{head}." if head else ""
             for phase, phase_value in zip("abc", complex2abc(complex(value))):
-                row[f"{head}.{stem}_{phase}"] = float(phase_value)
+                row[f"{prefix}{stem}_{phase}"] = float(phase_value)
+        elif not ((head in params.units and what in ("u_dc", "i_dc"))
+                  or (head in params.sources and what == "angle")):
+            row[key] = float(value)
     for name in params.units:
         for what in ("u_dc", "i_dc"):
             key = f"{name}.{what}"
