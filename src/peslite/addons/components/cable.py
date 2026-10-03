@@ -35,7 +35,6 @@ def _state_record(sections: int) -> type[Bag]:
     )
     return type(f"_CableState{sections}", (Bag,), {"__slots__": names})
 
-
 @lru_cache(maxsize=None)
 def _rhs_function(sections: int) -> FunctionType:
     """Build a straight-line RHS once; no section loop or mode branch remains at run time."""
